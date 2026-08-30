@@ -101,7 +101,7 @@ class InferenceHost:
             program_id=program.program_id,
             program_revision=program.revision,
             model_binding=actor.model_binding,
-            context_receipt_ref=context_receipt.context_receipt_id,
+            context_receipt=context_receipt,
             context=context,
         )
         input_digest = canonical_digest(request)
