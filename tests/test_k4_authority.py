@@ -1,7 +1,10 @@
 from dataclasses import replace
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ai_capital.kernel.actor_store import ActorRepository
 from ai_capital.kernel.authority import AuthorityEngine, PolicySnapshot
@@ -61,9 +64,7 @@ class Fixture:
         install_builtin_capabilities(self.capabilities, self.handlers)
         self.broker = CapabilityBroker(self.capabilities, self.handlers)
         self.store = AuthorityRepository(self.programs)
-        self.store.install_policy(
-            PolicySnapshot(0, ask_risks, deny_effects, NOW)
-        )
+        self.store.install_policy(PolicySnapshot(0, ask_risks, deny_effects, NOW))
         if grant:
             constraints = ("approval_required",) if approval_required else ()
             self.store.issue_grant(
@@ -127,6 +128,24 @@ class K4AuthorityTests(unittest.TestCase):
             finally:
                 fx.close()
 
+    def test_allow_decision_can_issue_only_one_execution_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fx = Fixture(directory)
+            try:
+                context = fx.engine.decide(
+                    program_id="p-1", actor_id="a-1", resolution=fx.resolution
+                )
+                first = fx.engine.issue_execution_authority(
+                    decision_id=context.decision.decision_id
+                )
+                self.assertEqual(first.decision_id, context.decision.decision_id)
+                with self.assertRaises(AuthorityDenied):
+                    fx.engine.issue_execution_authority(
+                        decision_id=context.decision.decision_id
+                    )
+            finally:
+                fx.close()
+
     def test_capability_availability_without_grant_denies(self):
         with tempfile.TemporaryDirectory() as directory:
             fx = Fixture(directory, grant=False)
@@ -169,6 +188,20 @@ class K4AuthorityTests(unittest.TestCase):
             finally:
                 fx.close()
 
+    def test_ask_decision_can_receive_only_one_approval_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fx = Fixture(directory, approval_required=True)
+            try:
+                context = fx.engine.decide(
+                    program_id="p-1", actor_id="a-1", resolution=fx.resolution
+                )
+                approval = fx.engine.approve(decision_id=context.decision.decision_id)
+                self.assertEqual(approval.decision_id, context.decision.decision_id)
+                with self.assertRaises(ApprovalInvalid):
+                    fx.engine.approve(decision_id=context.decision.decision_id)
+            finally:
+                fx.close()
+
     def test_approval_cannot_authorize_different_decision(self):
         with tempfile.TemporaryDirectory() as directory:
             fx = Fixture(directory, approval_required=True)
@@ -200,7 +233,8 @@ class K4AuthorityTests(unittest.TestCase):
                     decision_id=first.decision.decision_id
                 )
                 second = fx.engine.decide(
-                    program_id="p-1", actor_id="a-1",
+                    program_id="p-1",
+                    actor_id="a-1",
                     resolution=replace(fx.resolution, request_id="req-2"),
                 )
                 fx.store.revoke_grant("g-1")
@@ -349,10 +383,12 @@ class K4AuthorityTests(unittest.TestCase):
                         approval_id=approval.approval_id,
                     )
                 fx.store._append_event = original_append
-                self.assertEqual(
-                    fx.store.get_approval(approval.approval_id),
-                    approval,
+                self.assertEqual(fx.store.get_approval(approval.approval_id), approval)
+                receipt = fx.engine.issue_execution_authority(
+                    decision_id=context.decision.decision_id,
+                    approval_id=approval.approval_id,
                 )
+                self.assertEqual(receipt.decision_id, context.decision.decision_id)
             finally:
                 fx.close()
 
