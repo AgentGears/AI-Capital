@@ -272,7 +272,8 @@ class AuthorityEngine:
                 raise ApprovalInvalid("approval is stale for policy")
             if approval.resolved_effect_digest != canonical_digest(decision.resolved_effect):
                 raise ApprovalInvalid("approval is bound to a different effect")
-            self._store.consume_approval(approval_id)
+        elif approval_id is not None:
+            raise ApprovalInvalid("allow decisions do not consume approvals")
 
         receipt = ExecutionAuthorityReceipt(
             receipt_id=str(uuid4()),
@@ -289,7 +290,7 @@ class AuthorityEngine:
             issued_at=utc_now(),
             single_use_identity=str(uuid4()),
         )
-        self._store.record_execution_authority(receipt)
+        self._store.record_execution_authority(receipt, approval_id=approval_id)
         return receipt
 
     def consume_execution_authority(
@@ -315,11 +316,20 @@ class AuthorityEngine:
         if receipt.resolved_effect_digest != canonical_digest(context.decision.resolved_effect):
             raise IntegrityViolation("execution authority effect binding is invalid")
 
-        active_ids = {
-            grant.grant_id for grant in self._store.active_grants(actor_id=receipt.actor_id)
+        current_grants = {
+            grant.grant_id: grant
+            for grant in self._store.active_grants(actor_id=receipt.actor_id)
         }
-        if any(grant_id not in active_ids for grant_id in receipt.grant_refs):
-            raise AuthorityDenied("execution authority references revoked Grant")
+        now = utc_now()
+        for grant_id in receipt.grant_refs:
+            grant = current_grants.get(grant_id)
+            if grant is None or not grant_matches(
+                grant,
+                actor_id=receipt.actor_id,
+                resolution=context.resolution,
+                at=now,
+            ):
+                raise AuthorityDenied("execution authority Grant set is no longer current")
 
         self._store.consume_execution_authority(receipt_id)
         return receipt
