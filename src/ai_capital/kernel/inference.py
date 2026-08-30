@@ -8,7 +8,13 @@ from uuid import uuid4
 from .actor_store import ActorRepository
 from .durable_program import ProgramRepository
 from .enums import ActorStatus, ModelAttemptOutcome
-from .errors import IntegrityViolation, InternalFault, InvalidRequest
+from .errors import (
+    IntegrityViolation,
+    InternalFault,
+    InvalidRequest,
+    StaleActorGeneration,
+    StaleProgramRevision,
+)
 from .events import utc_now
 from .frozen_json import FrozenMap, freeze_json
 from .models import (
@@ -72,7 +78,6 @@ class InferenceHost:
         actor_id: str,
         context_receipt: ContextReceipt,
         context: Mapping[str, object],
-        attempt_id: str | None = None,
     ) -> InferenceResult:
         program = self._programs.get(program_id)
         actor = self._actors.get(actor_id)
@@ -88,7 +93,7 @@ class InferenceHost:
         if not isinstance(configuration, FrozenMap):
             raise IntegrityViolation("effective model configuration must be an object")
 
-        attempt_id = attempt_id or str(uuid4())
+        attempt_id = str(uuid4())
         request = InferenceRequest(
             attempt_id=attempt_id,
             actor_id=actor.actor_id,
@@ -144,6 +149,51 @@ class InferenceHost:
             self._actors.record_attempt(receipt, None)
             raise IntegrityViolation("inference provider returned invalid model output")
 
+        output_digest = canonical_digest(turn)
+        current_program = self._programs.get(program_id)
+        current_actor = self._actors.get(actor_id)
+        if current_program.revision != program.revision:
+            receipt = ModelAttemptReceipt(
+                attempt_id=attempt_id,
+                actor_id=actor.actor_id,
+                actor_generation=actor.generation,
+                program_id=program.program_id,
+                program_revision=program.revision,
+                model_binding=actor.model_binding,
+                context_receipt_ref=context_receipt.context_receipt_id,
+                effective_config_digest=configuration_digest,
+                outcome=ModelAttemptOutcome.STALE,
+                started_at=started_at,
+                finished_at=finished_at,
+                output_digest=output_digest,
+                error_code="stale_program_revision",
+            )
+            self._actors.record_attempt(receipt, turn)
+            raise StaleProgramRevision("model output is stale for current Program revision")
+
+        if (
+            current_actor.generation != actor.generation
+            or current_actor.model_binding != actor.model_binding
+            or current_actor.status is not ActorStatus.ACTIVE
+        ):
+            receipt = ModelAttemptReceipt(
+                attempt_id=attempt_id,
+                actor_id=actor.actor_id,
+                actor_generation=actor.generation,
+                program_id=program.program_id,
+                program_revision=program.revision,
+                model_binding=actor.model_binding,
+                context_receipt_ref=context_receipt.context_receipt_id,
+                effective_config_digest=configuration_digest,
+                outcome=ModelAttemptOutcome.STALE,
+                started_at=started_at,
+                finished_at=finished_at,
+                output_digest=output_digest,
+                error_code="stale_actor_generation",
+            )
+            self._actors.record_attempt(receipt, turn)
+            raise StaleActorGeneration("model output is stale for current Actor generation")
+
         receipt = ModelAttemptReceipt(
             attempt_id=attempt_id,
             actor_id=actor.actor_id,
@@ -156,7 +206,7 @@ class InferenceHost:
             outcome=ModelAttemptOutcome.SUCCEEDED,
             started_at=started_at,
             finished_at=finished_at,
-            output_digest=canonical_digest(turn),
+            output_digest=output_digest,
             error_code=None,
         )
         self._actors.record_attempt(receipt, turn)
