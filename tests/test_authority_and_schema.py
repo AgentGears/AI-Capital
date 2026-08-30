@@ -74,6 +74,14 @@ class AuthorityAndSchemaTests(unittest.TestCase):
         self.assertEqual(nested["path"], ("a", "b"))
         with self.assertRaises(TypeError):
             capability.input_schema["new"] = "value"
+        with self.assertRaises(AttributeError):
+            capability.input_schema._items = ()
+
+    def test_canonical_structures_reject_ambiguous_values(self):
+        with self.assertRaises(TypeError):
+            FrozenMap({1: "not-a-string-key"})
+        with self.assertRaises(ValueError):
+            canonical_json({"value": float("nan")})
 
     def test_every_authority_domain_has_owner(self):
         self.assertEqual(set(ownership_matrix()), set(AuthorityDomain))
@@ -118,6 +126,8 @@ class AuthorityAndSchemaTests(unittest.TestCase):
             "reasoning_proposals", "capability_requests", "claim_proposals",
             "completion_proposal", "provenance_receipt",
         })
+        with self.assertRaises(TypeError):
+            ModelTurn()
 
     def test_canonical_serialization_is_deterministic(self):
         left = {"b": 2, "a": 1}
