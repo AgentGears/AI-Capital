@@ -47,22 +47,26 @@ class ActorRepository:
                     raise IntegrityViolation(f"unsupported Actor schema version {version}")
                 return
 
-            self._host_store._db.executescript(
+            statements = (
                 """
-                CREATE TABLE actor_projections (
+                CREATE TABLE IF NOT EXISTS actor_projections (
                     actor_id TEXT PRIMARY KEY,
                     generation INTEGER NOT NULL,
                     actor_json TEXT NOT NULL,
                     actor_digest TEXT NOT NULL
-                );
-                CREATE TABLE actor_generations (
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS actor_generations (
                     actor_id TEXT NOT NULL,
                     generation INTEGER NOT NULL,
                     actor_json TEXT NOT NULL,
                     actor_digest TEXT NOT NULL,
                     PRIMARY KEY(actor_id, generation)
-                );
-                CREATE TABLE model_attempts (
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS model_attempts (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     attempt_id TEXT NOT NULL UNIQUE,
                     actor_id TEXT NOT NULL,
@@ -73,13 +77,19 @@ class ActorRepository:
                     receipt_digest TEXT NOT NULL,
                     turn_json TEXT,
                     turn_digest TEXT
-                );
-                CREATE INDEX model_attempts_actor_sequence
-                    ON model_attempts(actor_id, sequence);
-                CREATE INDEX model_attempts_program_sequence
-                    ON model_attempts(program_id, sequence);
+                )
+                """,
                 """
+                CREATE INDEX IF NOT EXISTS model_attempts_actor_sequence
+                    ON model_attempts(actor_id, sequence)
+                """,
+                """
+                CREATE INDEX IF NOT EXISTS model_attempts_program_sequence
+                    ON model_attempts(program_id, sequence)
+                """,
             )
+            for statement in statements:
+                self._host_store._db.execute(statement)
             self._host_store._db.execute(
                 "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                 (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
@@ -223,14 +233,21 @@ class ActorRepository:
         if generation is None:
             raise IntegrityViolation("model attempt references unknown Actor generation")
 
-        if receipt.outcome is ModelAttemptOutcome.SUCCEEDED:
-            if turn is None or receipt.error_code is not None:
-                raise IntegrityViolation("successful model attempt requires output and no error")
+        if receipt.outcome in {
+            ModelAttemptOutcome.SUCCEEDED,
+            ModelAttemptOutcome.STALE,
+        }:
+            if turn is None:
+                raise IntegrityViolation("model attempt outcome requires retained output")
             if turn.provenance_receipt != receipt.attempt_id:
                 raise IntegrityViolation("model output provenance does not match attempt")
             turn_digest = canonical_digest(turn)
             if receipt.output_digest != turn_digest:
                 raise IntegrityViolation("model output digest does not match receipt")
+            if receipt.outcome is ModelAttemptOutcome.SUCCEEDED and receipt.error_code is not None:
+                raise IntegrityViolation("successful model attempt cannot carry an error code")
+            if receipt.outcome is ModelAttemptOutcome.STALE and not receipt.error_code:
+                raise IntegrityViolation("stale model attempt requires a currentness code")
             turn_json = record_to_json(turn)
         else:
             if turn is not None or receipt.output_digest is not None:
