@@ -99,6 +99,9 @@ class JsonHttpProviderTests(unittest.TestCase):
                     seen = ResponseHandler.seen_request
                     self.assertIsNotNone(seen)
                     self.assertEqual(seen["attempt_id"], result.receipt.attempt_id)
+                    self.assertEqual(seen["context_receipt"]["context_receipt_id"], "ctx-1")
+                    self.assertEqual(seen["context_receipt"]["program_id"], "p-1")
+                    self.assertEqual(seen["context_receipt"]["program_revision"], 0)
                     UUID(result.receipt.attempt_id)
                     self.assertEqual(result.turn.provenance_receipt, result.receipt.attempt_id)
                     self.assertEqual(result.turn.reasoning_proposals[0].text, "inspect the objective")
@@ -111,6 +114,7 @@ class JsonHttpProviderTests(unittest.TestCase):
                     )
                     stored_request = actors.request(result.receipt.attempt_id)
                     self.assertEqual(stored_request.context["objective"], program.objective)
+                    self.assertEqual(stored_request.context_receipt.context_receipt_id, "ctx-1")
                     self.assertEqual(result.receipt.input_digest, canonical_digest(stored_request))
         finally:
             server.shutdown()
