@@ -134,7 +134,10 @@ class CapabilityRepository:
             raise IntegrityViolation("Capability projection binding revision mismatch")
         if canonical_digest(capability) != row["capability_digest"]:
             raise IntegrityViolation("Capability projection digest mismatch")
-        self._validate_capability(capability, new=False)
+        try:
+            self._validate_capability(capability, new=False)
+        except InvalidRequest as exc:
+            raise IntegrityViolation("durable Capability contract is invalid") from exc
         return capability
 
     def register(self, capability: Capability) -> Capability:
