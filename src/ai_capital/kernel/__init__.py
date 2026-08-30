@@ -16,6 +16,7 @@ from .frozen_json import *
 from .inference import *
 from .json_http_provider import *
 from .models import *
+from .operation_journal import *
 from .operations import *
 from .ownership import *
 from .program_state import *
