@@ -27,7 +27,7 @@ from .models import (
     ExecutionAuthorityReceipt,
     Grant,
 )
-from .schema_codec import record_to_json
+from .schema_codec import record_from_json, record_to_json
 from .serialization import canonical_digest, canonical_json
 
 
@@ -93,9 +93,12 @@ def _parse_time(value: str) -> datetime:
 
 
 def grant_is_current(grant: Grant, *, at: str) -> bool:
+    current = _parse_time(at)
+    if current < _parse_time(grant.issued_at):
+        return False
     if grant.expires_at is None:
         return True
-    return _parse_time(at) < _parse_time(grant.expires_at)
+    return current < _parse_time(grant.expires_at)
 
 
 def grant_matches(
@@ -221,6 +224,12 @@ class AuthorityEngine:
         policy = self._store.current_policy()
         if policy.policy_revision != context.decision.policy_revision:
             raise ApprovalInvalid("approval request is stale for current policy")
+        existing = self._store._host_store._db.execute(
+            "SELECT 1 FROM approval_receipts WHERE decision_id = ? LIMIT 1",
+            (decision_id,),
+        ).fetchone()
+        if existing is not None:
+            raise ApprovalInvalid("AuthorityDecision already has an approval receipt")
         approval = ApprovalReceipt(
             approval_id=str(uuid4()),
             decision_id=decision_id,
@@ -232,6 +241,16 @@ class AuthorityEngine:
         self._store.record_approval(approval)
         return approval
 
+    @staticmethod
+    def _receipt_from_json(payload: str) -> ExecutionAuthorityReceipt:
+        try:
+            receipt = record_from_json(ExecutionAuthorityReceipt, payload)
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("execution authority cannot be decoded") from exc
+        if not isinstance(receipt, ExecutionAuthorityReceipt):
+            raise IntegrityViolation("decoded execution authority has wrong type")
+        return receipt
+
     def _persist_execution_authority(
         self,
         receipt: ExecutionAuthorityReceipt,
@@ -240,6 +259,18 @@ class AuthorityEngine:
     ) -> None:
         try:
             with self._store._host_store._transaction():
+                prior_rows = self._store._host_store._db.execute(
+                    "SELECT receipt_json, receipt_digest FROM execution_authority_receipts"
+                ).fetchall()
+                for row in prior_rows:
+                    prior = self._receipt_from_json(row["receipt_json"])
+                    if canonical_digest(prior) != row["receipt_digest"]:
+                        raise IntegrityViolation("execution authority digest mismatch")
+                    if prior.decision_id == receipt.decision_id:
+                        raise AuthorityDenied(
+                            "AuthorityDecision already issued execution authority"
+                        )
+
                 if approval is not None:
                     row = self._store._host_store._db.execute(
                         "SELECT consumed_at FROM approval_receipts WHERE approval_id = ?",
