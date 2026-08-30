@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 import sys
 import tempfile
@@ -11,7 +12,7 @@ from ai_capital.kernel.capability_broker import CapabilityBroker, CapabilityHand
 from ai_capital.kernel.capability_store import CapabilityRepository
 from ai_capital.kernel.durable_program import ProgramRepository
 from ai_capital.kernel.enums import ContextCompleteness
-from ai_capital.kernel.errors import InvalidRequest
+from ai_capital.kernel.errors import IntegrityViolation, InvalidRequest
 from ai_capital.kernel.inference import (
     InferenceHost,
     ModelBindingRegistry,
@@ -61,7 +62,7 @@ class CapabilityContextTests(unittest.TestCase):
         provider = CapturingProvider()
         bindings = ModelBindingRegistry()
         bindings.register("binding-a", provider)
-        host = InferenceHost(programs, actors, bindings)
+        host = InferenceHost(programs, actors, bindings, capabilities)
         return programs, actors, program, snapshot, provider, host
 
     def test_host_injects_exact_receipted_snapshot_into_durable_model_context(self):
@@ -158,6 +159,48 @@ class CapabilityContextTests(unittest.TestCase):
                         context_receipt=receipt_for(
                             program,
                             ("capability_snapshot:not-the-supplied-snapshot",),
+                        ),
+                        context={"objective": program.objective},
+                        capability_snapshot=snapshot,
+                    )
+                self.assertEqual(provider.requests, [])
+            finally:
+                programs.close()
+
+    def test_forged_snapshot_with_real_identity_is_rejected_before_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            programs, _, program, snapshot, provider, host = self._fixture(directory)
+            try:
+                forged = replace(snapshot, capabilities=snapshot.capabilities[:1])
+                with self.assertRaises(IntegrityViolation):
+                    host.infer(
+                        program_id=program.program_id,
+                        actor_id="actor-1",
+                        context_receipt=receipt_for(
+                            program,
+                            (capability_snapshot_ref(snapshot),),
+                        ),
+                        context={"objective": program.objective},
+                        capability_snapshot=forged,
+                    )
+                self.assertEqual(provider.requests, [])
+            finally:
+                programs.close()
+
+    def test_snapshot_exposure_requires_capability_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            programs, actors, program, snapshot, provider, _ = self._fixture(directory)
+            try:
+                bindings = ModelBindingRegistry()
+                bindings.register("binding-a", provider)
+                host = InferenceHost(programs, actors, bindings)
+                with self.assertRaises(InvalidRequest):
+                    host.infer(
+                        program_id=program.program_id,
+                        actor_id="actor-1",
+                        context_receipt=receipt_for(
+                            program,
+                            (capability_snapshot_ref(snapshot),),
                         ),
                         context={"objective": program.objective},
                         capability_snapshot=snapshot,
