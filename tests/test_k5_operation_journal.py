@@ -335,7 +335,7 @@ class K5OperationJournalTests(unittest.TestCase):
                     recovered_journal.replay_is_intrinsically_safe(operation_id)
                 )
 
-    def test_restart_before_dispatch_fails_without_claiming_effect(self):
+    def test_restart_before_dispatch_proves_mutation_absent(self):
         with tempfile.TemporaryDirectory() as directory:
             fx = Fixture(directory)
             try:
@@ -357,10 +357,13 @@ class K5OperationJournalTests(unittest.TestCase):
                 operation = recovered[0]
                 self.assertEqual(operation.operation_id, operation_id)
                 self.assertIs(operation.execution_outcome, ExecutionOutcome.FAILED)
-                self.assertIs(operation.effect_status, EffectStatus.NOT_APPLICABLE)
+                self.assertIs(operation.effect_status, EffectStatus.ABSENT)
                 self.assertIs(
                     operation.reconciliation_status,
                     ReconciliationStatus.NOT_REQUIRED,
+                )
+                self.assertTrue(
+                    recovered_journal.replay_is_intrinsically_safe(operation_id)
                 )
 
     def test_idempotency_key_requires_backend_support(self):
