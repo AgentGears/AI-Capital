@@ -12,6 +12,7 @@ from .enums import (
     EffectClass,
     EffectStatus,
     ExecutionOutcome,
+    ModelAttemptOutcome,
     ProgramStatus,
     ReconciliationStatus,
     Reversibility,
@@ -191,6 +192,21 @@ class ContextReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class InferenceRequest:
+    attempt_id: str
+    actor_id: str
+    actor_generation: int
+    program_id: str
+    program_revision: int
+    model_binding: str
+    context_receipt_ref: str
+    context: FrozenMap
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "context", freeze_json(self.context))
+
+
+@dataclass(frozen=True, slots=True)
 class ModelAttemptReceipt:
     attempt_id: str
     actor_id: str
@@ -200,8 +216,11 @@ class ModelAttemptReceipt:
     model_binding: str
     context_receipt_ref: str
     effective_config_digest: str
+    outcome: ModelAttemptOutcome
     started_at: str
-    finished_at: str | None = None
+    finished_at: str
+    output_digest: str | None
+    error_code: str | None
 
 
 @dataclass(frozen=True, slots=True)
