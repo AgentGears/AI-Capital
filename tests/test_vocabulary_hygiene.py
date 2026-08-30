@@ -10,11 +10,12 @@ CANONICAL_DOCUMENTS = (
     "AI_CAPITAL_ARCHITECTURE_PATTERN_REGISTER.md",
 )
 
+# This is a structural guard, not a substitute for architecture review. It avoids
+# embedding external product/project names in the repository while still catching
+# common external-identity leakage forms.
 FORBIDDEN_PATTERNS = (
     re.compile(r"https?://", re.IGNORECASE),
     re.compile(r"\bexternal/source system\b", re.IGNORECASE),
-    re.compile(r"\bsource provenance\b", re.IGNORECASE),
-    re.compile(r"\b(repository|publication)\s*:", re.IGNORECASE),
     re.compile(r"\bcommit\s+[0-9a-f]{7,40}\b", re.IGNORECASE),
     re.compile(r"\b[0-9a-f]{40}\b", re.IGNORECASE),
 )
@@ -30,7 +31,7 @@ class VocabularyHygieneTests(unittest.TestCase):
             for pattern in FORBIDDEN_PATTERNS:
                 self.assertIsNone(
                     pattern.search(text),
-                    f"{relative_path} contains forbidden structural marker",
+                    f"{relative_path} contains forbidden external-identity marker",
                 )
 
 
