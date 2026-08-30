@@ -22,6 +22,7 @@ from ai_capital.kernel.durable_program import ProgramRepository
 from ai_capital.kernel.enums import EffectClass, Reversibility, RiskClass
 from ai_capital.kernel.errors import (
     CapabilityUnavailable,
+    IntegrityViolation,
     InvalidRequest,
     StaleCapabilityBinding,
     UnknownCapability,
@@ -67,6 +68,16 @@ class CountingResolver:
             resource_type="workspace_path",
             target=arguments[self.binding_target],
             effect_class=EffectClass.OBSERVE,
+            parameters={},
+        )
+
+
+class WrongContractResolver:
+    def resolve_effect(self, arguments: FrozenMap) -> ResolvedEffect:
+        return ResolvedEffect(
+            resource_type="different_resource",
+            target=arguments["path"],
+            effect_class=EffectClass.MODIFY,
             parameters={},
         )
 
@@ -201,6 +212,39 @@ class CapabilityRegistryTests(unittest.TestCase):
                 self.assertEqual(resolution.resolved_effect.target, "notes.txt")
                 self.assertEqual(resolution.resolved_effect.effect_class, EffectClass.OBSERVE)
                 self.assertEqual(resolution.request_id, "req-1")
+
+    def test_resolver_cannot_escape_capability_semantic_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with ProgramRepository(Path(directory) / "kernel.db") as host:
+                capabilities = CapabilityRepository(host)
+                handlers = CapabilityHandlerRegistry()
+                capabilities.register(simple_capability())
+                handlers.register("handler-a", WrongContractResolver())
+                broker = CapabilityBroker(capabilities, handlers)
+                snapshot = broker.snapshot(("workspace.read",))
+                with self.assertRaises(IntegrityViolation):
+                    broker.resolve(
+                        CapabilityRequest(
+                            "req-1", "workspace.read", {"path": "notes.txt"}, 0
+                        ),
+                        snapshot=snapshot,
+                    )
+
+    def test_snapshot_store_rejects_noncurrent_or_forged_descriptor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with ProgramRepository(Path(directory) / "kernel.db") as host:
+                capabilities = CapabilityRepository(host)
+                registered = capabilities.register(simple_capability())
+                descriptor = capability_descriptor(registered)
+                forged = replace(descriptor, operation="different-operation")
+                with self.assertRaises(InvalidRequest):
+                    capabilities.create_snapshot((forged,))
+
+                capabilities.replace_handler(
+                    "workspace.read", "handler-b", expected_binding_revision=0
+                )
+                with self.assertRaises(InvalidRequest):
+                    capabilities.create_snapshot((descriptor,))
 
     def test_initial_builtin_family_is_complete_and_snapshot_is_durable(self):
         expected = (
