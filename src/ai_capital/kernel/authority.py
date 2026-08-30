@@ -61,18 +61,17 @@ class ApprovalReceipt:
     single_use_identity: str
 
 
+_EFFECT_RANK: dict[EffectClass, int] = {
+    EffectClass.OBSERVE: 0,
+    EffectClass.CREATE: 1,
+    EffectClass.MODIFY: 2,
+    EffectClass.DELETE: 3,
+    EffectClass.EXTERNAL_SIDE_EFFECT: 4,
+}
+
+
 def effect_allowed_by_ceiling(ceiling: EffectClass, effect: EffectClass) -> bool:
-    permitted = {
-        EffectClass.OBSERVE: frozenset({EffectClass.OBSERVE}),
-        EffectClass.CREATE: frozenset({EffectClass.OBSERVE, EffectClass.CREATE}),
-        EffectClass.MODIFY: frozenset({EffectClass.OBSERVE, EffectClass.MODIFY}),
-        EffectClass.DELETE: frozenset({EffectClass.OBSERVE, EffectClass.DELETE}),
-        EffectClass.EXTERNAL_SIDE_EFFECT: frozenset({
-            EffectClass.OBSERVE,
-            EffectClass.EXTERNAL_SIDE_EFFECT,
-        }),
-    }
-    return effect in permitted[ceiling]
+    return _EFFECT_RANK[effect] <= _EFFECT_RANK[ceiling]
 
 
 def scope_matches(pattern: str, value: str) -> bool:
