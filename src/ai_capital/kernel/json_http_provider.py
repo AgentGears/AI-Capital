@@ -96,6 +96,7 @@ class JsonHttpInferenceProvider:
             "program_id": request.program_id,
             "program_revision": request.program_revision,
             "model_profile": self._model_profile,
+            "context_receipt": to_canonical_data(request.context_receipt),
             "context": to_canonical_data(request.context),
         }).encode("utf-8")
         outbound = Request(
