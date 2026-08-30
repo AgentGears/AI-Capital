@@ -313,6 +313,7 @@ class K5OperationJournalTests(unittest.TestCase):
                 fx.authority.consume_execution_authority(
                     receipt_id=authority.receipt_id
                 )
+                fx.journal.mark_admitted(operation.operation_id)
                 fx.journal.mark_running(operation.operation_id)
                 operation_id = operation.operation_id
             finally:
