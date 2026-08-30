@@ -6,6 +6,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from .actor_store import ActorRepository
+from .capability_store import CapabilityRepository
 from .durable_program import ProgramRepository
 from .enums import ActorStatus, ModelAttemptOutcome
 from .errors import (
@@ -71,10 +72,12 @@ class InferenceHost:
         programs: ProgramRepository,
         actors: ActorRepository,
         bindings: ModelBindingRegistry,
+        capabilities: CapabilityRepository | None = None,
     ):
         self._programs = programs
         self._actors = actors
         self._bindings = bindings
+        self._capabilities = capabilities
 
     def infer(
         self,
@@ -98,6 +101,7 @@ class InferenceHost:
             context=context,
             context_receipt=context_receipt,
             capability_snapshot=capability_snapshot,
+            capabilities=self._capabilities,
         )
 
         provider = self._bindings.resolve(actor.model_binding)
@@ -240,6 +244,7 @@ def _bind_capability_snapshot(
     context: Mapping[str, object],
     context_receipt: ContextReceipt,
     capability_snapshot: CapabilitySnapshot | None,
+    capabilities: CapabilityRepository | None,
 ) -> dict[str, object]:
     if _CAPABILITY_CONTEXT_KEY in context:
         raise InvalidRequest(
@@ -260,10 +265,20 @@ def _bind_capability_snapshot(
             )
         return effective_context
 
-    expected_ref = capability_snapshot_ref(capability_snapshot)
+    if capabilities is None:
+        raise InvalidRequest(
+            "Capability snapshot exposure requires the Host Capability registry"
+        )
+    durable_snapshot = capabilities.get_snapshot(capability_snapshot.snapshot_id)
+    if durable_snapshot != capability_snapshot:
+        raise IntegrityViolation(
+            "supplied Capability snapshot differs from durable Host snapshot"
+        )
+
+    expected_ref = capability_snapshot_ref(durable_snapshot)
     if capability_refs != (expected_ref,):
         raise InvalidRequest(
             "ContextReceipt must include exactly the supplied Capability snapshot"
         )
-    effective_context[_CAPABILITY_CONTEXT_KEY] = to_canonical_data(capability_snapshot)
+    effective_context[_CAPABILITY_CONTEXT_KEY] = to_canonical_data(durable_snapshot)
     return effective_context
