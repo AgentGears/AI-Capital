@@ -2,6 +2,8 @@
 
 from .actor_state import *
 from .actor_store import *
+from .authority import *
+from .authority_store import *
 from .builtin_capabilities import *
 from .capability_broker import *
 from .capability_store import *
