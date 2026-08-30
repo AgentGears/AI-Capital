@@ -13,7 +13,7 @@ from ai_capital.kernel.builtin_capabilities import install_builtin_capabilities
 from ai_capital.kernel.capability_broker import CapabilityBroker, CapabilityHandlerRegistry
 from ai_capital.kernel.capability_store import CapabilityRepository
 from ai_capital.kernel.durable_program import ProgramRepository
-from ai_capital.kernel.enums import AuthorityDecisionKind, EffectClass, RiskClass
+from ai_capital.kernel.enums import AuthorityDecisionKind, EffectClass, ProgramStatus, RiskClass
 from ai_capital.kernel.errors import IntegrityViolation
 from ai_capital.kernel.models import Actor, CapabilityRequest, Grant, Program
 from ai_capital.kernel.schema_codec import record_to_json
@@ -29,6 +29,7 @@ class StoredDecisionIntegrityTests(unittest.TestCase):
             path = Path(directory) / "kernel.db"
             with ProgramRepository(path) as programs:
                 programs.create(Program("p-1", 0, "stored decision integrity"))
+                programs.transition("p-1", ProgramStatus.ACTIVE, expected_revision=0)
                 actors = ActorRepository(programs)
                 actors.register(Actor("a-1", 0, "worker", "binding-a"))
 
