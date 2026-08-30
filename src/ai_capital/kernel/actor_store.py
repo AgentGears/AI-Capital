@@ -6,7 +6,7 @@ from .actor_state import replace_model_binding
 from .durable_program import ProgramRepository
 from .enums import ActorStatus, ModelAttemptOutcome
 from .errors import IntegrityViolation, InvalidRequest, PersistenceConflict, StaleActorGeneration
-from .models import Actor, ModelAttemptReceipt, ModelTurn
+from .models import Actor, InferenceRequest, ModelAttemptReceipt, ModelTurn
 from .schema_codec import record_from_json, record_to_json
 from .serialization import canonical_digest
 
@@ -73,6 +73,8 @@ class ActorRepository:
                     actor_generation INTEGER NOT NULL,
                     program_id TEXT NOT NULL,
                     program_revision INTEGER NOT NULL,
+                    request_json TEXT NOT NULL,
+                    request_digest TEXT NOT NULL,
                     receipt_json TEXT NOT NULL,
                     receipt_digest TEXT NOT NULL,
                     turn_json TEXT,
@@ -222,6 +224,7 @@ class ActorRepository:
         self,
         receipt: ModelAttemptReceipt,
         turn: ModelTurn | None,
+        request: InferenceRequest,
     ) -> None:
         generation = self._host_store._db.execute(
             """
@@ -232,6 +235,20 @@ class ActorRepository:
         ).fetchone()
         if generation is None:
             raise IntegrityViolation("model attempt references unknown Actor generation")
+
+        if (
+            request.attempt_id != receipt.attempt_id
+            or request.actor_id != receipt.actor_id
+            or request.actor_generation != receipt.actor_generation
+            or request.program_id != receipt.program_id
+            or request.program_revision != receipt.program_revision
+            or request.model_binding != receipt.model_binding
+            or request.context_receipt_ref != receipt.context_receipt_ref
+        ):
+            raise IntegrityViolation("model attempt receipt does not match inference request")
+        request_digest = canonical_digest(request)
+        if receipt.input_digest != request_digest:
+            raise IntegrityViolation("model attempt input digest does not match inference request")
 
         if receipt.outcome in {
             ModelAttemptOutcome.SUCCEEDED,
@@ -264,8 +281,9 @@ class ActorRepository:
                     INSERT INTO model_attempts(
                         attempt_id, actor_id, actor_generation,
                         program_id, program_revision,
+                        request_json, request_digest,
                         receipt_json, receipt_digest, turn_json, turn_digest
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         receipt.attempt_id,
@@ -273,6 +291,8 @@ class ActorRepository:
                         receipt.actor_generation,
                         receipt.program_id,
                         receipt.program_revision,
+                        record_to_json(request),
+                        request_digest,
                         record_to_json(receipt),
                         canonical_digest(receipt),
                         turn_json,
@@ -284,28 +304,62 @@ class ActorRepository:
                 f"duplicate model attempt identity: {receipt.attempt_id}"
             ) from exc
 
+    def _receipt_from_row(self, row: sqlite3.Row) -> ModelAttemptReceipt:
+        try:
+            receipt = record_from_json(ModelAttemptReceipt, row["receipt_json"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("model attempt receipt cannot be decoded") from exc
+        if not isinstance(receipt, ModelAttemptReceipt):
+            raise IntegrityViolation("decoded model attempt receipt has wrong type")
+        if canonical_digest(receipt) != row["receipt_digest"]:
+            raise IntegrityViolation("model attempt receipt digest mismatch")
+        if (
+            receipt.attempt_id != row["attempt_id"]
+            or receipt.actor_id != row["actor_id"]
+            or receipt.actor_generation != int(row["actor_generation"])
+            or receipt.program_id != row["program_id"]
+            or receipt.program_revision != int(row["program_revision"])
+            or receipt.input_digest != row["request_digest"]
+        ):
+            raise IntegrityViolation("model attempt row disagrees with receipt")
+        return receipt
+
     def attempts(self, actor_id: str) -> tuple[ModelAttemptReceipt, ...]:
         rows = self._host_store._db.execute(
             """
-            SELECT receipt_json, receipt_digest
+            SELECT attempt_id, actor_id, actor_generation, program_id, program_revision,
+                   request_digest, receipt_json, receipt_digest
             FROM model_attempts
             WHERE actor_id = ?
             ORDER BY sequence
             """,
             (actor_id,),
         ).fetchall()
-        receipts: list[ModelAttemptReceipt] = []
-        for row in rows:
-            try:
-                receipt = record_from_json(ModelAttemptReceipt, row["receipt_json"])
-            except (TypeError, ValueError) as exc:
-                raise IntegrityViolation("model attempt receipt cannot be decoded") from exc
-            if not isinstance(receipt, ModelAttemptReceipt):
-                raise IntegrityViolation("decoded model attempt receipt has wrong type")
-            if canonical_digest(receipt) != row["receipt_digest"]:
-                raise IntegrityViolation("model attempt receipt digest mismatch")
-            receipts.append(receipt)
-        return tuple(receipts)
+        return tuple(self._receipt_from_row(row) for row in rows)
+
+    def request(self, attempt_id: str) -> InferenceRequest:
+        row = self._host_store._db.execute(
+            """
+            SELECT attempt_id, actor_id, actor_generation, program_id, program_revision,
+                   request_json, request_digest, receipt_json, receipt_digest
+            FROM model_attempts WHERE attempt_id = ?
+            """,
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            raise InvalidRequest(f"unknown model attempt: {attempt_id}")
+        receipt = self._receipt_from_row(row)
+        try:
+            request = record_from_json(InferenceRequest, row["request_json"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("inference request cannot be decoded") from exc
+        if not isinstance(request, InferenceRequest):
+            raise IntegrityViolation("decoded inference request has wrong type")
+        if canonical_digest(request) != row["request_digest"]:
+            raise IntegrityViolation("inference request digest mismatch")
+        if request.attempt_id != receipt.attempt_id:
+            raise IntegrityViolation("inference request identity disagrees with receipt")
+        return request
 
     def turn(self, attempt_id: str) -> ModelTurn | None:
         row = self._host_store._db.execute(
@@ -329,4 +383,6 @@ class ActorRepository:
             raise IntegrityViolation("decoded model output has wrong type")
         if canonical_digest(turn) != row["turn_digest"]:
             raise IntegrityViolation("model output digest mismatch")
+        if turn.provenance_receipt != attempt_id:
+            raise IntegrityViolation("model output provenance disagrees with attempt identity")
         return turn
