@@ -20,7 +20,11 @@ from ai_capital.kernel.enums import (
     ProgramStatus,
     ReconciliationStatus,
 )
-from ai_capital.kernel.errors import ExecutionTimeout, IntegrityViolation
+from ai_capital.kernel.errors import (
+    ExecutionCancelled,
+    ExecutionTimeout,
+    IntegrityViolation,
+)
 from ai_capital.kernel.models import Actor, CapabilityRequest, Grant, Program
 from ai_capital.kernel.operation_journal import (
     ExecutionObservation,
@@ -61,6 +65,47 @@ class SideEffectThenExitExecutor:
         self.calls += 1
         self.marker.write_text("effect happened", encoding="utf-8")
         raise SystemExit("acknowledgement lost after effect")
+
+
+class SideEffectThenCancelExecutor:
+    supports_idempotency = False
+
+    def __init__(self, marker: Path):
+        self.marker = marker
+        self.calls = 0
+
+    def execute(self, effect, *, idempotency_key):
+        self.calls += 1
+        self.marker.write_text("effect happened", encoding="utf-8")
+        raise ExecutionCancelled("cancelled after effect")
+
+
+class DuplicateDeliveryExecutor:
+    supports_idempotency = True
+
+    def __init__(self):
+        self.calls = 0
+        self.deliveries = 0
+        self.effects = 0
+        self._seen: set[str] = set()
+
+    def _deliver(self, key: str) -> None:
+        self.deliveries += 1
+        if key in self._seen:
+            return
+        self._seen.add(key)
+        self.effects += 1
+
+    def execute(self, effect, *, idempotency_key):
+        self.calls += 1
+        assert idempotency_key is not None
+        self._deliver(idempotency_key)
+        self._deliver(idempotency_key)
+        return ExecutionObservation(
+            ExecutionOutcome.SUCCEEDED,
+            EffectStatus.CONFIRMED,
+            {"deduplicated": True},
+        )
 
 
 class Fixture:
@@ -170,6 +215,90 @@ class K5OperationIntegrityTests(unittest.TestCase):
                 self.assertFalse(journal.replay_is_intrinsically_safe(operation_id))
                 self.assertEqual(marker.read_text(encoding="utf-8"), "effect happened")
 
+    def test_cancellation_after_real_side_effect_is_indeterminate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "cancel.marker"
+            fx = Fixture(directory)
+            try:
+                resolution, authority = fx.authorize()
+                executor = SideEffectThenCancelExecutor(marker)
+                operation = fx.host.execute_authorized(
+                    resolution=resolution,
+                    authority_receipt_id=authority.receipt_id,
+                    executor=executor,
+                )
+                self.assertEqual(executor.calls, 1)
+                self.assertEqual(marker.read_text(encoding="utf-8"), "effect happened")
+                self.assertIs(operation.execution_outcome, ExecutionOutcome.CANCELLED)
+                self.assertIs(operation.effect_status, EffectStatus.INDETERMINATE)
+                self.assertIs(
+                    operation.reconciliation_status,
+                    ReconciliationStatus.PENDING,
+                )
+                self.assertFalse(
+                    fx.journal.replay_is_intrinsically_safe(operation.operation_id)
+                )
+            finally:
+                fx.close()
+
+    def test_duplicate_adapter_delivery_uses_same_idempotency_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fx = Fixture(directory)
+            try:
+                resolution, authority = fx.authorize()
+                executor = DuplicateDeliveryExecutor()
+                operation = fx.host.execute_authorized(
+                    resolution=resolution,
+                    authority_receipt_id=authority.receipt_id,
+                    executor=executor,
+                    idempotency_key="host-idem-1",
+                )
+                self.assertEqual(executor.calls, 1)
+                self.assertEqual(executor.deliveries, 2)
+                self.assertEqual(executor.effects, 1)
+                self.assertEqual(
+                    fx.journal.idempotency_key(operation.operation_id),
+                    "host-idem-1",
+                )
+                self.assertIs(operation.effect_status, EffectStatus.CONFIRMED)
+            finally:
+                fx.close()
+
+    def test_semantic_event_sequence_includes_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fx = Fixture(directory)
+            try:
+                resolution, authority = fx.authorize()
+                fx.host.execute_authorized(
+                    resolution=resolution,
+                    authority_receipt_id=authority.receipt_id,
+                    executor=Executor(
+                        ExecutionObservation(
+                            ExecutionOutcome.SUCCEEDED,
+                            EffectStatus.CONFIRMED,
+                            {},
+                        )
+                    ),
+                )
+                rows = fx.programs._db.execute(
+                    """
+                    SELECT event_type FROM events
+                    WHERE event_type LIKE 'operation.%'
+                    ORDER BY sequence
+                    """
+                ).fetchall()
+                self.assertEqual(
+                    [row["event_type"] for row in rows],
+                    [
+                        "operation.requested",
+                        "operation.admitted",
+                        "operation.started",
+                        "operation.finished",
+                    ],
+                )
+            finally:
+                fx.close()
+
     def test_observe_backend_cannot_claim_environmental_effect(self):
         with tempfile.TemporaryDirectory() as directory:
             fx = Fixture(directory, capability_id="workspace.read")
@@ -182,6 +311,7 @@ class K5OperationIntegrityTests(unittest.TestCase):
                     authority_receipt_ref=authority.receipt_id,
                 )
                 fx.authority.consume_execution_authority(receipt_id=authority.receipt_id)
+                fx.journal.mark_admitted(operation.operation_id)
                 fx.journal.mark_running(operation.operation_id)
                 with self.assertRaises(IntegrityViolation):
                     fx.journal.finish(
@@ -211,6 +341,7 @@ class K5OperationIntegrityTests(unittest.TestCase):
                     authority_receipt_ref=authority.receipt_id,
                 )
                 fx.authority.consume_execution_authority(receipt_id=authority.receipt_id)
+                fx.journal.mark_admitted(operation.operation_id)
                 fx.journal.mark_running(operation.operation_id)
                 with self.assertRaises(IntegrityViolation):
                     fx.journal.finish(
