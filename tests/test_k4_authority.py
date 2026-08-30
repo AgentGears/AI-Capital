@@ -53,10 +53,15 @@ class Fixture:
         capability_id: str = "workspace.read",
         effect_ceiling: EffectClass = EffectClass.OBSERVE,
         resource_scope: tuple[str, ...] = ("*",),
+        activate_program: bool = True,
     ):
         self.path = Path(directory) / "kernel.db"
         self.programs = ProgramRepository(self.path)
         self.program = self.programs.create(Program("p-1", 0, "authority proof"))
+        if activate_program:
+            self.program = self.programs.transition(
+                "p-1", ProgramStatus.ACTIVE, expected_revision=0
+            )
         self.actors = ActorRepository(self.programs)
         self.actors.register(Actor("a-1", 0, "worker", "binding-a"))
         self.capabilities = CapabilityRepository(self.programs)
@@ -125,6 +130,17 @@ class K4AuthorityTests(unittest.TestCase):
                 fx.engine.consume_execution_authority(receipt_id=receipt.receipt_id)
                 with self.assertRaises(AuthorityDenied):
                     fx.engine.consume_execution_authority(receipt_id=receipt.receipt_id)
+            finally:
+                fx.close()
+
+    def test_created_program_cannot_receive_protected_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fx = Fixture(directory, activate_program=False)
+            try:
+                with self.assertRaises(AuthorityDenied):
+                    fx.engine.decide(
+                        program_id="p-1", actor_id="a-1", resolution=fx.resolution
+                    )
             finally:
                 fx.close()
 
@@ -254,7 +270,9 @@ class K4AuthorityTests(unittest.TestCase):
                 program_decision = fx.engine.decide(
                     program_id="p-1", actor_id="a-1", resolution=fx.resolution
                 )
-                fx.programs.transition("p-1", ProgramStatus.ACTIVE, expected_revision=0)
+                fx.programs.transition(
+                    "p-1", ProgramStatus.BLOCKED, expected_revision=1
+                )
                 with self.assertRaises(StaleProgramRevision):
                     fx.engine.issue_execution_authority(
                         decision_id=program_decision.decision.decision_id
