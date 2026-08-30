@@ -27,6 +27,11 @@ class ActorStatus(StringEnum):
     DISABLED = "disabled"
 
 
+class ModelAttemptOutcome(StringEnum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 class EffectClass(StringEnum):
     OBSERVE = "observe"
     CREATE = "create"
