@@ -153,6 +153,15 @@ class AuthorityEngine:
 
         if resolution.binding_revision != capability.binding_revision:
             raise StaleCapabilityBinding("Capability resolution is stale")
+        if (
+            resolution.resolved_effect.resource_type != capability.resource_type
+            or resolution.resolved_effect.effect_class is not capability.effect_class
+        ):
+            raise IntegrityViolation(
+                "Capability resolution violates the current Capability contract"
+            )
+        if not resolution.request_id.strip():
+            raise IntegrityViolation("Capability resolution request identity is empty")
 
         active_grants = self._store.active_grants(actor_id=actor_id)
         matching = tuple(
