@@ -227,32 +227,32 @@ class AuthorityEngine:
         self,
         receipt: ExecutionAuthorityReceipt,
         *,
-        approval_id: str | None,
+        approval: ApprovalReceipt | None,
     ) -> None:
         try:
             with self._store._host_store._transaction():
-                if approval_id is not None:
+                if approval is not None:
                     row = self._store._host_store._db.execute(
-                        """
-                        SELECT consumed_at FROM approval_receipts
-                        WHERE approval_id = ?
-                        """,
-                        (approval_id,),
+                        "SELECT consumed_at FROM approval_receipts WHERE approval_id = ?",
+                        (approval.approval_id,),
                     ).fetchone()
                     if row is None:
-                        raise ApprovalInvalid(f"unknown approval: {approval_id}")
+                        raise ApprovalInvalid(f"unknown approval: {approval.approval_id}")
                     if row["consumed_at"] is not None:
-                        raise ApprovalConsumed(f"approval already consumed: {approval_id}")
+                        raise ApprovalConsumed(
+                            f"approval already consumed: {approval.approval_id}"
+                        )
                     cursor = self._store._host_store._db.execute(
                         """
                         UPDATE approval_receipts SET consumed_at = ?
                         WHERE approval_id = ? AND consumed_at IS NULL
                         """,
-                        (utc_now(), approval_id),
+                        (utc_now(), approval.approval_id),
                     )
                     if cursor.rowcount != 1:
-                        raise ApprovalConsumed(f"approval already consumed: {approval_id}")
-                    approval = self._store.get_approval_unchecked(approval_id)
+                        raise ApprovalConsumed(
+                            f"approval already consumed: {approval.approval_id}"
+                        )
                     self._store._append_event("approval.consumed", approval)
 
                 self._store._host_store._db.execute(
@@ -316,6 +316,7 @@ class AuthorityEngine:
             ):
                 raise AuthorityDenied("AuthorityDecision Grant set is no longer current")
 
+        approval: ApprovalReceipt | None = None
         if decision.decision is AuthorityDecisionKind.DENY:
             raise AuthorityDenied(decision.rationale_code)
         if decision.decision is AuthorityDecisionKind.ASK:
@@ -346,7 +347,7 @@ class AuthorityEngine:
             issued_at=utc_now(),
             single_use_identity=str(uuid4()),
         )
-        self._persist_execution_authority(receipt, approval_id=approval_id)
+        self._persist_execution_authority(receipt, approval=approval)
         return receipt
 
     def consume_execution_authority(
