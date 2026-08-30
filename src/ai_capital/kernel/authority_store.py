@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from .authority import ApprovalReceipt, AuthorityDecisionContext, PolicySnapshot
@@ -110,6 +111,16 @@ class AuthorityRepository:
             )
 
     @staticmethod
+    def _parse_time(value: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise InvalidRequest("authority timestamp must be valid ISO-8601") from exc
+        if parsed.tzinfo is None:
+            raise InvalidRequest("authority timestamp must be timezone-aware")
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
     def _validate_scope(pattern: str) -> None:
         if not pattern:
             raise InvalidRequest("Grant scope entries must be non-empty")
@@ -128,6 +139,11 @@ class AuthorityRepository:
             cls._validate_scope(pattern)
         if any(item != "approval_required" for item in grant.constraints):
             raise InvalidRequest("unsupported Grant constraint")
+        issued_at = cls._parse_time(grant.issued_at)
+        if grant.expires_at is not None:
+            expires_at = cls._parse_time(grant.expires_at)
+            if expires_at <= issued_at:
+                raise InvalidRequest("Grant expiry must be later than issuance")
 
     def _append_event(
         self,
@@ -250,14 +266,15 @@ class AuthorityRepository:
                 raise AuthorityDenied(f"Grant is already revoked: {grant_id}")
             self._append_event("grant.revoked", {"grant_id": grant_id, "grant": grant})
 
-    @staticmethod
-    def _validate_policy(policy: PolicySnapshot) -> None:
+    @classmethod
+    def _validate_policy(cls, policy: PolicySnapshot) -> None:
         if policy.policy_revision < 0:
             raise InvalidRequest("policy revision must be non-negative")
         if len(set(policy.ask_risk_classes)) != len(policy.ask_risk_classes):
             raise InvalidRequest("policy ask risks contain duplicates")
         if len(set(policy.deny_effect_classes)) != len(policy.deny_effect_classes):
             raise InvalidRequest("policy denied effects contain duplicates")
+        cls._parse_time(policy.created_at)
 
     def install_policy(self, policy: PolicySnapshot) -> PolicySnapshot:
         self._validate_policy(policy)
