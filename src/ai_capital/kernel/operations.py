@@ -51,8 +51,11 @@ def validate_operation_semantics(operation: Operation) -> None:
         raise IntegrityViolation("successful execution cannot assert absent effect")
 
 
-def retry_is_safe(operation: Operation, *, idempotency_contract: bool = False) -> bool:
+def retry_is_safe(operation: Operation) -> bool:
+    """K0 only recognizes proven absence as intrinsically retry-safe.
+
+    Host-validated idempotency contracts belong to the later Operation admission
+    layer and must not be represented as an untrusted boolean bypass here.
+    """
     validate_operation_semantics(operation)
-    if idempotency_contract:
-        return True
     return operation.effect_status is EffectStatus.ABSENT
