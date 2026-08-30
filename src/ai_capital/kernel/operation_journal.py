@@ -153,6 +153,7 @@ class OperationJournal:
                     resolution_json TEXT NOT NULL,
                     resolution_digest TEXT NOT NULL,
                     idempotency_key TEXT,
+                    admitted_sequence INTEGER,
                     last_sequence INTEGER NOT NULL
                 )
                 """,
@@ -258,7 +259,8 @@ class OperationJournal:
             """
             SELECT operation_id, program_id, actor_id, capability_id,
                    authority_receipt_ref, operation_json, operation_digest,
-                   resolution_json, resolution_digest, idempotency_key, last_sequence
+                   resolution_json, resolution_digest, idempotency_key,
+                   admitted_sequence, last_sequence
             FROM operation_projections WHERE operation_id = ?
             """,
             (operation_id,),
@@ -320,8 +322,9 @@ class OperationJournal:
                     INSERT INTO operation_projections(
                         operation_id, program_id, actor_id, capability_id,
                         authority_receipt_ref, operation_json, operation_digest,
-                        resolution_json, resolution_digest, idempotency_key, last_sequence
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        resolution_json, resolution_digest, idempotency_key,
+                        admitted_sequence, last_sequence
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
                     """,
                     (
                         operation.operation_id,
@@ -340,6 +343,47 @@ class OperationJournal:
         except sqlite3.IntegrityError as exc:
             raise PersistenceConflict("Operation identity collision") from exc
         return operation
+
+    def mark_admitted(self, operation_id: str) -> Operation:
+        row = self._read_row(operation_id)
+        current, _ = self._decode_row(row)
+        if current.execution_outcome is not ExecutionOutcome.NOT_STARTED:
+            raise IntegrityViolation("only a not-started Operation may be admitted")
+        if row["admitted_sequence"] is not None:
+            raise IntegrityViolation("Operation is already admitted")
+        with self._host_store._transaction():
+            row = self._read_row(operation_id)
+            current, _ = self._decode_row(row)
+            if current.execution_outcome is not ExecutionOutcome.NOT_STARTED:
+                raise PersistenceConflict("Operation changed before admission")
+            if row["admitted_sequence"] is not None:
+                raise IntegrityViolation("Operation is already admitted")
+            event = self._append_event(
+                "operation.admitted",
+                {
+                    "operation": current,
+                    "authority_receipt_ref": current.authority_receipt_ref,
+                },
+                program_id=current.program_id,
+                actor_id=current.actor_id,
+            )
+            cursor = self._host_store._db.execute(
+                """
+                UPDATE operation_projections
+                SET admitted_sequence = ?, last_sequence = ?
+                WHERE operation_id = ? AND operation_digest = ?
+                  AND admitted_sequence IS NULL
+                """,
+                (
+                    event.sequence,
+                    event.sequence,
+                    operation_id,
+                    canonical_digest(current),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceConflict("Operation changed during admission")
+        return current
 
     def _insert_receipt(
         self,
@@ -415,9 +459,12 @@ class OperationJournal:
         return updated
 
     def mark_running(self, operation_id: str) -> Operation:
-        current = self.get(operation_id)
+        row = self._read_row(operation_id)
+        current, _ = self._decode_row(row)
         if current.execution_outcome is not ExecutionOutcome.NOT_STARTED:
             raise IntegrityViolation("only a not-started Operation may begin execution")
+        if row["admitted_sequence"] is None:
+            raise IntegrityViolation("Operation cannot start before admission")
         updated = replace(
             current,
             execution_outcome=ExecutionOutcome.RUNNING,
@@ -567,7 +614,7 @@ class OperationJournal:
     def recover_interrupted(self) -> tuple[Operation, ...]:
         rows = self._host_store._db.execute(
             """
-            SELECT operation_id FROM operation_projections
+            SELECT operation_id, admitted_sequence FROM operation_projections
             ORDER BY operation_id
             """
         ).fetchall()
@@ -575,10 +622,15 @@ class OperationJournal:
         for row in rows:
             current = self.get(row["operation_id"])
             if current.execution_outcome is ExecutionOutcome.NOT_STARTED:
+                error_code = (
+                    "host_interrupted_after_admission_before_dispatch"
+                    if row["admitted_sequence"] is not None
+                    else "host_interrupted_before_admission"
+                )
                 recovered.append(
                     self.fail_before_dispatch(
                         current.operation_id,
-                        error_code="host_interrupted_before_dispatch",
+                        error_code=error_code,
                     )
                 )
                 continue
@@ -738,6 +790,7 @@ class OperationHost:
             )
             raise
 
+        self._journal.mark_admitted(operation.operation_id)
         running = self._journal.mark_running(operation.operation_id)
         effect = resolution.resolved_effect
         try:
