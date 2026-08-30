@@ -6,6 +6,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from .actor_store import ActorRepository
+from .capability_store import CapabilityRepository
 from .durable_program import ProgramRepository
 from .enums import ActorStatus, ModelAttemptOutcome
 from .errors import (
@@ -18,12 +19,17 @@ from .errors import (
 from .events import utc_now
 from .frozen_json import FrozenMap, freeze_json
 from .models import (
+    CapabilitySnapshot,
     ContextReceipt,
     InferenceRequest,
     ModelAttemptReceipt,
     ModelTurn,
 )
-from .serialization import canonical_digest
+from .serialization import canonical_digest, to_canonical_data
+
+
+_CAPABILITY_CONTEXT_KEY = "capability_snapshot"
+_CAPABILITY_REF_PREFIX = "capability_snapshot:"
 
 
 class InferenceProvider(Protocol):
@@ -66,10 +72,12 @@ class InferenceHost:
         programs: ProgramRepository,
         actors: ActorRepository,
         bindings: ModelBindingRegistry,
+        capabilities: CapabilityRepository | None = None,
     ):
         self._programs = programs
         self._actors = actors
         self._bindings = bindings
+        self._capabilities = capabilities
 
     def infer(
         self,
@@ -78,6 +86,7 @@ class InferenceHost:
         actor_id: str,
         context_receipt: ContextReceipt,
         context: Mapping[str, object],
+        capability_snapshot: CapabilitySnapshot | None = None,
     ) -> InferenceResult:
         program = self._programs.get(program_id)
         actor = self._actors.get(actor_id)
@@ -87,6 +96,13 @@ class InferenceHost:
             raise InvalidRequest("ContextReceipt references a different Program")
         if context_receipt.program_revision != program.revision:
             raise InvalidRequest("ContextReceipt is stale for current Program revision")
+
+        effective_context = _bind_capability_snapshot(
+            context=context,
+            context_receipt=context_receipt,
+            capability_snapshot=capability_snapshot,
+            capabilities=self._capabilities,
+        )
 
         provider = self._bindings.resolve(actor.model_binding)
         configuration = freeze_json(provider.effective_configuration())
@@ -102,7 +118,7 @@ class InferenceHost:
             program_revision=program.revision,
             model_binding=actor.model_binding,
             context_receipt=context_receipt,
-            context=context,
+            context=effective_context,
         )
         input_digest = canonical_digest(request)
         started_at = utc_now()
@@ -217,3 +233,52 @@ class InferenceHost:
         )
         self._actors.record_attempt(receipt, turn, request)
         return InferenceResult(receipt=receipt, turn=turn)
+
+
+def capability_snapshot_ref(snapshot: CapabilitySnapshot) -> str:
+    return f"{_CAPABILITY_REF_PREFIX}{snapshot.snapshot_id}"
+
+
+def _bind_capability_snapshot(
+    *,
+    context: Mapping[str, object],
+    context_receipt: ContextReceipt,
+    capability_snapshot: CapabilitySnapshot | None,
+    capabilities: CapabilityRepository | None,
+) -> dict[str, object]:
+    if _CAPABILITY_CONTEXT_KEY in context:
+        raise InvalidRequest(
+            "capability_snapshot is Host-reserved and cannot be caller-supplied"
+        )
+
+    capability_refs = tuple(
+        ref
+        for ref in context_receipt.included_refs
+        if ref.startswith(_CAPABILITY_REF_PREFIX)
+    )
+    effective_context = dict(context)
+
+    if capability_snapshot is None:
+        if capability_refs:
+            raise InvalidRequest(
+                "ContextReceipt claims a Capability snapshot that was not supplied"
+            )
+        return effective_context
+
+    if capabilities is None:
+        raise InvalidRequest(
+            "Capability snapshot exposure requires the Host Capability registry"
+        )
+    durable_snapshot = capabilities.get_snapshot(capability_snapshot.snapshot_id)
+    if durable_snapshot != capability_snapshot:
+        raise IntegrityViolation(
+            "supplied Capability snapshot differs from durable Host snapshot"
+        )
+
+    expected_ref = capability_snapshot_ref(durable_snapshot)
+    if capability_refs != (expected_ref,):
+        raise InvalidRequest(
+            "ContextReceipt must include exactly the supplied Capability snapshot"
+        )
+    effective_context[_CAPABILITY_CONTEXT_KEY] = to_canonical_data(durable_snapshot)
+    return effective_context
