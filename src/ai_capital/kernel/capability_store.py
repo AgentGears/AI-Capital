@@ -280,6 +280,12 @@ class CapabilityRepository:
         ordered = tuple(sorted(descriptors, key=lambda item: item.capability_id))
         if len({item.capability_id for item in ordered}) != len(ordered):
             raise InvalidRequest("Capability snapshot contains duplicate identities")
+        for descriptor in ordered:
+            current = self.get(descriptor.capability_id)
+            if capability_descriptor(current) != descriptor:
+                raise InvalidRequest(
+                    f"Capability snapshot descriptor is not current: {descriptor.capability_id}"
+                )
         snapshot = CapabilitySnapshot(
             snapshot_id=str(uuid4()),
             capabilities=ordered,
