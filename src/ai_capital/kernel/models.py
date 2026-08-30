@@ -199,7 +199,7 @@ class InferenceRequest:
     program_id: str
     program_revision: int
     model_binding: str
-    context_receipt_ref: str
+    context_receipt: ContextReceipt
     context: FrozenMap
 
     def __post_init__(self) -> None:
