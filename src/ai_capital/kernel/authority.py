@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -9,10 +10,12 @@ from .capability_store import CapabilityRepository
 from .durable_program import ProgramRepository
 from .enums import AuthorityDecisionKind, EffectClass, RiskClass
 from .errors import (
+    ApprovalConsumed,
     ApprovalInvalid,
     ApprovalRequired,
     AuthorityDenied,
     IntegrityViolation,
+    PersistenceConflict,
     StaleActorGeneration,
     StaleCapabilityBinding,
     StaleProgramRevision,
@@ -24,6 +27,7 @@ from .models import (
     ExecutionAuthorityReceipt,
     Grant,
 )
+from .schema_codec import record_to_json
 from .serialization import canonical_digest, canonical_json
 
 
@@ -219,6 +223,58 @@ class AuthorityEngine:
         self._store.record_approval(approval)
         return approval
 
+    def _persist_execution_authority(
+        self,
+        receipt: ExecutionAuthorityReceipt,
+        *,
+        approval_id: str | None,
+    ) -> None:
+        try:
+            with self._store._host_store._transaction():
+                if approval_id is not None:
+                    row = self._store._host_store._db.execute(
+                        """
+                        SELECT consumed_at FROM approval_receipts
+                        WHERE approval_id = ?
+                        """,
+                        (approval_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise ApprovalInvalid(f"unknown approval: {approval_id}")
+                    if row["consumed_at"] is not None:
+                        raise ApprovalConsumed(f"approval already consumed: {approval_id}")
+                    cursor = self._store._host_store._db.execute(
+                        """
+                        UPDATE approval_receipts SET consumed_at = ?
+                        WHERE approval_id = ? AND consumed_at IS NULL
+                        """,
+                        (utc_now(), approval_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ApprovalConsumed(f"approval already consumed: {approval_id}")
+                    approval = self._store.get_approval_unchecked(approval_id)
+                    self._store._append_event("approval.consumed", approval)
+
+                self._store._host_store._db.execute(
+                    """
+                    INSERT INTO execution_authority_receipts(
+                        receipt_id, single_use_identity, receipt_json,
+                        receipt_digest, consumed_at
+                    ) VALUES (?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        receipt.receipt_id,
+                        receipt.single_use_identity,
+                        record_to_json(receipt),
+                        canonical_digest(receipt),
+                    ),
+                )
+                self._store._append_event("authority.execution_issued", receipt)
+        except sqlite3.IntegrityError as exc:
+            raise PersistenceConflict(
+                f"execution authority identity already exists: {receipt.receipt_id}"
+            ) from exc
+
     def issue_execution_authority(
         self,
         *,
@@ -290,7 +346,7 @@ class AuthorityEngine:
             issued_at=utc_now(),
             single_use_identity=str(uuid4()),
         )
-        self._store.record_execution_authority(receipt, approval_id=approval_id)
+        self._persist_execution_authority(receipt, approval_id=approval_id)
         return receipt
 
     def consume_execution_authority(
