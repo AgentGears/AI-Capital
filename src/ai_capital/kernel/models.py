@@ -77,6 +77,54 @@ class Capability:
 
 
 @dataclass(frozen=True, slots=True)
+class CapabilityDescriptor:
+    capability_id: str
+    schema_version: int
+    operation: str
+    resource_type: str
+    effect_class: EffectClass
+    reversibility: Reversibility
+    risk_class: RiskClass
+    input_schema: FrozenMap
+    output_schema: FrozenMap
+    binding_revision: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "input_schema", freeze_json(self.input_schema))
+        object.__setattr__(self, "output_schema", freeze_json(self.output_schema))
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilitySnapshot:
+    snapshot_id: str
+    capabilities: tuple[CapabilityDescriptor, ...]
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedEffect:
+    resource_type: str
+    target: str
+    effect_class: EffectClass
+    parameters: FrozenMap
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "parameters", freeze_json(self.parameters))
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityResolution:
+    request_id: str
+    capability_id: str
+    binding_revision: int
+    arguments: FrozenMap
+    resolved_effect: ResolvedEffect
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "arguments", freeze_json(self.arguments))
+
+
+@dataclass(frozen=True, slots=True)
 class Grant:
     grant_id: str
     subject_ref: str
