@@ -12,6 +12,7 @@ from .enums import (
     EffectClass,
     EffectStatus,
     ExecutionOutcome,
+    ModelAttemptOutcome,
     ProgramStatus,
     ReconciliationStatus,
     Reversibility,
@@ -191,6 +192,32 @@ class ContextReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class InferenceRequest:
+    attempt_id: str
+    actor_id: str
+    actor_generation: int
+    program_id: str
+    program_revision: int
+    model_binding: str
+    context_receipt: ContextReceipt
+    context: FrozenMap
+
+    def __post_init__(self) -> None:
+        frozen_context = freeze_json(self.context)
+        if not isinstance(frozen_context, FrozenMap):
+            raise TypeError("inference context must be an object")
+        if self.context_receipt.program_id != self.program_id:
+            raise ValueError("ContextReceipt Program does not match inference request")
+        if self.context_receipt.program_revision != self.program_revision:
+            raise ValueError("ContextReceipt revision does not match inference request")
+        object.__setattr__(self, "context", frozen_context)
+
+    @property
+    def context_receipt_ref(self) -> str:
+        return self.context_receipt.context_receipt_id
+
+
+@dataclass(frozen=True, slots=True)
 class ModelAttemptReceipt:
     attempt_id: str
     actor_id: str
@@ -199,9 +226,13 @@ class ModelAttemptReceipt:
     program_revision: int
     model_binding: str
     context_receipt_ref: str
+    input_digest: str
     effective_config_digest: str
+    outcome: ModelAttemptOutcome
     started_at: str
-    finished_at: str | None = None
+    finished_at: str
+    output_digest: str | None
+    error_code: str | None
 
 
 @dataclass(frozen=True, slots=True)
