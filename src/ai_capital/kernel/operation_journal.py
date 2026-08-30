@@ -31,7 +31,7 @@ from .serialization import canonical_digest, to_canonical_data
 
 
 _COMPONENT = "operation_journal"
-_COMPONENT_SCHEMA_VERSION = 1
+_COMPONENT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,59 +129,81 @@ class OperationJournal:
                 "SELECT version FROM component_schema WHERE component = ?",
                 (_COMPONENT,),
             ).fetchone()
-            if row is not None:
-                version = int(row[0])
-                if version > _COMPONENT_SCHEMA_VERSION:
-                    raise IntegrityViolation(
-                        f"Operation schema version {version} is newer than supported "
-                        f"{_COMPONENT_SCHEMA_VERSION}"
+            version = None if row is None else int(row[0])
+            if version is not None and version > _COMPONENT_SCHEMA_VERSION:
+                raise IntegrityViolation(
+                    f"Operation schema version {version} is newer than supported "
+                    f"{_COMPONENT_SCHEMA_VERSION}"
+                )
+
+            if version is None:
+                self._host_store._db.execute(
+                    """
+                    CREATE TABLE operation_projections (
+                        operation_id TEXT PRIMARY KEY,
+                        program_id TEXT NOT NULL,
+                        actor_id TEXT NOT NULL,
+                        capability_id TEXT NOT NULL,
+                        authority_receipt_ref TEXT NOT NULL,
+                        operation_json TEXT NOT NULL,
+                        operation_digest TEXT NOT NULL,
+                        resolution_json TEXT NOT NULL,
+                        resolution_digest TEXT NOT NULL,
+                        idempotency_key TEXT,
+                        admitted_sequence INTEGER,
+                        last_sequence INTEGER NOT NULL
                     )
-                if version != _COMPONENT_SCHEMA_VERSION:
-                    raise IntegrityViolation(f"unsupported Operation schema version {version}")
+                    """
+                )
+                self._host_store._db.execute(
+                    """
+                    CREATE INDEX operations_program
+                        ON operation_projections(program_id, operation_id)
+                    """
+                )
+                self._host_store._db.execute(
+                    """
+                    CREATE TABLE operation_receipts (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        receipt_id TEXT NOT NULL UNIQUE,
+                        operation_id TEXT NOT NULL,
+                        receipt_type TEXT NOT NULL,
+                        receipt_json TEXT NOT NULL,
+                        receipt_digest TEXT NOT NULL
+                    )
+                    """
+                )
+                self._host_store._db.execute(
+                    """
+                    CREATE INDEX operation_receipts_operation
+                        ON operation_receipts(operation_id, sequence)
+                    """
+                )
+                self._host_store._db.execute(
+                    "INSERT INTO component_schema(component, version) VALUES (?, ?)",
+                    (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
+                )
                 return
 
-            statements = (
-                """
-                CREATE TABLE IF NOT EXISTS operation_projections (
-                    operation_id TEXT PRIMARY KEY,
-                    program_id TEXT NOT NULL,
-                    actor_id TEXT NOT NULL,
-                    capability_id TEXT NOT NULL,
-                    authority_receipt_ref TEXT NOT NULL,
-                    operation_json TEXT NOT NULL,
-                    operation_digest TEXT NOT NULL,
-                    resolution_json TEXT NOT NULL,
-                    resolution_digest TEXT NOT NULL,
-                    idempotency_key TEXT,
-                    admitted_sequence INTEGER,
-                    last_sequence INTEGER NOT NULL
+            if version == 1:
+                columns = {
+                    str(item[1])
+                    for item in self._host_store._db.execute(
+                        "PRAGMA table_info(operation_projections)"
+                    ).fetchall()
+                }
+                if "admitted_sequence" not in columns:
+                    self._host_store._db.execute(
+                        "ALTER TABLE operation_projections ADD COLUMN admitted_sequence INTEGER"
+                    )
+                self._host_store._db.execute(
+                    "UPDATE component_schema SET version = ? WHERE component = ?",
+                    (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
                 )
-                """,
-                """
-                CREATE INDEX IF NOT EXISTS operations_program
-                    ON operation_projections(program_id, operation_id)
-                """,
-                """
-                CREATE TABLE IF NOT EXISTS operation_receipts (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    receipt_id TEXT NOT NULL UNIQUE,
-                    operation_id TEXT NOT NULL,
-                    receipt_type TEXT NOT NULL,
-                    receipt_json TEXT NOT NULL,
-                    receipt_digest TEXT NOT NULL
-                )
-                """,
-                """
-                CREATE INDEX IF NOT EXISTS operation_receipts_operation
-                    ON operation_receipts(operation_id, sequence)
-                """,
-            )
-            for statement in statements:
-                self._host_store._db.execute(statement)
-            self._host_store._db.execute(
-                "INSERT INTO component_schema(component, version) VALUES (?, ?)",
-                (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
-            )
+                version = _COMPONENT_SCHEMA_VERSION
+
+            if version != _COMPONENT_SCHEMA_VERSION:
+                raise IntegrityViolation(f"unsupported Operation schema version {version}")
 
     def _append_event(
         self,
@@ -223,6 +245,21 @@ class OperationJournal:
         self._host_store._insert_event(event)
         return event
 
+    def _read_row(self, operation_id: str) -> sqlite3.Row:
+        row = self._host_store._db.execute(
+            """
+            SELECT operation_id, program_id, actor_id, capability_id,
+                   authority_receipt_ref, operation_json, operation_digest,
+                   resolution_json, resolution_digest, idempotency_key,
+                   admitted_sequence, last_sequence
+            FROM operation_projections WHERE operation_id = ?
+            """,
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise InvalidRequest(f"unknown Operation: {operation_id}")
+        return row
+
     def _decode_row(self, row: sqlite3.Row) -> tuple[Operation, CapabilityResolution]:
         try:
             operation = record_from_json(Operation, row["operation_json"])
@@ -253,21 +290,6 @@ class OperationJournal:
             raise IntegrityViolation("Operation Capability differs from resolution")
         validate_operation_semantics(operation)
         return operation, resolution
-
-    def _read_row(self, operation_id: str) -> sqlite3.Row:
-        row = self._host_store._db.execute(
-            """
-            SELECT operation_id, program_id, actor_id, capability_id,
-                   authority_receipt_ref, operation_json, operation_digest,
-                   resolution_json, resolution_digest, idempotency_key,
-                   admitted_sequence, last_sequence
-            FROM operation_projections WHERE operation_id = ?
-            """,
-            (operation_id,),
-        ).fetchone()
-        if row is None:
-            raise InvalidRequest(f"unknown Operation: {operation_id}")
-        return row
 
     def get(self, operation_id: str) -> Operation:
         operation, _ = self._decode_row(self._read_row(operation_id))
@@ -497,9 +519,15 @@ class OperationJournal:
         current = self.get(operation_id)
         if current.execution_outcome is not ExecutionOutcome.NOT_STARTED:
             raise IntegrityViolation("pre-dispatch failure requires a not-started Operation")
+        resolution = self.resolution(operation_id)
+        effect_status = (
+            EffectStatus.NOT_APPLICABLE
+            if resolution.resolved_effect.effect_class is EffectClass.OBSERVE
+            else EffectStatus.ABSENT
+        )
         observation = ExecutionObservation(
             execution_outcome=ExecutionOutcome.FAILED,
-            effect_status=EffectStatus.NOT_APPLICABLE,
+            effect_status=effect_status,
             output={},
             error_code=error_code,
         )
@@ -507,7 +535,7 @@ class OperationJournal:
         updated = replace(
             current,
             execution_outcome=ExecutionOutcome.FAILED,
-            effect_status=EffectStatus.NOT_APPLICABLE,
+            effect_status=effect_status,
             reconciliation_status=ReconciliationStatus.NOT_REQUIRED,
             finished_at=receipt.observed_at,
             receipt_refs=current.receipt_refs + (receipt.receipt_id,),
@@ -561,6 +589,11 @@ class OperationJournal:
             resolution.resolved_effect.effect_class,
             observation.effect_status,
         )
+        if (
+            observation.execution_outcome is ExecutionOutcome.SUCCEEDED
+            and observation.error_code is not None
+        ):
+            raise IntegrityViolation("successful execution cannot carry an error code")
         updated = replace(
             current,
             execution_outcome=observation.execution_outcome,
@@ -588,7 +621,7 @@ class OperationJournal:
         operation = self.get(operation_id)
         row = self._host_store._db.execute(
             """
-            SELECT receipt_id, receipt_json, receipt_digest
+            SELECT receipt_id, operation_id, receipt_type, receipt_json, receipt_digest
             FROM operation_receipts
             WHERE operation_id = ? AND receipt_type = 'execution'
             ORDER BY sequence DESC LIMIT 1
@@ -603,6 +636,8 @@ class OperationJournal:
             raise IntegrityViolation("execution receipt cannot be decoded") from exc
         if receipt.receipt_id != row["receipt_id"]:
             raise IntegrityViolation("execution receipt row identity mismatch")
+        if receipt.operation_id != row["operation_id"] or row["receipt_type"] != "execution":
+            raise IntegrityViolation("execution receipt row binding mismatch")
         if canonical_digest(receipt) != row["receipt_digest"]:
             raise IntegrityViolation("execution receipt digest mismatch")
         if receipt.operation_id != operation_id:
@@ -637,12 +672,16 @@ class OperationJournal:
             if current.execution_outcome is not ExecutionOutcome.RUNNING:
                 continue
             resolution = self.resolution(current.operation_id)
-            if resolution.resolved_effect.effect_class is EffectClass.OBSERVE:
-                effect_status = EffectStatus.NOT_APPLICABLE
-                reconciliation_status = ReconciliationStatus.NOT_REQUIRED
-            else:
-                effect_status = EffectStatus.INDETERMINATE
-                reconciliation_status = ReconciliationStatus.PENDING
+            effect_status = (
+                EffectStatus.NOT_APPLICABLE
+                if resolution.resolved_effect.effect_class is EffectClass.OBSERVE
+                else EffectStatus.INDETERMINATE
+            )
+            reconciliation_status = (
+                ReconciliationStatus.NOT_REQUIRED
+                if effect_status is EffectStatus.NOT_APPLICABLE
+                else ReconciliationStatus.PENDING
+            )
             observation = ExecutionObservation(
                 execution_outcome=ExecutionOutcome.FAILED,
                 effect_status=effect_status,
@@ -814,6 +853,12 @@ class OperationHost:
             observation = self._exception_observation(
                 effect, ExecutionOutcome.FAILED, "execution_backend_fault"
             )
+        if not isinstance(observation, ExecutionObservation):
+            observation = self._exception_observation(
+                effect,
+                ExecutionOutcome.FAILED,
+                "invalid_execution_observation",
+            )
         return self._journal.finish(running.operation_id, observation)
 
     @staticmethod
@@ -849,4 +894,6 @@ class OperationHost:
             execution_receipt=execution_receipt,
             idempotency_key=self._journal.idempotency_key(operation_id),
         )
+        if not isinstance(observation, ReconciliationObservation):
+            raise IntegrityViolation("reconciler returned an invalid observation")
         return self._journal.apply_reconciliation(operation_id, observation)
