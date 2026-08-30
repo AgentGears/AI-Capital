@@ -141,6 +141,67 @@ class AuthorityEngine:
         self._capabilities = capabilities
         self._store = authority_store
 
+    @staticmethod
+    def _expected_decision(
+        *,
+        capability,
+        policy: PolicySnapshot,
+        grants: tuple[Grant, ...],
+    ) -> tuple[AuthorityDecisionKind, str]:
+        if capability.effect_class in policy.deny_effect_classes:
+            return AuthorityDecisionKind.DENY, "policy_denied_effect"
+        if not grants:
+            return AuthorityDecisionKind.DENY, "no_applicable_grant"
+        grant_forces_approval = all(
+            "approval_required" in grant.constraints for grant in grants
+        )
+        if capability.risk_class in policy.ask_risk_classes or grant_forces_approval:
+            return AuthorityDecisionKind.ASK, "approval_required"
+        return AuthorityDecisionKind.ALLOW, "grant_and_policy_allow"
+
+    def _validate_decision_semantics(
+        self,
+        *,
+        context: AuthorityDecisionContext,
+        capability,
+        policy: PolicySnapshot,
+        current_grants: dict[str, Grant],
+        at: str,
+    ) -> tuple[Grant, ...]:
+        decision = context.decision
+        resolution = context.resolution
+        if decision.request_id != resolution.request_id:
+            raise IntegrityViolation("AuthorityDecision request differs from resolution")
+        if context.capability_id != resolution.capability_id:
+            raise IntegrityViolation("AuthorityDecision Capability differs from resolution")
+        if canonical_json(resolution.resolved_effect) != decision.resolved_effect:
+            raise IntegrityViolation("AuthorityDecision effect differs from resolution")
+        if tuple(sorted(set(decision.grant_refs))) != tuple(decision.grant_refs):
+            raise IntegrityViolation("AuthorityDecision Grant references are not canonical")
+
+        referenced: list[Grant] = []
+        for grant_id in decision.grant_refs:
+            grant = current_grants.get(grant_id)
+            if grant is None or not grant_matches(
+                grant,
+                actor_id=context.actor_id,
+                resolution=resolution,
+                at=at,
+            ):
+                raise AuthorityDenied("AuthorityDecision Grant set is no longer current")
+            referenced.append(grant)
+
+        expected_kind, expected_rationale = self._expected_decision(
+            capability=capability,
+            policy=policy,
+            grants=tuple(referenced),
+        )
+        if decision.decision is not expected_kind or decision.rationale_code != expected_rationale:
+            raise IntegrityViolation(
+                "stored AuthorityDecision disagrees with deterministic policy semantics"
+            )
+        return tuple(referenced)
+
     def decide(
         self,
         *,
@@ -166,33 +227,20 @@ class AuthorityEngine:
         if not resolution.request_id.strip():
             raise IntegrityViolation("Capability resolution request identity is empty")
 
-        active_grants = self._store.active_grants(actor_id=actor_id)
         matching = tuple(
             grant
-            for grant in active_grants
+            for grant in self._store.active_grants(actor_id=actor_id)
             if grant_matches(grant, actor_id=actor_id, resolution=resolution, at=now)
         )
-
-        effect = resolution.resolved_effect.effect_class
-        if effect in policy.deny_effect_classes:
-            decision_kind = AuthorityDecisionKind.DENY
-            rationale = "policy_denied_effect"
-            grant_refs: tuple[str, ...] = ()
-        elif not matching:
-            decision_kind = AuthorityDecisionKind.DENY
-            rationale = "no_applicable_grant"
-            grant_refs = ()
-        else:
-            grant_refs = tuple(sorted(grant.grant_id for grant in matching))
-            grant_forces_approval = all(
-                "approval_required" in grant.constraints for grant in matching
-            )
-            if capability.risk_class in policy.ask_risk_classes or grant_forces_approval:
-                decision_kind = AuthorityDecisionKind.ASK
-                rationale = "approval_required"
-            else:
-                decision_kind = AuthorityDecisionKind.ALLOW
-                rationale = "grant_and_policy_allow"
+        matching = tuple(sorted(matching, key=lambda grant: grant.grant_id))
+        decision_kind, rationale = self._expected_decision(
+            capability=capability,
+            policy=policy,
+            grants=matching,
+        )
+        grant_refs = () if decision_kind is AuthorityDecisionKind.DENY else tuple(
+            grant.grant_id for grant in matching
+        )
 
         decision = AuthorityDecision(
             decision_id=str(uuid4()),
@@ -338,23 +386,19 @@ class AuthorityEngine:
             raise IntegrityViolation("AuthorityDecision is stale for policy")
         if context.resolution.binding_revision != capability.binding_revision:
             raise StaleCapabilityBinding("AuthorityDecision resolution is stale")
-        if canonical_json(context.resolution.resolved_effect) != decision.resolved_effect:
-            raise IntegrityViolation("AuthorityDecision effect differs from resolution")
 
         current_grants = {
             grant.grant_id: grant
             for grant in self._store.active_grants(actor_id=context.actor_id)
         }
         now = utc_now()
-        for grant_id in decision.grant_refs:
-            grant = current_grants.get(grant_id)
-            if grant is None or not grant_matches(
-                grant,
-                actor_id=context.actor_id,
-                resolution=context.resolution,
-                at=now,
-            ):
-                raise AuthorityDenied("AuthorityDecision Grant set is no longer current")
+        self._validate_decision_semantics(
+            context=context,
+            capability=capability,
+            policy=policy,
+            current_grants=current_grants,
+            at=now,
+        )
 
         approval: ApprovalReceipt | None = None
         if decision.decision is AuthorityDecisionKind.DENY:
@@ -390,6 +434,31 @@ class AuthorityEngine:
         self._persist_execution_authority(receipt, approval=approval)
         return receipt
 
+    def _validate_consumed_approval(self, context: AuthorityDecisionContext) -> None:
+        if context.decision.decision is not AuthorityDecisionKind.ASK:
+            return
+        row = self._store._host_store._db.execute(
+            """
+            SELECT receipt_json, receipt_digest, consumed_at
+            FROM approval_receipts WHERE decision_id = ?
+            """,
+            (context.decision.decision_id,),
+        ).fetchone()
+        if row is None or row["consumed_at"] is None:
+            raise ApprovalInvalid("ask decision lacks a consumed approval")
+        try:
+            approval = record_from_json(ApprovalReceipt, row["receipt_json"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("approval cannot be decoded") from exc
+        if canonical_digest(approval) != row["receipt_digest"]:
+            raise IntegrityViolation("approval digest mismatch")
+        if approval.decision_id != context.decision.decision_id:
+            raise IntegrityViolation("approval decision binding is invalid")
+        if approval.policy_revision != context.decision.policy_revision:
+            raise IntegrityViolation("approval policy binding is invalid")
+        if approval.resolved_effect_digest != canonical_digest(context.decision.resolved_effect):
+            raise IntegrityViolation("approval effect binding is invalid")
+
     def consume_execution_authority(
         self,
         *,
@@ -412,21 +481,21 @@ class AuthorityEngine:
             raise IntegrityViolation("execution authority is stale for policy")
         if receipt.resolved_effect_digest != canonical_digest(context.decision.resolved_effect):
             raise IntegrityViolation("execution authority effect binding is invalid")
+        if tuple(receipt.grant_refs) != tuple(context.decision.grant_refs):
+            raise IntegrityViolation("execution authority Grant set differs from decision")
 
         current_grants = {
             grant.grant_id: grant
             for grant in self._store.active_grants(actor_id=receipt.actor_id)
         }
-        now = utc_now()
-        for grant_id in receipt.grant_refs:
-            grant = current_grants.get(grant_id)
-            if grant is None or not grant_matches(
-                grant,
-                actor_id=receipt.actor_id,
-                resolution=context.resolution,
-                at=now,
-            ):
-                raise AuthorityDenied("execution authority Grant set is no longer current")
+        self._validate_decision_semantics(
+            context=context,
+            capability=capability,
+            policy=policy,
+            current_grants=current_grants,
+            at=utc_now(),
+        )
+        self._validate_consumed_approval(context)
 
         self._store.consume_execution_authority(receipt_id)
         return receipt
