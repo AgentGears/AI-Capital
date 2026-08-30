@@ -205,6 +205,10 @@ class InferenceRequest:
     def __post_init__(self) -> None:
         object.__setattr__(self, "context", freeze_json(self.context))
 
+    @property
+    def context_receipt_ref(self) -> str:
+        return self.context_receipt.context_receipt_id
+
 
 @dataclass(frozen=True, slots=True)
 class ModelAttemptReceipt:
