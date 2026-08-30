@@ -10,16 +10,22 @@ _JSON_SCALARS = (str, int, bool, type(None))
 class FrozenMap(Mapping[str, object]):
     """Small immutable mapping for canonical JSON-shaped kernel values."""
 
-    __slots__ = ("_items",)
+    __slots__ = ("_items", "_sealed")
 
     def __init__(self, source: Mapping[str, object] | None = None):
         source = source or {}
-        self._items = tuple(
-            sorted(
-                ((str(key), freeze_json(value)) for key, value in source.items()),
-                key=lambda item: item[0],
-            )
-        )
+        items: list[tuple[str, object]] = []
+        for key, value in source.items():
+            if not isinstance(key, str):
+                raise TypeError("canonical object keys must be strings")
+            items.append((key, freeze_json(value)))
+        object.__setattr__(self, "_items", tuple(sorted(items, key=lambda item: item[0])))
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("FrozenMap is immutable")
+        object.__setattr__(self, name, value)
 
     def __getitem__(self, key: str) -> object:
         for item_key, value in self._items:
