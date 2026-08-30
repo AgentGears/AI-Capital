@@ -16,6 +16,11 @@ class ProgramStatus(StringEnum):
     CANCELLED = "cancelled"
 
 
+class WorkItemStatus(StringEnum):
+    OPEN = "open"
+    SATISFIED = "satisfied"
+
+
 class ActorStatus(StringEnum):
     ACTIVE = "active"
     REPLACED = "replaced"

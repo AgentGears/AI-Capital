@@ -17,8 +17,16 @@ from .enums import (
     Reversibility,
     RiskClass,
     VerificationResult,
+    WorkItemStatus,
 )
 from .frozen_json import FrozenMap, freeze_json
+
+
+@dataclass(frozen=True, slots=True)
+class WorkItem:
+    work_item_id: str
+    description: str
+    status: WorkItemStatus = WorkItemStatus.OPEN
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +37,7 @@ class Program:
     constraints: tuple[str, ...] = ()
     assumptions: tuple[str, ...] = ()
     decisions: tuple[str, ...] = ()
-    work_items: tuple[str, ...] = ()
+    work_items: tuple[WorkItem, ...] = ()
     evidence_refs: tuple[str, ...] = ()
     operation_refs: tuple[str, ...] = ()
     verification_refs: tuple[str, ...] = ()

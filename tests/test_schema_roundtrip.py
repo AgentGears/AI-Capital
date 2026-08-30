@@ -11,6 +11,7 @@ from ai_capital.kernel.enums import (
     ProgramStatus,
     Reversibility,
     RiskClass,
+    WorkItemStatus,
 )
 from ai_capital.kernel.frozen_json import FrozenMap
 from ai_capital.kernel.models import (
@@ -19,13 +20,14 @@ from ai_capital.kernel.models import (
     ContextReceipt,
     ModelTurn,
     Program,
+    WorkItem,
 )
 from ai_capital.kernel.schema_codec import record_from_json, record_to_json
 from ai_capital.kernel.serialization import canonical_json
 
 
 class SchemaRoundTripTests(unittest.TestCase):
-    def test_program_round_trip_restores_enums_and_tuples(self):
+    def test_program_round_trip_restores_enums_tuples_and_work_state(self):
         original = Program(
             program_id="p-1",
             revision=4,
@@ -33,7 +35,10 @@ class SchemaRoundTripTests(unittest.TestCase):
             constraints=("bounded", "durable"),
             assumptions=("a-1",),
             decisions=("d-1",),
-            work_items=("w-1", "w-2"),
+            work_items=(
+                WorkItem("w-1", "first", WorkItemStatus.OPEN),
+                WorkItem("w-2", "second", WorkItemStatus.SATISFIED),
+            ),
             evidence_refs=("e-1",),
             operation_refs=("o-1",),
             verification_refs=("v-1",),
@@ -45,6 +50,7 @@ class SchemaRoundTripTests(unittest.TestCase):
         self.assertEqual(restored, original)
         self.assertIsInstance(restored.constraints, tuple)
         self.assertIs(restored.status, ProgramStatus.BLOCKED)
+        self.assertIs(restored.work_items[1].status, WorkItemStatus.SATISFIED)
 
     def test_capability_round_trip_restores_frozen_structures(self):
         original = Capability(

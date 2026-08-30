@@ -16,6 +16,7 @@ from .kernel.models import (
     Operation,
     Program,
     Verification,
+    WorkItem,
 )
 
 __all__ = [
@@ -34,4 +35,5 @@ __all__ = [
     "Operation",
     "Program",
     "Verification",
+    "WorkItem",
 ]
