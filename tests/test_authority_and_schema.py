@@ -14,7 +14,8 @@ from ai_capital.kernel.enums import (
     Reversibility,
     RiskClass,
 )
-from ai_capital.kernel.errors import AuthorityDenied, StaleActorGeneration
+from ai_capital.kernel.errors import AuthorityDenied, IntegrityViolation, StaleActorGeneration
+from ai_capital.kernel.frozen_json import FrozenMap
 from ai_capital.kernel.models import (
     Actor,
     AuthorityDecision,
@@ -48,7 +49,8 @@ def fixture():
     )
     receipt = ExecutionAuthorityReceipt(
         "r-1", "d-1", "p-1", 3, "a-1", 7, "cap-1", 5, 11,
-        ("g-1",), "effect-digest", "2026-08-30T00:00:00Z", "single-use-1",
+        ("g-1",), canonical_digest(decision.resolved_effect),
+        "2026-08-30T00:00:00Z", "single-use-1",
     )
     return program, actor, capability, decision, receipt
 
@@ -59,6 +61,19 @@ class AuthorityAndSchemaTests(unittest.TestCase):
             record = getattr(models, name)
             self.assertTrue(dataclasses.is_dataclass(record), name)
             self.assertTrue(record.__dataclass_params__.frozen, name)
+
+    def test_json_shaped_fields_are_deep_frozen(self):
+        capability = Capability(
+            "cap-1", 1, "workspace.read", "workspace", EffectClass.OBSERVE,
+            Reversibility.REVERSIBLE, RiskClass.LOW,
+            {"properties": {"path": ["a", "b"]}}, {}, 1, "handler-1",
+        )
+        self.assertIsInstance(capability.input_schema, FrozenMap)
+        nested = capability.input_schema["properties"]
+        self.assertIsInstance(nested, FrozenMap)
+        self.assertEqual(nested["path"], ("a", "b"))
+        with self.assertRaises(TypeError):
+            capability.input_schema["new"] = "value"
 
     def test_every_authority_domain_has_owner(self):
         self.assertEqual(set(ownership_matrix()), set(AuthorityDomain))
@@ -85,6 +100,15 @@ class AuthorityAndSchemaTests(unittest.TestCase):
         with self.assertRaises(AuthorityDenied):
             validate_execution_authority(
                 receipt=receipt, decision=denied, program=program, actor=actor,
+                capability=capability, policy_revision=11,
+            )
+
+    def test_resolved_effect_mismatch_rejected(self):
+        program, actor, capability, decision, receipt = fixture()
+        receipt = dataclasses.replace(receipt, resolved_effect_digest="wrong")
+        with self.assertRaises(IntegrityViolation):
+            validate_execution_authority(
+                receipt=receipt, decision=decision, program=program, actor=actor,
                 capability=capability, policy_revision=11,
             )
 
