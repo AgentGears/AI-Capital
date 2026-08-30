@@ -215,6 +215,7 @@ class ModelAttemptReceipt:
     program_revision: int
     model_binding: str
     context_receipt_ref: str
+    input_digest: str
     effective_config_digest: str
     outcome: ModelAttemptOutcome
     started_at: str
