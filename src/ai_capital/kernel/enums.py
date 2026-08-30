@@ -30,6 +30,7 @@ class ActorStatus(StringEnum):
 class ModelAttemptOutcome(StringEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    STALE = "stale"
 
 
 class EffectClass(StringEnum):
