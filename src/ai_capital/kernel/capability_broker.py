@@ -9,7 +9,6 @@ from .errors import (
     IntegrityViolation,
     InvalidRequest,
     StaleCapabilityBinding,
-    UnknownCapability,
 )
 from .frozen_json import FrozenMap
 from .models import (
@@ -100,7 +99,10 @@ class CapabilityBroker:
         *,
         snapshot: CapabilitySnapshot,
     ) -> CapabilityResolution:
-        descriptor = _descriptor_from_snapshot(snapshot, request.capability_id)
+        durable_snapshot = self._capabilities.get_snapshot(snapshot.snapshot_id)
+        if durable_snapshot != snapshot:
+            raise IntegrityViolation("supplied Capability snapshot differs from durable snapshot")
+        descriptor = _descriptor_from_snapshot(durable_snapshot, request.capability_id)
         current = self._capabilities.get(request.capability_id)
 
         if (
@@ -125,7 +127,10 @@ class CapabilityBroker:
             raise IntegrityViolation("Capability arguments did not normalize to an object")
 
         resolver = self._handlers.resolve(current.handler_binding)
-        effect = resolver.resolve_effect(arguments)
+        try:
+            effect = resolver.resolve_effect(arguments)
+        except Exception as exc:
+            raise IntegrityViolation("Capability effect resolver failed") from exc
         if not isinstance(effect, ResolvedEffect):
             raise IntegrityViolation("Capability effect resolver returned invalid type")
         if effect.resource_type != current.resource_type:
