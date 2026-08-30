@@ -1,5 +1,6 @@
 from dataclasses import replace
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -29,6 +30,8 @@ from ai_capital.kernel.errors import (
 )
 from ai_capital.kernel.frozen_json import FrozenMap
 from ai_capital.kernel.models import Capability, CapabilityRequest, ResolvedEffect
+from ai_capital.kernel.schema_codec import record_to_json
+from ai_capital.kernel.serialization import canonical_digest
 
 
 def simple_capability(handler_binding: str = "handler-a") -> Capability:
@@ -245,6 +248,67 @@ class CapabilityRegistryTests(unittest.TestCase):
                 )
                 with self.assertRaises(InvalidRequest):
                     capabilities.create_snapshot((descriptor,))
+
+    def test_snapshot_row_identity_tampering_is_detected_with_recomputed_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "kernel.db"
+            with ProgramRepository(path) as host:
+                capabilities = CapabilityRepository(host)
+                registered = capabilities.register(simple_capability())
+                snapshot = capabilities.create_snapshot((capability_descriptor(registered),))
+                snapshot_id = snapshot.snapshot_id
+
+            forged = replace(snapshot, snapshot_id="different-snapshot")
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    """
+                    UPDATE capability_snapshots
+                    SET snapshot_json = ?, snapshot_digest = ?
+                    WHERE snapshot_id = ?
+                    """,
+                    (record_to_json(forged), canonical_digest(forged), snapshot_id),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with ProgramRepository(path) as host:
+                capabilities = CapabilityRepository(host)
+                with self.assertRaises(IntegrityViolation):
+                    capabilities.get_snapshot(snapshot_id)
+
+    def test_snapshot_descriptor_tampering_is_detected_against_binding_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "kernel.db"
+            with ProgramRepository(path) as host:
+                capabilities = CapabilityRepository(host)
+                registered = capabilities.register(simple_capability())
+                snapshot = capabilities.create_snapshot((capability_descriptor(registered),))
+                snapshot_id = snapshot.snapshot_id
+
+            forged_descriptor = replace(
+                snapshot.capabilities[0], operation="different-operation"
+            )
+            forged = replace(snapshot, capabilities=(forged_descriptor,))
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    """
+                    UPDATE capability_snapshots
+                    SET snapshot_json = ?, snapshot_digest = ?
+                    WHERE snapshot_id = ?
+                    """,
+                    (record_to_json(forged), canonical_digest(forged), snapshot_id),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with ProgramRepository(path) as host:
+                capabilities = CapabilityRepository(host)
+                with self.assertRaises(IntegrityViolation):
+                    capabilities.get_snapshot(snapshot_id)
 
     def test_initial_builtin_family_is_complete_and_snapshot_is_durable(self):
         expected = (
