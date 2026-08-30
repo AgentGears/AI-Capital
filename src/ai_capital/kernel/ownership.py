@@ -7,6 +7,7 @@ from .errors import (
     StaleProgramRevision,
 )
 from .models import Actor, AuthorityDecision, Capability, ExecutionAuthorityReceipt, Program
+from .serialization import canonical_digest
 
 
 _CANONICAL_OWNERS: dict[AuthorityDomain, str] = {
@@ -62,3 +63,5 @@ def validate_execution_authority(
         raise IntegrityViolation("execution authority is stale for current policy")
     if tuple(receipt.grant_refs) != tuple(decision.grant_refs):
         raise IntegrityViolation("execution authority Grant set differs from decision")
+    if receipt.resolved_effect_digest != canonical_digest(decision.resolved_effect):
+        raise IntegrityViolation("execution authority is not bound to resolved effect")
