@@ -203,7 +203,14 @@ class InferenceRequest:
     context: FrozenMap
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "context", freeze_json(self.context))
+        frozen_context = freeze_json(self.context)
+        if not isinstance(frozen_context, FrozenMap):
+            raise TypeError("inference context must be an object")
+        if self.context_receipt.program_id != self.program_id:
+            raise ValueError("ContextReceipt Program does not match inference request")
+        if self.context_receipt.program_revision != self.program_revision:
+            raise ValueError("ContextReceipt revision does not match inference request")
+        object.__setattr__(self, "context", frozen_context)
 
     @property
     def context_receipt_ref(self) -> str:
