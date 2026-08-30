@@ -98,6 +98,24 @@ class InferenceProvenanceTests(unittest.TestCase):
         self.assertEqual(restored_request.context_receipt_ref, "ctx-1")
         self.assertEqual(record_from_json(ModelAttemptReceipt, record_to_json(attempt)), attempt)
 
+    def test_inference_request_rejects_inconsistent_context_receipt(self):
+        wrong_program = ContextReceipt(
+            "ctx-1", "other", 5, (), (), ContextCompleteness.COMPLETE, 10,
+            "2026-08-30T00:00:00Z",
+        )
+        with self.assertRaises(ValueError):
+            InferenceRequest(
+                "attempt-1", "actor-1", 0, "p-1", 5, "binding-a",
+                wrong_program, {"objective": "bounded"},
+            )
+
+        wrong_revision = replace(wrong_program, program_id="p-1", program_revision=4)
+        with self.assertRaises(ValueError):
+            InferenceRequest(
+                "attempt-1", "actor-1", 0, "p-1", 5, "binding-a",
+                wrong_revision, {"objective": "bounded"},
+            )
+
     def test_exact_inference_request_is_durable_and_digest_bound(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "kernel.db"
