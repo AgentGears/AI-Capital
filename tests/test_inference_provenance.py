@@ -56,6 +56,16 @@ def successful_attempt(path: Path):
 
 class InferenceProvenanceTests(unittest.TestCase):
     def test_inference_request_and_attempt_receipt_round_trip(self):
+        context_receipt = ContextReceipt(
+            "ctx-1",
+            "p-1",
+            5,
+            ("program:p-1", "evidence:e-1"),
+            ("history:h-1",),
+            ContextCompleteness.TRUNCATED,
+            100,
+            "2026-08-30T00:00:00Z",
+        )
         request = InferenceRequest(
             "attempt-1",
             "actor-1",
@@ -63,7 +73,7 @@ class InferenceProvenanceTests(unittest.TestCase):
             "p-1",
             5,
             "binding-a",
-            "ctx-1",
+            context_receipt,
             {"objective": "bounded"},
         )
         attempt = ModelAttemptReceipt(
@@ -82,7 +92,10 @@ class InferenceProvenanceTests(unittest.TestCase):
             canonical_digest(ModelTurn(provenance_receipt="attempt-1")),
             None,
         )
-        self.assertEqual(record_from_json(InferenceRequest, record_to_json(request)), request)
+        restored_request = record_from_json(InferenceRequest, record_to_json(request))
+        self.assertEqual(restored_request, request)
+        self.assertEqual(restored_request.context_receipt, context_receipt)
+        self.assertEqual(restored_request.context_receipt_ref, "ctx-1")
         self.assertEqual(record_from_json(ModelAttemptReceipt, record_to_json(attempt)), attempt)
 
     def test_exact_inference_request_is_durable_and_digest_bound(self):
@@ -93,6 +106,9 @@ class InferenceProvenanceTests(unittest.TestCase):
                 stored = actors.request(result.receipt.attempt_id)
                 self.assertEqual(stored.context["objective"], "provenance")
                 self.assertEqual(stored.context["revision"], 0)
+                self.assertEqual(stored.context_receipt.context_receipt_id, "ctx-1")
+                self.assertEqual(stored.context_receipt.program_id, "p-1")
+                self.assertEqual(stored.context_receipt.program_revision, 0)
                 self.assertEqual(result.receipt.input_digest, canonical_digest(stored))
             finally:
                 programs.close()
@@ -100,6 +116,7 @@ class InferenceProvenanceTests(unittest.TestCase):
             with ProgramRepository(path) as restarted:
                 actors = ActorRepository(restarted)
                 stored = actors.request(result.receipt.attempt_id)
+                self.assertEqual(stored.context_receipt.context_receipt_id, "ctx-1")
                 self.assertEqual(result.receipt.input_digest, canonical_digest(stored))
 
     def test_redundant_attempt_row_tampering_is_detected(self):
@@ -130,6 +147,30 @@ class InferenceProvenanceTests(unittest.TestCase):
             programs.close()
 
             changed = replace(original, context={"objective": "tampered", "revision": 0})
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    "UPDATE model_attempts SET request_json = ? WHERE attempt_id = ?",
+                    (record_to_json(changed), result.receipt.attempt_id),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with ProgramRepository(path) as restarted:
+                actors = ActorRepository(restarted)
+                with self.assertRaises(IntegrityViolation):
+                    actors.request(result.receipt.attempt_id)
+
+    def test_context_receipt_tampering_is_detected_even_when_context_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "kernel.db"
+            programs, actors, result = successful_attempt(path)
+            original = actors.request(result.receipt.attempt_id)
+            programs.close()
+
+            changed_receipt = replace(original.context_receipt, budget_units=999)
+            changed = replace(original, context_receipt=changed_receipt)
             connection = sqlite3.connect(path)
             try:
                 connection.execute(
