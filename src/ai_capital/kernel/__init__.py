@@ -9,6 +9,7 @@ from .errors import *
 from .events import *
 from .frozen_json import *
 from .inference import *
+from .json_http_provider import *
 from .models import *
 from .operations import *
 from .ownership import *
