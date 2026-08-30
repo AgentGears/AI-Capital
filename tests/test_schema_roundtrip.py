@@ -6,6 +6,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ai_capital.kernel.enums import (
+    ContextCompleteness,
     EffectClass,
     ProgramStatus,
     Reversibility,
@@ -15,6 +16,7 @@ from ai_capital.kernel.frozen_json import FrozenMap
 from ai_capital.kernel.models import (
     Capability,
     CapabilityRequest,
+    ContextReceipt,
     ModelTurn,
     Program,
 )
@@ -91,6 +93,23 @@ class SchemaRoundTripTests(unittest.TestCase):
         program = Program("p-1", 0, "immutable")
         with self.assertRaises(dataclasses.FrozenInstanceError):
             program.status = ProgramStatus.ACTIVE
+
+    def test_context_projection_has_no_ownership_link_to_program(self):
+        program = Program("p-1", 2, "durable")
+        receipt = ContextReceipt(
+            "ctx-1",
+            "p-1",
+            2,
+            ("program:p-1",),
+            ("history:h-1",),
+            ContextCompleteness.TRUNCATED,
+            100,
+            "2026-08-30T00:00:00Z",
+        )
+        del receipt
+        self.assertEqual(program.program_id, "p-1")
+        self.assertEqual(program.revision, 2)
+        self.assertEqual(program.objective, "durable")
 
 
 if __name__ == "__main__":
