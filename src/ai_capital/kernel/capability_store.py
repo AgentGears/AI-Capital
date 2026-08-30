@@ -116,6 +116,8 @@ class CapabilityRepository:
             raise InvalidRequest("Capability operation and resource type must be non-empty")
         if not capability.handler_binding.strip():
             raise InvalidRequest("Capability handler binding must be non-empty")
+        if capability.binding_revision < 0:
+            raise InvalidRequest("Capability binding revision cannot be negative")
         if new and capability.binding_revision != 0:
             raise InvalidRequest("new Capability must begin at binding revision 0")
         validate_schema_definition(capability.input_schema, path="$input_schema")
@@ -139,6 +141,22 @@ class CapabilityRepository:
         except InvalidRequest as exc:
             raise IntegrityViolation("durable Capability contract is invalid") from exc
         return capability
+
+    def _binding(self, capability_id: str, binding_revision: int) -> Capability:
+        row = self._host_store._db.execute(
+            """
+            SELECT capability_id, binding_revision, capability_json, capability_digest
+            FROM capability_bindings
+            WHERE capability_id = ? AND binding_revision = ?
+            """,
+            (capability_id, binding_revision),
+        ).fetchone()
+        if row is None:
+            raise IntegrityViolation(
+                f"Capability snapshot references missing binding: "
+                f"{capability_id}@{binding_revision}"
+            )
+        return self._capability_from_row(row)
 
     def register(self, capability: Capability) -> Capability:
         self._validate_capability(capability, new=True)
@@ -309,7 +327,7 @@ class CapabilityRepository:
     def get_snapshot(self, snapshot_id: str) -> CapabilitySnapshot:
         row = self._host_store._db.execute(
             """
-            SELECT snapshot_json, snapshot_digest
+            SELECT snapshot_id, snapshot_json, snapshot_digest
             FROM capability_snapshots WHERE snapshot_id = ?
             """,
             (snapshot_id,),
@@ -322,10 +340,22 @@ class CapabilityRepository:
             raise IntegrityViolation("Capability snapshot cannot be decoded") from exc
         if not isinstance(snapshot, CapabilitySnapshot):
             raise IntegrityViolation("decoded Capability snapshot has wrong type")
+        if snapshot.snapshot_id != row["snapshot_id"] or snapshot.snapshot_id != snapshot_id:
+            raise IntegrityViolation("Capability snapshot identity mismatch")
         if canonical_digest(snapshot) != row["snapshot_digest"]:
             raise IntegrityViolation("Capability snapshot digest mismatch")
         if tuple(sorted(snapshot.capabilities, key=lambda item: item.capability_id)) != snapshot.capabilities:
             raise IntegrityViolation("Capability snapshot is not canonically ordered")
         if len({item.capability_id for item in snapshot.capabilities}) != len(snapshot.capabilities):
             raise IntegrityViolation("Capability snapshot contains duplicate identities")
+        for descriptor in snapshot.capabilities:
+            historical = self._binding(
+                descriptor.capability_id,
+                descriptor.binding_revision,
+            )
+            if capability_descriptor(historical) != descriptor:
+                raise IntegrityViolation(
+                    f"Capability snapshot descriptor disagrees with binding history: "
+                    f"{descriptor.capability_id}@{descriptor.binding_revision}"
+                )
         return snapshot
