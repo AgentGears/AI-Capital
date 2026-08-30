@@ -43,7 +43,10 @@ class ExecutionObservation:
     error_code: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "output", freeze_json(self.output))
+        frozen = freeze_json(self.output)
+        if not isinstance(frozen, FrozenMap):
+            raise TypeError("execution output must be an object")
+        object.__setattr__(self, "output", frozen)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +62,10 @@ class ExecutionReceipt:
     idempotency_key: str | None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "output", freeze_json(self.output))
+        frozen = freeze_json(self.output)
+        if not isinstance(frozen, FrozenMap):
+            raise TypeError("execution receipt output must be an object")
+        object.__setattr__(self, "output", frozen)
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +289,8 @@ class OperationJournal:
         authority_receipt_ref: str,
         idempotency_key: str | None = None,
     ) -> Operation:
+        if not program_id.strip() or not actor_id.strip():
+            raise InvalidRequest("Operation Program and Actor identities must be non-empty")
         if not authority_receipt_ref.strip():
             raise InvalidRequest("Operation requires an execution-authority receipt")
         if idempotency_key is not None and not idempotency_key.strip():
@@ -472,6 +480,22 @@ class OperationJournal:
             return ReconciliationStatus.PENDING
         return ReconciliationStatus.NOT_REQUIRED
 
+    @staticmethod
+    def _validate_effect_dimension(
+        effect_class: EffectClass,
+        effect_status: EffectStatus,
+    ) -> None:
+        if effect_class is EffectClass.OBSERVE:
+            if effect_status is not EffectStatus.NOT_APPLICABLE:
+                raise IntegrityViolation(
+                    "observational execution must use not_applicable effect status"
+                )
+            return
+        if effect_status is EffectStatus.NOT_APPLICABLE:
+            raise IntegrityViolation(
+                "mutating execution cannot use not_applicable effect status"
+            )
+
     def finish(
         self,
         operation_id: str,
@@ -485,6 +509,11 @@ class OperationJournal:
             ExecutionOutcome.RUNNING,
         }:
             raise IntegrityViolation("execution observation must be terminal")
+        resolution = self.resolution(operation_id)
+        self._validate_effect_dimension(
+            resolution.resolved_effect.effect_class,
+            observation.effect_status,
+        )
         updated = replace(
             current,
             execution_outcome=observation.execution_outcome,
@@ -509,6 +538,7 @@ class OperationJournal:
         )
 
     def execution_receipt(self, operation_id: str) -> ExecutionReceipt:
+        operation = self.get(operation_id)
         row = self._host_store._db.execute(
             """
             SELECT receipt_id, receipt_json, receipt_digest
@@ -530,6 +560,8 @@ class OperationJournal:
             raise IntegrityViolation("execution receipt digest mismatch")
         if receipt.operation_id != operation_id:
             raise IntegrityViolation("execution receipt Operation mismatch")
+        if receipt.receipt_id not in operation.receipt_refs:
+            raise IntegrityViolation("execution receipt is not linked from Operation")
         return receipt
 
     def recover_interrupted(self) -> tuple[Operation, ...]:
@@ -607,6 +639,8 @@ class OperationJournal:
             EffectStatus.INDETERMINATE,
         }:
             raise IntegrityViolation("reconciliation returned an invalid effect status")
+        if not observation.rationale_code.strip():
+            raise IntegrityViolation("reconciliation requires a rationale code")
         next_reconciliation = (
             ReconciliationStatus.UNRESOLVED
             if observation.effect_status is EffectStatus.INDETERMINATE
@@ -671,7 +705,9 @@ class OperationHost:
         executor: EffectExecutor,
         idempotency_key: str | None = None,
     ) -> Operation:
-        if idempotency_key is not None and not executor.supports_idempotency:
+        if idempotency_key is not None and not bool(
+            getattr(executor, "supports_idempotency", False)
+        ):
             raise InvalidRequest("execution backend does not support idempotency keys")
 
         authority_receipt = self._authority._store.get_execution_authority(
