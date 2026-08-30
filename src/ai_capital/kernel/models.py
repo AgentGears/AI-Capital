@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
 
 from .enums import (
     ActorStatus,
@@ -19,8 +18,7 @@ from .enums import (
     RiskClass,
     VerificationResult,
 )
-
-JsonMap = Mapping[str, object]
+from .frozen_json import FrozenMap, freeze_json
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,10 +57,14 @@ class Capability:
     effect_class: EffectClass
     reversibility: Reversibility
     risk_class: RiskClass
-    input_schema: JsonMap
-    output_schema: JsonMap
+    input_schema: FrozenMap
+    output_schema: FrozenMap
     binding_revision: int
     handler_binding: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "input_schema", freeze_json(self.input_schema))
+        object.__setattr__(self, "output_schema", freeze_json(self.output_schema))
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,12 +159,15 @@ class Event:
     event_type: str
     occurred_at: str
     recorded_at: str
-    payload: JsonMap
+    payload: FrozenMap
     digest: str
     actor_id: str | None = None
     program_id: str | None = None
     causation_id: str | None = None
     correlation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "payload", freeze_json(self.payload))
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,8 +234,11 @@ class ReasoningProposal:
 class CapabilityRequest:
     request_id: str
     capability_id: str
-    arguments: JsonMap
+    arguments: FrozenMap
     expected_binding_revision: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "arguments", freeze_json(self.arguments))
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,8 +254,8 @@ class CompletionProposal:
 
 @dataclass(frozen=True, slots=True)
 class ModelTurn:
+    provenance_receipt: str
     reasoning_proposals: tuple[ReasoningProposal, ...] = ()
     capability_requests: tuple[CapabilityRequest, ...] = ()
     claim_proposals: tuple[ClaimProposal, ...] = ()
     completion_proposal: CompletionProposal | None = None
-    provenance_receipt: str = ""
