@@ -8,7 +8,7 @@ from uuid import uuid4
 from .actor_store import ActorRepository
 from .capability_store import CapabilityRepository
 from .durable_program import ProgramRepository
-from .enums import AuthorityDecisionKind, EffectClass, RiskClass
+from .enums import ActorStatus, AuthorityDecisionKind, EffectClass, ProgramStatus, RiskClass
 from .errors import (
     ApprovalConsumed,
     ApprovalInvalid,
@@ -142,6 +142,13 @@ class AuthorityEngine:
         self._store = authority_store
 
     @staticmethod
+    def _require_active_context(*, program, actor) -> None:
+        if program.status is not ProgramStatus.ACTIVE:
+            raise AuthorityDenied("protected authority requires an active Program")
+        if actor.status is not ActorStatus.ACTIVE:
+            raise AuthorityDenied("protected authority requires an active Actor")
+
+    @staticmethod
     def _expected_decision(
         *,
         capability,
@@ -212,6 +219,7 @@ class AuthorityEngine:
         program = self._programs.get(program_id)
         actor = self._actors.get(actor_id)
         capability = self._capabilities.get(resolution.capability_id)
+        self._require_active_context(program=program, actor=actor)
         policy = self._store.current_policy()
         now = utc_now()
 
@@ -382,6 +390,7 @@ class AuthorityEngine:
             raise StaleActorGeneration("AuthorityDecision is stale for Actor")
         if capability.binding_revision != context.capability_binding_revision:
             raise StaleCapabilityBinding("AuthorityDecision is stale for Capability")
+        self._require_active_context(program=program, actor=actor)
         if policy.policy_revision != decision.policy_revision:
             raise IntegrityViolation("AuthorityDecision is stale for policy")
         if context.resolution.binding_revision != capability.binding_revision:
@@ -477,6 +486,7 @@ class AuthorityEngine:
             raise StaleActorGeneration("execution authority is stale for Actor")
         if capability.binding_revision != receipt.capability_binding_revision:
             raise StaleCapabilityBinding("execution authority is stale for Capability")
+        self._require_active_context(program=program, actor=actor)
         if policy.policy_revision != receipt.policy_revision:
             raise IntegrityViolation("execution authority is stale for policy")
         if receipt.resolved_effect_digest != canonical_digest(context.decision.resolved_effect):
