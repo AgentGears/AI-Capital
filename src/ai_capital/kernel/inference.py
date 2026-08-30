@@ -104,6 +104,7 @@ class InferenceHost:
             context_receipt_ref=context_receipt.context_receipt_id,
             context=context,
         )
+        input_digest = canonical_digest(request)
         started_at = utc_now()
         configuration_digest = canonical_digest(configuration)
 
@@ -119,6 +120,7 @@ class InferenceHost:
                 program_revision=program.revision,
                 model_binding=actor.model_binding,
                 context_receipt_ref=context_receipt.context_receipt_id,
+                input_digest=input_digest,
                 effective_config_digest=configuration_digest,
                 outcome=ModelAttemptOutcome.FAILED,
                 started_at=started_at,
@@ -126,7 +128,7 @@ class InferenceHost:
                 output_digest=None,
                 error_code="provider_failure",
             )
-            self._actors.record_attempt(receipt, None)
+            self._actors.record_attempt(receipt, None, request)
             raise InternalFault("inference provider failed") from exc
 
         finished_at = utc_now()
@@ -139,6 +141,7 @@ class InferenceHost:
                 program_revision=program.revision,
                 model_binding=actor.model_binding,
                 context_receipt_ref=context_receipt.context_receipt_id,
+                input_digest=input_digest,
                 effective_config_digest=configuration_digest,
                 outcome=ModelAttemptOutcome.FAILED,
                 started_at=started_at,
@@ -146,7 +149,7 @@ class InferenceHost:
                 output_digest=None,
                 error_code="invalid_model_output",
             )
-            self._actors.record_attempt(receipt, None)
+            self._actors.record_attempt(receipt, None, request)
             raise IntegrityViolation("inference provider returned invalid model output")
 
         output_digest = canonical_digest(turn)
@@ -161,6 +164,7 @@ class InferenceHost:
                 program_revision=program.revision,
                 model_binding=actor.model_binding,
                 context_receipt_ref=context_receipt.context_receipt_id,
+                input_digest=input_digest,
                 effective_config_digest=configuration_digest,
                 outcome=ModelAttemptOutcome.STALE,
                 started_at=started_at,
@@ -168,7 +172,7 @@ class InferenceHost:
                 output_digest=output_digest,
                 error_code="stale_program_revision",
             )
-            self._actors.record_attempt(receipt, turn)
+            self._actors.record_attempt(receipt, turn, request)
             raise StaleProgramRevision("model output is stale for current Program revision")
 
         if (
@@ -184,6 +188,7 @@ class InferenceHost:
                 program_revision=program.revision,
                 model_binding=actor.model_binding,
                 context_receipt_ref=context_receipt.context_receipt_id,
+                input_digest=input_digest,
                 effective_config_digest=configuration_digest,
                 outcome=ModelAttemptOutcome.STALE,
                 started_at=started_at,
@@ -191,7 +196,7 @@ class InferenceHost:
                 output_digest=output_digest,
                 error_code="stale_actor_generation",
             )
-            self._actors.record_attempt(receipt, turn)
+            self._actors.record_attempt(receipt, turn, request)
             raise StaleActorGeneration("model output is stale for current Actor generation")
 
         receipt = ModelAttemptReceipt(
@@ -202,6 +207,7 @@ class InferenceHost:
             program_revision=program.revision,
             model_binding=actor.model_binding,
             context_receipt_ref=context_receipt.context_receipt_id,
+            input_digest=input_digest,
             effective_config_digest=configuration_digest,
             outcome=ModelAttemptOutcome.SUCCEEDED,
             started_at=started_at,
@@ -209,5 +215,5 @@ class InferenceHost:
             output_digest=output_digest,
             error_code=None,
         )
-        self._actors.record_attempt(receipt, turn)
+        self._actors.record_attempt(receipt, turn, request)
         return InferenceResult(receipt=receipt, turn=turn)
