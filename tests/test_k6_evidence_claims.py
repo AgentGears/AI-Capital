@@ -86,6 +86,29 @@ class K6EvidenceClaimTests(unittest.TestCase):
             finally:
                 programs.close()
 
+    def test_evidence_bytes_use_filesystem_artifact_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            programs, evidence, _ = self._stores(directory)
+            try:
+                admitted = self._admit(evidence, b"filesystem-evidence")
+                columns = {
+                    row["name"]
+                    for row in programs._db.execute(
+                        "PRAGMA table_info(evidence_artifacts)"
+                    ).fetchall()
+                }
+                self.assertNotIn("content", columns)
+                artifact_path = (
+                    Path(directory)
+                    / "evidence"
+                    / admitted.digest[:2]
+                    / admitted.digest[2:]
+                )
+                self.assertEqual(artifact_path.read_bytes(), b"filesystem-evidence")
+                self.assertEqual(evidence.artifact(admitted.evidence_id), b"filesystem-evidence")
+            finally:
+                programs.close()
+
     def test_model_claim_proposal_does_not_admit_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             programs, evidence, claims = self._stores(directory)
@@ -246,10 +269,13 @@ class K6EvidenceClaimTests(unittest.TestCase):
             programs, evidence, _ = self._stores(directory)
             try:
                 admitted = self._admit(evidence, b"original")
-                programs._db.execute(
-                    "UPDATE evidence_artifacts SET content = ? WHERE artifact_digest = ?",
-                    (b"forged!!", admitted.digest),
+                artifact_path = (
+                    Path(directory)
+                    / "evidence"
+                    / admitted.digest[:2]
+                    / admitted.digest[2:]
                 )
+                artifact_path.write_bytes(b"forged!!")
                 with self.assertRaises(IntegrityViolation):
                     evidence.get(admitted.evidence_id)
             finally:
