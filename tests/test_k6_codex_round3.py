@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ai_capital.kernel.claim_store import ClaimRepository
 from ai_capital.kernel.durable_program import ProgramRepository
@@ -106,7 +109,7 @@ class K6CodexRound3Tests(unittest.TestCase):
 
     def test_claim_event_index_is_used_and_migrates_from_schema_v1(self):
         with tempfile.TemporaryDirectory() as directory:
-            programs, _, claims = self._stores(directory)
+            programs, evidence, claims = self._stores(directory)
             try:
                 claim = claims.create("migrated", claim_id="claim-migrate")
                 programs._db.execute("DROP TABLE claim_event_index")
@@ -114,7 +117,7 @@ class K6CodexRound3Tests(unittest.TestCase):
                     "UPDATE component_schema SET version = 1 WHERE component = 'claim_store'"
                 )
 
-                migrated = ClaimRepository(programs, claims._evidence)
+                migrated = ClaimRepository(programs, evidence)
                 self.assertEqual(migrated.get(claim.claim_id), claim)
                 row = programs._db.execute(
                     """
