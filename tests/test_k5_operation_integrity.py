@@ -241,7 +241,7 @@ class K5OperationIntegrityTests(unittest.TestCase):
             finally:
                 fx.close()
 
-    def test_duplicate_adapter_delivery_uses_same_idempotency_identity(self):
+    def test_duplicate_adapter_delivery_uses_same_host_idempotency_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             fx = Fixture(directory)
             try:
@@ -251,15 +251,15 @@ class K5OperationIntegrityTests(unittest.TestCase):
                     resolution=resolution,
                     authority_receipt_id=authority.receipt_id,
                     executor=executor,
-                    idempotency_key="host-idem-1",
+                    idempotency_key="caller-opt-in",
                 )
+                host_key = fx.journal.idempotency_key(operation.operation_id)
+                self.assertIsNotNone(host_key)
+                self.assertNotEqual(host_key, "caller-opt-in")
                 self.assertEqual(executor.calls, 1)
                 self.assertEqual(executor.deliveries, 2)
                 self.assertEqual(executor.effects, 1)
-                self.assertEqual(
-                    fx.journal.idempotency_key(operation.operation_id),
-                    "host-idem-1",
-                )
+                self.assertEqual(executor._seen, {host_key})
                 self.assertIs(operation.effect_status, EffectStatus.CONFIRMED)
             finally:
                 fx.close()
