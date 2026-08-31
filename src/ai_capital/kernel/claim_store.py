@@ -537,7 +537,7 @@ class ClaimRepository:
 
     def create(self, statement: str, *, claim_id: str | None = None) -> Claim:
         claim = Claim(
-            claim_id=claim_id or str(uuid4()),
+            claim_id=str(uuid4()) if claim_id is None else claim_id,
             statement=statement,
             evidence_refs=(),
             status=ClaimStatus.PROPOSED,
