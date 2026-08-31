@@ -17,7 +17,12 @@ from ai_capital.kernel.claim_store import (
 )
 from ai_capital.kernel.durable_program import ProgramRepository
 from ai_capital.kernel.enums import ClaimStatus
-from ai_capital.kernel.errors import EvidenceInvalid, EvidenceMissing, IntegrityViolation
+from ai_capital.kernel.errors import (
+    EvidenceInvalid,
+    EvidenceMissing,
+    IntegrityViolation,
+    PersistenceConflict,
+)
 from ai_capital.kernel.evidence_store import EvidenceReference, EvidenceRepository
 from ai_capital.kernel.models import ClaimProposal
 from ai_capital.kernel.schema_codec import record_to_json
@@ -25,6 +30,15 @@ from ai_capital.kernel.serialization import canonical_digest
 
 
 OBSERVED = "2026-08-31T00:00:00Z"
+
+
+class RecordingEvidenceRepository(EvidenceRepository):
+    def __init__(self, *args, **kwargs):
+        self.fsynced_directories: list[Path] = []
+        super().__init__(*args, **kwargs)
+
+    def _fsync_directory(self, path: Path) -> None:
+        self.fsynced_directories.append(Path(path))
 
 
 class K6EvidenceClaimTests(unittest.TestCase):
@@ -109,6 +123,52 @@ class K6EvidenceClaimTests(unittest.TestCase):
             finally:
                 programs.close()
 
+    def test_artifact_directory_is_fsynced_before_admission_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            programs = ProgramRepository(Path(directory) / "kernel.db")
+            evidence = RecordingEvidenceRepository(programs)
+            try:
+                evidence.fsynced_directories.clear()
+                admitted = self._admit(evidence, b"durable-directory-entry")
+                artifact_parent = (
+                    Path(directory)
+                    / "evidence"
+                    / admitted.digest[:2]
+                )
+                self.assertIn(artifact_parent, evidence.fsynced_directories)
+            finally:
+                programs.close()
+
+    def test_evidence_identity_cannot_be_reused_when_projection_is_lost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            programs, evidence, _ = self._stores(directory)
+            try:
+                evidence.admit(
+                    content=b"first",
+                    source_class="source_observation",
+                    observed_at=OBSERVED,
+                    provenance=("source:fixture", "admission:host"),
+                    trust_class="observed",
+                    currentness="current",
+                    evidence_id="e-fixed",
+                )
+                programs._db.execute(
+                    "DELETE FROM evidence_records WHERE evidence_id = ?",
+                    ("e-fixed",),
+                )
+                with self.assertRaises(PersistenceConflict):
+                    evidence.admit(
+                        content=b"second",
+                        source_class="source_observation",
+                        observed_at=OBSERVED,
+                        provenance=("source:fixture", "admission:host"),
+                        trust_class="observed",
+                        currentness="current",
+                        evidence_id="e-fixed",
+                    )
+            finally:
+                programs.close()
+
     def test_model_claim_proposal_does_not_admit_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             programs, evidence, claims = self._stores(directory)
@@ -188,6 +248,46 @@ class K6EvidenceClaimTests(unittest.TestCase):
                 )
                 with self.assertRaises(EvidenceMissing):
                     claims.verification_evidence(claim.claim_id)
+            finally:
+                programs.close()
+
+    def test_claim_history_gap_is_rejected_against_semantic_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            programs, evidence, claims = self._stores(directory)
+            try:
+                support = self._admit(evidence, b"support")
+                contradiction = self._admit(evidence, b"contradiction")
+                claim = claims.create("statement")
+                claims.support(claim.claim_id, (support.evidence_id,))
+                claims.contradict(claim.claim_id, (contradiction.evidence_id,))
+                row = programs._db.execute(
+                    """
+                    SELECT sequence FROM claim_history
+                    WHERE claim_id = ? AND event_type = 'claim.supported'
+                    """,
+                    (claim.claim_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                programs._db.execute(
+                    "DELETE FROM claim_history WHERE sequence = ?",
+                    (int(row["sequence"]),),
+                )
+                with self.assertRaises(IntegrityViolation):
+                    claims.history(claim.claim_id)
+            finally:
+                programs.close()
+
+    def test_claim_identity_cannot_be_reused_when_projection_is_lost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            programs, _, claims = self._stores(directory)
+            try:
+                claims.create("original", claim_id="c-fixed")
+                programs._db.execute(
+                    "DELETE FROM claim_projections WHERE claim_id = ?",
+                    ("c-fixed",),
+                )
+                with self.assertRaises(PersistenceConflict):
+                    claims.create("replacement", claim_id="c-fixed")
             finally:
                 programs.close()
 
