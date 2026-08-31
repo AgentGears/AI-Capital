@@ -82,23 +82,26 @@ class K6CodexRound4Tests(unittest.TestCase):
                 ).fetchone()
                 self.assertIsNotNone(row)
                 event = record_from_json(Event, row["event_json"])
+                forged = event.__class__(
+                    event_id=event.event_id,
+                    sequence=event.sequence,
+                    event_type=event.event_type,
+                    occurred_at=event.occurred_at,
+                    recorded_at=event.recorded_at,
+                    payload=event.payload,
+                    digest="0" * 64,
+                    actor_id=event.actor_id,
+                    program_id=event.program_id,
+                    causation_id=event.causation_id,
+                    correlation_id=event.correlation_id,
+                )
                 programs._db.execute(
                     "UPDATE events SET event_json = ? WHERE sequence = ?",
-                    (record_to_json(event.__class__(
-                        event_id=event.event_id,
-                        sequence=event.sequence,
-                        event_type=event.event_type,
-                        occurred_at=event.occurred_at,
-                        recorded_at=event.recorded_at,
-                        payload=event.payload,
-                        digest="0" * 64,
-                        actor_id=event.actor_id,
-                        program_id=event.program_id,
-                        causation_id=event.causation_id,
-                        correlation_id=event.correlation_id,
-                    )), int(row["sequence"])),
+                    (record_to_json(forged), int(row["sequence"])),
                 )
 
+                third = self._admit(evidence, b"third", evidence_id="e-third")
+                self.assertEqual(third.evidence_id, "e-third")
                 self.assertEqual(evidence.get(first.evidence_id), first)
                 with self.assertRaises(IntegrityViolation):
                     evidence.get("e-second")
