@@ -34,6 +34,17 @@ _COMPONENT = "operation_journal"
 _COMPONENT_SCHEMA_VERSION = 3
 
 
+def _host_idempotency_key(*, operation_id: str, resolution_digest: str) -> str:
+    """Derive the backend identity from Host-owned immutable Operation inputs."""
+    return canonical_digest(
+        {
+            "kind": "operation_idempotency",
+            "operation_id": operation_id,
+            "resolution_digest": resolution_digest,
+        }
+    )
+
+
 def _idempotency_binding_digest(
     *,
     idempotency_key: str,
@@ -224,19 +235,17 @@ class OperationJournal:
                 version = 2
 
             if version == 2:
-                duplicate = self._host_store._db.execute(
+                legacy_idempotency = self._host_store._db.execute(
                     """
-                    SELECT idempotency_key
+                    SELECT operation_id
                     FROM operation_projections
                     WHERE idempotency_key IS NOT NULL
-                    GROUP BY idempotency_key
-                    HAVING COUNT(*) > 1
                     LIMIT 1
                     """
                 ).fetchone()
-                if duplicate is not None:
+                if legacy_idempotency is not None:
                     raise IntegrityViolation(
-                        "legacy Operation store reuses an idempotency identity across Operations"
+                        "legacy external idempotency identities require explicit reconciliation"
                     )
                 self._host_store._db.execute(
                     """
@@ -248,34 +257,6 @@ class OperationJournal:
                     )
                     """
                 )
-                legacy_rows = self._host_store._db.execute(
-                    """
-                    SELECT operation_id, resolution_digest, idempotency_key
-                    FROM operation_projections
-                    WHERE idempotency_key IS NOT NULL
-                    """
-                ).fetchall()
-                for legacy in legacy_rows:
-                    key = str(legacy["idempotency_key"])
-                    operation_id = str(legacy["operation_id"])
-                    resolution_digest = str(legacy["resolution_digest"])
-                    self._host_store._db.execute(
-                        """
-                        INSERT OR IGNORE INTO operation_idempotency_bindings(
-                            idempotency_key, operation_id, resolution_digest, binding_digest
-                        ) VALUES (?, ?, ?, ?)
-                        """,
-                        (
-                            key,
-                            operation_id,
-                            resolution_digest,
-                            _idempotency_binding_digest(
-                                idempotency_key=key,
-                                operation_id=operation_id,
-                                resolution_digest=resolution_digest,
-                            ),
-                        ),
-                    )
                 self._host_store._db.execute(
                     "UPDATE component_schema SET version = ? WHERE component = ?",
                     (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
@@ -357,20 +338,24 @@ class OperationJournal:
             raise IntegrityViolation("Operation idempotency identity is invalid")
         if binding is None:
             raise IntegrityViolation("Operation idempotency identity lacks durable binding")
-        if binding["idempotency_key"] != key:
-            raise IntegrityViolation("Operation idempotency identity disagrees with binding")
+        expected_key = _host_idempotency_key(
+            operation_id=str(row["operation_id"]),
+            resolution_digest=str(row["resolution_digest"]),
+        )
+        if key != expected_key or binding["idempotency_key"] != expected_key:
+            raise IntegrityViolation("Operation idempotency identity is not Host-derived")
         if binding["operation_id"] != row["operation_id"]:
             raise IntegrityViolation("idempotency binding Operation identity mismatch")
         if binding["resolution_digest"] != row["resolution_digest"]:
             raise IntegrityViolation("idempotency binding resolution mismatch")
-        expected = _idempotency_binding_digest(
-            idempotency_key=key,
+        expected_binding = _idempotency_binding_digest(
+            idempotency_key=expected_key,
             operation_id=str(row["operation_id"]),
             resolution_digest=str(row["resolution_digest"]),
         )
-        if binding["binding_digest"] != expected:
+        if binding["binding_digest"] != expected_binding:
             raise IntegrityViolation("idempotency binding digest mismatch")
-        return key
+        return expected_key
 
     def _decode_row(self, row: sqlite3.Row) -> tuple[Operation, CapabilityResolution]:
         try:
@@ -431,7 +416,7 @@ class OperationJournal:
         if not authority_receipt_ref.strip():
             raise InvalidRequest("Operation requires an execution-authority receipt")
         if idempotency_key is not None and not idempotency_key.strip():
-            raise InvalidRequest("idempotency key must be non-empty when supplied")
+            raise InvalidRequest("idempotency request token must be non-empty when supplied")
         resolution_digest = canonical_digest(resolution)
         operation = Operation(
             operation_id=str(uuid4()),
@@ -445,20 +430,17 @@ class OperationJournal:
             reconciliation_status=ReconciliationStatus.NOT_REQUIRED,
         )
         validate_operation_semantics(operation)
+        host_key = (
+            None
+            if idempotency_key is None
+            else _host_idempotency_key(
+                operation_id=operation.operation_id,
+                resolution_digest=resolution_digest,
+            )
+        )
         try:
             with self._host_store._transaction():
-                if idempotency_key is not None:
-                    existing = self._host_store._db.execute(
-                        """
-                        SELECT operation_id FROM operation_idempotency_bindings
-                        WHERE idempotency_key = ?
-                        """,
-                        (idempotency_key,),
-                    ).fetchone()
-                    if existing is not None:
-                        raise PersistenceConflict(
-                            "idempotency identity is already bound to another Operation"
-                        )
+                if host_key is not None:
                     self._host_store._db.execute(
                         """
                         INSERT INTO operation_idempotency_bindings(
@@ -466,11 +448,11 @@ class OperationJournal:
                         ) VALUES (?, ?, ?, ?)
                         """,
                         (
-                            idempotency_key,
+                            host_key,
                             operation.operation_id,
                             resolution_digest,
                             _idempotency_binding_digest(
-                                idempotency_key=idempotency_key,
+                                idempotency_key=host_key,
                                 operation_id=operation.operation_id,
                                 resolution_digest=resolution_digest,
                             ),
@@ -501,7 +483,7 @@ class OperationJournal:
                         canonical_digest(operation),
                         record_to_json(resolution),
                         resolution_digest,
-                        idempotency_key,
+                        host_key,
                         event.sequence,
                     ),
                 )
