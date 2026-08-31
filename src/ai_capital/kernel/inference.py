@@ -25,6 +25,7 @@ from .models import (
     ModelAttemptReceipt,
     ModelTurn,
 )
+from .schema_codec import record_from_json, record_to_json
 from .serialization import canonical_digest, to_canonical_data
 
 
@@ -62,6 +63,20 @@ class ModelBindingRegistry:
 class InferenceResult:
     receipt: ModelAttemptReceipt
     turn: ModelTurn
+
+
+def _validate_model_turn(turn: object, *, attempt_id: str) -> ModelTurn:
+    if not isinstance(turn, ModelTurn):
+        raise IntegrityViolation("inference provider returned invalid model output")
+    try:
+        restored = record_from_json(ModelTurn, record_to_json(turn))
+    except (TypeError, ValueError) as exc:
+        raise IntegrityViolation("inference provider returned malformed model output") from exc
+    if not isinstance(restored, ModelTurn) or restored != turn:
+        raise IntegrityViolation("model output does not satisfy canonical ModelTurn schema")
+    if restored.provenance_receipt != attempt_id:
+        raise IntegrityViolation("model output provenance does not match attempt")
+    return restored
 
 
 class InferenceHost:
@@ -148,7 +163,9 @@ class InferenceHost:
             raise InternalFault("inference provider failed") from exc
 
         finished_at = utc_now()
-        if not isinstance(turn, ModelTurn) or turn.provenance_receipt != attempt_id:
+        try:
+            turn = _validate_model_turn(turn, attempt_id=attempt_id)
+        except IntegrityViolation as exc:
             receipt = ModelAttemptReceipt(
                 attempt_id=attempt_id,
                 actor_id=actor.actor_id,
@@ -166,7 +183,7 @@ class InferenceHost:
                 error_code="invalid_model_output",
             )
             self._actors.record_attempt(receipt, None, request)
-            raise IntegrityViolation("inference provider returned invalid model output")
+            raise IntegrityViolation("inference provider returned invalid model output") from exc
 
         output_digest = canonical_digest(turn)
         current_program = self._programs.get(program_id)

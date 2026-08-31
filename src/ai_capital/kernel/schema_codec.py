@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import types
 from dataclasses import fields, is_dataclass
 from enum import Enum
@@ -92,7 +93,10 @@ def _decode(annotation: object, value: object) -> object:
     if annotation is float:
         if type(value) not in {int, float} or type(value) is bool:
             raise TypeError("expected number")
-        return float(value)
+        decoded = float(value)
+        if not math.isfinite(decoded):
+            raise ValueError("canonical number must be finite")
+        return decoded
     if annotation is type(None):
         if value is not None:
             raise TypeError("expected null")

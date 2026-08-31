@@ -274,17 +274,18 @@ class K5OperationJournalTests(unittest.TestCase):
                     resolution=resolution,
                     authority_receipt_id=authority.receipt_id,
                     executor=executor,
-                    idempotency_key="idem-1",
+                    idempotency_key="caller-opt-in",
                 )
-                reconciled = fx.host.reconcile(
-                    operation.operation_id,
-                    ScriptedReconciler(
-                        ReconciliationObservation(
-                            EffectStatus.INDETERMINATE,
-                            "cannot_observe_effect",
-                        )
-                    ),
+                host_key = fx.journal.idempotency_key(operation.operation_id)
+                self.assertIsNotNone(host_key)
+                self.assertNotEqual(host_key, "caller-opt-in")
+                reconciler = ScriptedReconciler(
+                    ReconciliationObservation(
+                        EffectStatus.INDETERMINATE,
+                        "cannot_observe_effect",
+                    )
                 )
+                reconciled = fx.host.reconcile(operation.operation_id, reconciler)
                 self.assertIs(reconciled.effect_status, EffectStatus.INDETERMINATE)
                 self.assertIs(
                     reconciled.reconciliation_status,
@@ -293,8 +294,8 @@ class K5OperationJournalTests(unittest.TestCase):
                 self.assertFalse(
                     fx.journal.replay_is_intrinsically_safe(reconciled.operation_id)
                 )
-                self.assertEqual(fx.journal.idempotency_key(operation.operation_id), "idem-1")
-                self.assertEqual(executor.keys, ["idem-1"])
+                self.assertEqual(executor.keys, [host_key])
+                self.assertEqual(reconciler.keys, [host_key])
                 self.assertEqual(executor.calls, 1)
             finally:
                 fx.close()
@@ -382,7 +383,7 @@ class K5OperationJournalTests(unittest.TestCase):
                                 {},
                             )
                         ),
-                        idempotency_key="idem-unsupported",
+                        idempotency_key="caller-opt-in",
                     )
             finally:
                 fx.close()

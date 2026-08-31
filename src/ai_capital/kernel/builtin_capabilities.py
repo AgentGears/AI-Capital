@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 
 from .capability_broker import CapabilityHandlerRegistry
 from .capability_store import CapabilityRepository
 from .enums import EffectClass, Reversibility, RiskClass
+from .errors import IntegrityViolation, UnknownCapability
 from .frozen_json import FrozenMap
 from .models import Capability, ResolvedEffect
 
@@ -54,6 +56,34 @@ class TargetFieldResolver:
             target=target,
             effect_class=self.effect_class,
             parameters=parameters,
+        )
+
+
+_READ_ONLY_COMMANDS = frozenset({"pwd", "ls", "cat", "head", "tail", "wc", "stat"})
+_FORBIDDEN_COMMAND_SYNTAX = frozenset("|&;<>()$`\n\r")
+
+
+@dataclass(frozen=True, slots=True)
+class CommandObserveResolver:
+    """Conservatively admits only a small shell-free observation subset."""
+
+    def resolve_effect(self, arguments: FrozenMap) -> ResolvedEffect:
+        command = arguments["command"]
+        if type(command) is not str or not command.strip():
+            raise ValueError("command must be a non-empty string")
+        if any(token in command for token in _FORBIDDEN_COMMAND_SYNTAX):
+            raise ValueError("command.observe forbids shell control or substitution syntax")
+        try:
+            parts = shlex.split(command, posix=True)
+        except ValueError as exc:
+            raise ValueError("command.observe command cannot be parsed safely") from exc
+        if not parts or parts[0] not in _READ_ONLY_COMMANDS:
+            raise ValueError("command.observe permits only the read-only command subset")
+        return ResolvedEffect(
+            resource_type="command",
+            target=command,
+            effect_class=EffectClass.OBSERVE,
+            parameters={},
         )
 
 
@@ -152,7 +182,7 @@ _BUILTINS = (
             binding_revision=0,
             handler_binding="builtin.command.observe.v1",
         ),
-        TargetFieldResolver("command", EffectClass.OBSERVE, "command"),
+        CommandObserveResolver(),
     ),
     (
         "network.fetch",
@@ -200,8 +230,21 @@ def install_builtin_capabilities(
     capabilities: CapabilityRepository,
     handlers: CapabilityHandlerRegistry,
 ) -> None:
-    for _, binding_id, capability, resolver in _BUILTINS:
-        capabilities.register(capability)
+    for capability_id, binding_id, capability, resolver in _BUILTINS:
+        try:
+            current = capabilities.get(capability_id)
+        except UnknownCapability:
+            current = capabilities.register(capability)
+        if current != capability:
+            raise IntegrityViolation(
+                f"durable built-in Capability differs from bootstrap contract: {capability_id}"
+            )
+        if handlers.contains(binding_id):
+            if handlers.resolve(binding_id) != resolver:
+                raise IntegrityViolation(
+                    f"runtime handler differs from built-in binding contract: {binding_id}"
+                )
+            continue
         handlers.register(binding_id, resolver)
 
 
