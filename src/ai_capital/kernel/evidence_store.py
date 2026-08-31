@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from .durable_program import ProgramRepository
@@ -41,8 +43,21 @@ class EvidenceReference:
 class EvidenceRepository:
     """Host-owned explicit Evidence admission over content-addressed source bytes."""
 
-    def __init__(self, host_store: ProgramRepository):
+    def __init__(
+        self,
+        host_store: ProgramRepository,
+        artifact_root: str | Path | None = None,
+    ):
         self._host_store = host_store
+        if artifact_root is None:
+            database_path = str(host_store._database_path)
+            if database_path == ":memory:":
+                raise EvidenceInvalid(
+                    "in-memory Host stores require an explicit Evidence artifact root"
+                )
+            artifact_root = Path(database_path).resolve().parent / "evidence"
+        self._artifact_root = Path(artifact_root)
+        self._artifact_root.mkdir(parents=True, exist_ok=True)
         self._migrate()
 
     def _migrate(self) -> None:
@@ -74,7 +89,7 @@ class EvidenceRepository:
                 """
                 CREATE TABLE evidence_artifacts (
                     artifact_digest TEXT PRIMARY KEY,
-                    content BLOB NOT NULL,
+                    content_ref TEXT NOT NULL UNIQUE,
                     byte_length INTEGER NOT NULL
                 )
                 """
@@ -111,6 +126,50 @@ class EvidenceRepository:
     @staticmethod
     def _artifact_digest(content: bytes) -> str:
         return hashlib.sha256(content).hexdigest()
+
+    @staticmethod
+    def _content_ref(artifact_digest: str) -> str:
+        return f"{_ARTIFACT_PREFIX}{artifact_digest}"
+
+    def _artifact_path(self, artifact_digest: str) -> Path:
+        if len(artifact_digest) != 64:
+            raise EvidenceInvalid("Evidence artifact digest must be a SHA-256 hex digest")
+        try:
+            int(artifact_digest, 16)
+        except ValueError as exc:
+            raise EvidenceInvalid("Evidence artifact digest must be hexadecimal") from exc
+        return self._artifact_root / artifact_digest[:2] / artifact_digest[2:]
+
+    def _store_artifact(self, content: bytes, artifact_digest: str) -> None:
+        path = self._artifact_path(artifact_digest)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            existing = path.read_bytes()
+            if existing != content or self._artifact_digest(existing) != artifact_digest:
+                raise IntegrityViolation("content-addressed Evidence artifact collision")
+            return
+
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        try:
+            with open(temporary, "xb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def _read_artifact(self, artifact_digest: str, *, expected_length: int) -> bytes:
+        path = self._artifact_path(artifact_digest)
+        if not path.exists():
+            raise IntegrityViolation("Evidence artifact is missing")
+        content = path.read_bytes()
+        if len(content) != expected_length:
+            raise IntegrityViolation("Evidence artifact byte length mismatch")
+        if self._artifact_digest(content) != artifact_digest:
+            raise IntegrityViolation("Evidence artifact digest mismatch")
+        return content
 
     def _append_event(self, payload: object, *, evidence_id: str) -> Event:
         sequence = self._host_store._next_sequence()
@@ -176,7 +235,7 @@ class EvidenceRepository:
     def _validate_evidence(cls, evidence: Evidence) -> None:
         if not evidence.evidence_id.strip() or not evidence.source_class.strip():
             raise EvidenceInvalid("Evidence identity and source class must be non-empty")
-        if evidence.content_ref != f"{_ARTIFACT_PREFIX}{evidence.digest}":
+        if evidence.content_ref != cls._content_ref(evidence.digest):
             raise EvidenceInvalid("Evidence content reference disagrees with content digest")
         if len(evidence.digest) != 64:
             raise EvidenceInvalid("Evidence digest must be a SHA-256 hex digest")
@@ -210,7 +269,7 @@ class EvidenceRepository:
             evidence_id=evidence_id or str(uuid4()),
             source_class=source_class,
             observed_at=observed_at,
-            content_ref=f"{_ARTIFACT_PREFIX}{artifact_digest}",
+            content_ref=self._content_ref(artifact_digest),
             digest=artifact_digest,
             provenance=provenance,
             trust_class=trust_class,
@@ -223,24 +282,30 @@ class EvidenceRepository:
             artifact_digest=artifact_digest,
             admitted_at=utc_now(),
         )
+        self._store_artifact(content, artifact_digest)
         try:
             with self._host_store._transaction():
-                existing = self._host_store._db.execute(
-                    "SELECT content, byte_length FROM evidence_artifacts WHERE artifact_digest = ?",
+                self._host_store._db.execute(
+                    """
+                    INSERT INTO evidence_artifacts(artifact_digest, content_ref, byte_length)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(artifact_digest) DO NOTHING
+                    """,
+                    (artifact_digest, evidence.content_ref, len(content)),
+                )
+                artifact_row = self._host_store._db.execute(
+                    """
+                    SELECT content_ref, byte_length FROM evidence_artifacts
+                    WHERE artifact_digest = ?
+                    """,
                     (artifact_digest,),
                 ).fetchone()
-                if existing is None:
-                    self._host_store._db.execute(
-                        """
-                        INSERT INTO evidence_artifacts(artifact_digest, content, byte_length)
-                        VALUES (?, ?, ?)
-                        """,
-                        (artifact_digest, sqlite3.Binary(content), len(content)),
-                    )
-                else:
-                    stored = bytes(existing["content"])
-                    if stored != content or int(existing["byte_length"]) != len(content):
-                        raise IntegrityViolation("content-addressed Evidence artifact collision")
+                if (
+                    artifact_row is None
+                    or artifact_row["content_ref"] != evidence.content_ref
+                    or int(artifact_row["byte_length"]) != len(content)
+                ):
+                    raise IntegrityViolation("durable Evidence artifact metadata collision")
                 event = self._append_event(
                     {"evidence": evidence, "admission": admission},
                     evidence_id=evidence.evidence_id,
@@ -303,16 +368,17 @@ class EvidenceRepository:
         self._validate_evidence(evidence)
 
         artifact = self._host_store._db.execute(
-            "SELECT content, byte_length FROM evidence_artifacts WHERE artifact_digest = ?",
+            """
+            SELECT content_ref, byte_length FROM evidence_artifacts
+            WHERE artifact_digest = ?
+            """,
             (evidence.digest,),
         ).fetchone()
         if artifact is None:
-            raise IntegrityViolation("Evidence artifact is missing")
-        content = bytes(artifact["content"])
-        if len(content) != int(artifact["byte_length"]):
-            raise IntegrityViolation("Evidence artifact byte length mismatch")
-        if self._artifact_digest(content) != evidence.digest:
-            raise IntegrityViolation("Evidence artifact digest mismatch")
+            raise IntegrityViolation("Evidence artifact metadata is missing")
+        if artifact["content_ref"] != evidence.content_ref:
+            raise IntegrityViolation("Evidence artifact content reference mismatch")
+        self._read_artifact(evidence.digest, expected_length=int(artifact["byte_length"]))
 
         event = self._event(str(row["admitted_event_id"]))
         if event.correlation_id != evidence.evidence_id:
@@ -335,12 +401,14 @@ class EvidenceRepository:
     def artifact(self, evidence_id: str) -> bytes:
         evidence = self.get(evidence_id)
         row = self._host_store._db.execute(
-            "SELECT content FROM evidence_artifacts WHERE artifact_digest = ?",
+            """
+            SELECT byte_length FROM evidence_artifacts WHERE artifact_digest = ?
+            """,
             (evidence.digest,),
         ).fetchone()
         if row is None:
-            raise IntegrityViolation("Evidence artifact is missing")
-        return bytes(row["content"])
+            raise IntegrityViolation("Evidence artifact metadata is missing")
+        return self._read_artifact(evidence.digest, expected_length=int(row["byte_length"]))
 
     def reference(self, evidence_id: str) -> EvidenceReference:
         evidence = self.get(evidence_id)
