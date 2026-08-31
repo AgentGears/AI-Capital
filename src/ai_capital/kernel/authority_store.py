@@ -308,7 +308,7 @@ class AuthorityRepository:
             """
             SELECT policy_revision, policy_json, policy_digest
             FROM authority_policies ORDER BY policy_revision DESC LIMIT 1
-            """
+            """,
         ).fetchone()
         if row is None:
             raise IntegrityViolation("no Authority policy is installed")
@@ -452,6 +452,35 @@ class AuthorityRepository:
                 f"execution authority identity already exists: {receipt.receipt_id}"
             ) from exc
 
+    @staticmethod
+    def _validate_receipt_context_binding(
+        receipt: ExecutionAuthorityReceipt,
+        context: AuthorityDecisionContext,
+    ) -> None:
+        if receipt.decision_id != context.decision.decision_id:
+            raise IntegrityViolation("execution authority decision binding is invalid")
+        if (
+            receipt.program_id != context.program_id
+            or receipt.program_revision != context.program_revision
+        ):
+            raise IntegrityViolation("execution authority Program binding is invalid")
+        if (
+            receipt.actor_id != context.actor_id
+            or receipt.actor_generation != context.actor_generation
+        ):
+            raise IntegrityViolation("execution authority Actor binding is invalid")
+        if (
+            receipt.capability_id != context.capability_id
+            or receipt.capability_binding_revision != context.capability_binding_revision
+        ):
+            raise IntegrityViolation("execution authority Capability binding is invalid")
+        if receipt.policy_revision != context.decision.policy_revision:
+            raise IntegrityViolation("execution authority policy binding is invalid")
+        if tuple(receipt.grant_refs) != tuple(context.decision.grant_refs):
+            raise IntegrityViolation("execution authority Grant binding is invalid")
+        if receipt.resolved_effect_digest != canonical_digest(context.decision.resolved_effect):
+            raise IntegrityViolation("execution authority effect binding is invalid")
+
     def get_execution_authority(self, receipt_id: str) -> ExecutionAuthorityReceipt:
         row = self._host_store._db.execute(
             """
@@ -474,6 +503,8 @@ class AuthorityRepository:
             raise IntegrityViolation("execution authority single-use identity mismatch")
         if canonical_digest(receipt) != row["receipt_digest"]:
             raise IntegrityViolation("execution authority digest mismatch")
+        context = self.get_decision(receipt.decision_id)
+        self._validate_receipt_context_binding(receipt, context)
         return receipt
 
     def consume_execution_authority(self, receipt_id: str) -> None:
