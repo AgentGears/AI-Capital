@@ -7,7 +7,13 @@ from uuid import uuid4
 
 from .durable_program import ProgramRepository
 from .enums import ClaimStatus
-from .errors import EvidenceInvalid, EvidenceMissing, IntegrityViolation, InvalidRequest, PersistenceConflict
+from .errors import (
+    EvidenceInvalid,
+    EvidenceMissing,
+    IntegrityViolation,
+    InvalidRequest,
+    PersistenceConflict,
+)
 from .events import event_digest_fields, utc_now, verify_event_digest
 from .evidence_store import EvidenceReference, EvidenceRepository
 from .models import Claim, Event
@@ -16,7 +22,7 @@ from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "claim_store"
-_COMPONENT_SCHEMA_VERSION = 1
+_COMPONENT_SCHEMA_VERSION = 2
 
 
 class ClaimEvidenceRelation(str, Enum):
@@ -78,69 +84,145 @@ class ClaimRepository:
                 (_COMPONENT,),
             ).fetchone()
             version = None if row is None else int(row[0])
-            if version is not None:
-                if version > _COMPONENT_SCHEMA_VERSION:
-                    raise IntegrityViolation(
-                        f"Claim schema version {version} is newer than supported "
-                        f"{_COMPONENT_SCHEMA_VERSION}"
-                    )
-                if version != _COMPONENT_SCHEMA_VERSION:
-                    raise IntegrityViolation(f"unsupported Claim schema version {version}")
-                return
+            if version is not None and version > _COMPONENT_SCHEMA_VERSION:
+                raise IntegrityViolation(
+                    f"Claim schema version {version} is newer than supported "
+                    f"{_COMPONENT_SCHEMA_VERSION}"
+                )
+            if version not in {None, 1, _COMPONENT_SCHEMA_VERSION}:
+                raise IntegrityViolation(f"unsupported Claim schema version {version}")
 
-            statements = (
-                """
-                CREATE TABLE claim_projections (
-                    claim_id TEXT PRIMARY KEY,
-                    claim_json TEXT NOT NULL,
-                    claim_digest TEXT NOT NULL,
-                    last_sequence INTEGER NOT NULL
+            if version is None:
+                statements = (
+                    """
+                    CREATE TABLE IF NOT EXISTS claim_projections (
+                        claim_id TEXT PRIMARY KEY,
+                        claim_json TEXT NOT NULL,
+                        claim_digest TEXT NOT NULL,
+                        last_sequence INTEGER NOT NULL
+                    )
+                    """,
+                    """
+                    CREATE TABLE IF NOT EXISTS claim_history (
+                        sequence INTEGER PRIMARY KEY,
+                        claim_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        claim_json TEXT NOT NULL,
+                        claim_digest TEXT NOT NULL
+                    )
+                    """,
+                    """
+                    CREATE INDEX IF NOT EXISTS claim_history_claim
+                        ON claim_history(claim_id, sequence)
+                    """,
+                    """
+                    CREATE TABLE IF NOT EXISTS claim_evidence_links (
+                        claim_id TEXT NOT NULL,
+                        evidence_id TEXT NOT NULL,
+                        relation TEXT NOT NULL,
+                        event_sequence INTEGER NOT NULL,
+                        link_json TEXT NOT NULL,
+                        link_digest TEXT NOT NULL,
+                        PRIMARY KEY(claim_id, evidence_id, relation),
+                        FOREIGN KEY(claim_id) REFERENCES claim_projections(claim_id),
+                        FOREIGN KEY(evidence_id) REFERENCES evidence_records(evidence_id)
+                    )
+                    """,
+                    """
+                    CREATE TABLE IF NOT EXISTS claim_supersessions (
+                        claim_id TEXT PRIMARY KEY,
+                        successor_claim_id TEXT NOT NULL,
+                        event_sequence INTEGER NOT NULL UNIQUE,
+                        receipt_json TEXT NOT NULL,
+                        receipt_digest TEXT NOT NULL,
+                        FOREIGN KEY(claim_id) REFERENCES claim_projections(claim_id),
+                        FOREIGN KEY(successor_claim_id) REFERENCES claim_projections(claim_id)
+                    )
+                    """,
                 )
-                """,
-                """
-                CREATE TABLE claim_history (
-                    sequence INTEGER PRIMARY KEY,
-                    claim_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    claim_json TEXT NOT NULL,
-                    claim_digest TEXT NOT NULL
+                for statement in statements:
+                    self._host_store._db.execute(statement)
+
+            if version in {None, 1}:
+                self._host_store._db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS claim_event_index (
+                        sequence INTEGER PRIMARY KEY,
+                        claim_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        FOREIGN KEY(sequence) REFERENCES events(sequence)
+                    )
+                    """
                 )
-                """,
-                """
-                CREATE INDEX claim_history_claim
-                    ON claim_history(claim_id, sequence)
-                """,
-                """
-                CREATE TABLE claim_evidence_links (
-                    claim_id TEXT NOT NULL,
-                    evidence_id TEXT NOT NULL,
-                    relation TEXT NOT NULL,
-                    event_sequence INTEGER NOT NULL,
-                    link_json TEXT NOT NULL,
-                    link_digest TEXT NOT NULL,
-                    PRIMARY KEY(claim_id, evidence_id, relation),
-                    FOREIGN KEY(claim_id) REFERENCES claim_projections(claim_id),
-                    FOREIGN KEY(evidence_id) REFERENCES evidence_records(evidence_id)
+                self._host_store._db.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS claim_event_index_claim_sequence
+                    ON claim_event_index(claim_id, sequence)
+                    """
                 )
-                """,
-                """
-                CREATE TABLE claim_supersessions (
-                    claim_id TEXT PRIMARY KEY,
-                    successor_claim_id TEXT NOT NULL,
-                    event_sequence INTEGER NOT NULL UNIQUE,
-                    receipt_json TEXT NOT NULL,
-                    receipt_digest TEXT NOT NULL,
-                    FOREIGN KEY(claim_id) REFERENCES claim_projections(claim_id),
-                    FOREIGN KEY(successor_claim_id) REFERENCES claim_projections(claim_id)
+                self._rebuild_claim_event_index()
+                self._validate_index_history_alignment()
+                self._host_store._db.execute(
+                    """
+                    INSERT INTO component_schema(component, version) VALUES (?, ?)
+                    ON CONFLICT(component) DO UPDATE SET version = excluded.version
+                    """,
+                    (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
                 )
-                """,
-            )
-            for statement in statements:
-                self._host_store._db.execute(statement)
+
+    def _rebuild_claim_event_index(self) -> None:
+        self._host_store._db.execute("DELETE FROM claim_event_index")
+        rows = self._host_store._db.execute(
+            "SELECT sequence FROM events ORDER BY sequence"
+        ).fetchall()
+        for row in rows:
+            event = self._event_by_sequence(int(row["sequence"]))
+            if not event.event_type.startswith("claim."):
+                continue
+            if event.correlation_id is None or not event.correlation_id.strip():
+                raise IntegrityViolation("Claim Event lacks a correlation identity")
             self._host_store._db.execute(
-                "INSERT INTO component_schema(component, version) VALUES (?, ?)",
-                (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
+                """
+                INSERT INTO claim_event_index(sequence, claim_id, event_type)
+                VALUES (?, ?, ?)
+                """,
+                (event.sequence, event.correlation_id, event.event_type),
             )
+
+    def _validate_index_history_alignment(self) -> None:
+        rows = self._host_store._db.execute(
+            """
+            SELECT claim_id FROM claim_event_index
+            UNION
+            SELECT claim_id FROM claim_history
+            """
+        ).fetchall()
+        for row in rows:
+            claim_id = str(row["claim_id"])
+            indexed = tuple(
+                int(item["sequence"])
+                for item in self._host_store._db.execute(
+                    """
+                    SELECT sequence FROM claim_event_index
+                    WHERE claim_id = ? ORDER BY sequence
+                    """,
+                    (claim_id,),
+                ).fetchall()
+            )
+            history = tuple(
+                int(item["sequence"])
+                for item in self._host_store._db.execute(
+                    """
+                    SELECT sequence FROM claim_history
+                    WHERE claim_id = ? ORDER BY sequence
+                    """,
+                    (claim_id,),
+                ).fetchall()
+            )
+            if indexed != history:
+                raise IntegrityViolation(
+                    "Claim Event index diverges from durable Claim history during migration"
+                )
 
     def _append_event(self, event_type: str, payload: object, *, claim_id: str) -> Event:
         sequence = self._host_store._next_sequence()
@@ -171,6 +253,16 @@ class ClaimRepository:
             correlation_id=claim_id,
         )
         self._host_store._insert_event(event)
+        try:
+            self._host_store._db.execute(
+                """
+                INSERT INTO claim_event_index(sequence, claim_id, event_type)
+                VALUES (?, ?, ?)
+                """,
+                (event.sequence, claim_id, event_type),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise PersistenceConflict("Claim Event index identity conflict") from exc
         return event
 
     def _event_by_sequence(self, sequence: int) -> Event:
@@ -200,25 +292,39 @@ class ClaimRepository:
             raise IntegrityViolation("Claim history Event integrity mismatch")
         return event
 
-    def _claim_event_sequences(self, claim_id: str) -> tuple[int, ...]:
+    def _claim_events(self, claim_id: str) -> tuple[Event, ...]:
         rows = self._host_store._db.execute(
             """
-            SELECT sequence FROM events
-            WHERE event_type LIKE 'claim.%'
+            SELECT sequence, claim_id, event_type
+            FROM claim_event_index
+            WHERE claim_id = ?
             ORDER BY sequence
-            """
+            """,
+            (claim_id,),
         ).fetchall()
-        sequences: list[int] = []
+        events: list[Event] = []
         for row in rows:
             event = self._event_by_sequence(int(row["sequence"]))
-            if event.correlation_id == claim_id:
-                sequences.append(event.sequence)
-        return tuple(sequences)
+            if (
+                event.correlation_id != row["claim_id"]
+                or event.correlation_id != claim_id
+                or event.event_type != row["event_type"]
+                or not event.event_type.startswith("claim.")
+            ):
+                raise IntegrityViolation("Claim Event index binding mismatch")
+            events.append(event)
+        return tuple(events)
 
-    def _event_links(self, claim_id: str) -> tuple[ClaimEvidenceLink, ...]:
+    def _claim_event_sequences(self, claim_id: str) -> tuple[int, ...]:
+        return tuple(event.sequence for event in self._claim_events(claim_id))
+
+    def _event_links(
+        self,
+        claim_id: str,
+        events: tuple[Event, ...],
+    ) -> tuple[ClaimEvidenceLink, ...]:
         links: list[ClaimEvidenceLink] = []
-        for sequence in self._claim_event_sequences(claim_id):
-            event = self._event_by_sequence(sequence)
+        for event in events:
             raw_links: list[object] = []
             if "link" in event.payload:
                 raw_links.append(event.payload["link"])
@@ -259,7 +365,11 @@ class ClaimRepository:
             raise InvalidRequest(f"unknown Claim: {claim_id}")
         return row
 
-    def _history_rows(self, claim_id: str) -> tuple[sqlite3.Row, ...]:
+    def _history_rows(
+        self,
+        claim_id: str,
+        events: tuple[Event, ...],
+    ) -> tuple[sqlite3.Row, ...]:
         rows = tuple(
             self._host_store._db.execute(
                 """
@@ -270,12 +380,12 @@ class ClaimRepository:
             ).fetchall()
         )
         history_sequences = tuple(int(row["sequence"]) for row in rows)
-        event_sequences = self._claim_event_sequences(claim_id)
+        event_sequences = tuple(event.sequence for event in events)
         if history_sequences != event_sequences:
             raise IntegrityViolation("Claim history sequence diverges from semantic Event history")
         return rows
 
-    def _history_claim(self, row: sqlite3.Row) -> Claim:
+    def _history_claim(self, row: sqlite3.Row, event: Event | None = None) -> Claim:
         try:
             claim = record_from_json(Claim, row["claim_json"])
         except (TypeError, ValueError) as exc:
@@ -284,7 +394,10 @@ class ClaimRepository:
             raise IntegrityViolation("Claim history identity mismatch")
         if canonical_digest(claim) != row["claim_digest"]:
             raise IntegrityViolation("Claim history digest mismatch")
-        event = self._event_by_sequence(int(row["sequence"]))
+        if event is None:
+            event = self._event_by_sequence(int(row["sequence"]))
+        if event.sequence != int(row["sequence"]):
+            raise IntegrityViolation("Claim history/Event sequence mismatch")
         if event.event_type != row["event_type"] or event.correlation_id != claim.claim_id:
             raise IntegrityViolation("Claim history/Event binding mismatch")
         try:
@@ -294,6 +407,22 @@ class ClaimRepository:
         if to_canonical_data(event_claim) != to_canonical_data(claim):
             raise IntegrityViolation("Claim history diverges from semantic Event")
         return claim
+
+    def _validated_history(
+        self,
+        claim_id: str,
+        events: tuple[Event, ...],
+    ) -> tuple[Claim, ...]:
+        rows = self._history_rows(claim_id, events)
+        history = tuple(
+            self._history_claim(row, event)
+            for row, event in zip(rows, events)
+        )
+        if not history or history[0].status is not ClaimStatus.PROPOSED:
+            raise IntegrityViolation("Claim history must begin in proposed state")
+        if any(item.status is ClaimStatus.SUPERSEDED for item in history[:-1]):
+            raise IntegrityViolation("Claim history continued after supersession")
+        return history
 
     def _links(self, claim_id: str) -> tuple[ClaimEvidenceLink, ...]:
         rows = self._host_store._db.execute(
@@ -349,16 +478,17 @@ class ClaimRepository:
             raise IntegrityViolation("Claim projection digest mismatch")
         self._validate_claim(claim)
 
-        history_rows = self._history_rows(claim_id)
+        events = self._claim_events(claim_id)
+        history = self._validated_history(claim_id, events)
         if (
-            not history_rows
-            or int(history_rows[-1]["sequence"]) != int(row["last_sequence"])
-            or self._history_claim(history_rows[-1]) != claim
+            not history
+            or events[-1].sequence != int(row["last_sequence"])
+            or history[-1] != claim
         ):
             raise IntegrityViolation("Claim projection diverges from durable history")
 
         links = self._links(claim_id)
-        event_links = self._event_links(claim_id)
+        event_links = self._event_links(claim_id, events)
         if len(links) != len(event_links) or set(links) != set(event_links):
             raise IntegrityViolation("Claim Evidence links diverge from semantic Event history")
         linked_refs = tuple(sorted({link.evidence_id for link in links}))
@@ -391,7 +521,10 @@ class ClaimRepository:
                 raise IntegrityViolation("Claim supersession receipt decoded wrong type")
             if canonical_digest(receipt) != supersession["receipt_digest"]:
                 raise IntegrityViolation("Claim supersession receipt digest mismatch")
-            if receipt.claim_id != claim_id or receipt.successor_claim_id != supersession["successor_claim_id"]:
+            if (
+                receipt.claim_id != claim_id
+                or receipt.successor_claim_id != supersession["successor_claim_id"]
+            ):
                 raise IntegrityViolation("Claim supersession binding mismatch")
             event = self._event_by_sequence(int(supersession["event_sequence"]))
             if event.event_type != "claim.superseded" or event.correlation_id != claim_id:
@@ -421,11 +554,19 @@ class ClaimRepository:
         )
         try:
             with self._host_store._transaction():
+                projection_row = self._host_store._db.execute(
+                    "SELECT 1 FROM claim_projections WHERE claim_id = ? LIMIT 1",
+                    (claim.claim_id,),
+                ).fetchone()
                 history_row = self._host_store._db.execute(
                     "SELECT 1 FROM claim_history WHERE claim_id = ? LIMIT 1",
                     (claim.claim_id,),
                 ).fetchone()
-                if history_row is not None or self._claim_event_sequences(claim.claim_id):
+                event_row = self._host_store._db.execute(
+                    "SELECT 1 FROM claim_event_index WHERE claim_id = ? LIMIT 1",
+                    (claim.claim_id,),
+                ).fetchone()
+                if projection_row is not None or history_row is not None or event_row is not None:
                     raise PersistenceConflict(
                         f"Claim identity already exists in durable history: {claim.claim_id}"
                     )
@@ -446,7 +587,13 @@ class ClaimRepository:
                     INSERT INTO claim_history(sequence, claim_id, event_type, claim_json, claim_digest)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (event.sequence, claim.claim_id, event.event_type, record_to_json(claim), canonical_digest(claim)),
+                    (
+                        event.sequence,
+                        claim.claim_id,
+                        event.event_type,
+                        record_to_json(claim),
+                        canonical_digest(claim),
+                    ),
                 )
         except sqlite3.IntegrityError as exc:
             raise PersistenceConflict(f"Claim identity already exists: {claim.claim_id}") from exc
@@ -494,7 +641,13 @@ class ClaimRepository:
             INSERT INTO claim_history(sequence, claim_id, event_type, claim_json, claim_digest)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (event.sequence, updated.claim_id, event.event_type, record_to_json(updated), canonical_digest(updated)),
+            (
+                event.sequence,
+                updated.claim_id,
+                event.event_type,
+                record_to_json(updated),
+                canonical_digest(updated),
+            ),
         )
 
     def add_reference(self, claim_id: str, evidence_id: str) -> Claim:
@@ -692,14 +845,10 @@ class ClaimRepository:
         return updated
 
     def history(self, claim_id: str) -> tuple[Claim, ...]:
-        self._row(claim_id)
-        rows = self._history_rows(claim_id)
-        history = tuple(self._history_claim(row) for row in rows)
-        if not history or history[0].status is not ClaimStatus.PROPOSED:
-            raise IntegrityViolation("Claim history must begin in proposed state")
-        if any(item.status is ClaimStatus.SUPERSEDED for item in history[:-1]):
-            raise IntegrityViolation("Claim history continued after supersession")
-        if history[-1] != self.get(claim_id):
+        current = self.get(claim_id)
+        events = self._claim_events(claim_id)
+        history = self._validated_history(claim_id, events)
+        if history[-1] != current:
             raise IntegrityViolation("Claim projection diverges from Claim history")
         return history
 
