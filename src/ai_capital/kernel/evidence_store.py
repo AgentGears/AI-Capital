@@ -283,8 +283,12 @@ class EvidenceRepository:
             int(evidence.digest, 16)
         except ValueError as exc:
             raise EvidenceInvalid("Evidence digest must be hexadecimal") from exc
-        if not evidence.provenance or any(not item.strip() for item in evidence.provenance):
-            raise EvidenceInvalid("Evidence requires a non-empty provenance chain")
+        if (
+            type(evidence.provenance) is not tuple
+            or not evidence.provenance
+            or any(type(item) is not str or not item.strip() for item in evidence.provenance)
+        ):
+            raise EvidenceInvalid("Evidence requires a tuple of non-empty provenance strings")
         if not evidence.trust_class.strip() or not evidence.currentness.strip():
             raise EvidenceInvalid("Evidence trust/currentness metadata must be non-empty")
         cls._parse_time(evidence.observed_at, field="observed_at")
