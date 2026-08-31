@@ -27,7 +27,6 @@ from ai_capital.kernel.enums import (
 from ai_capital.kernel.errors import (
     IntegrityViolation,
     InvalidStateTransition,
-    PersistenceConflict,
 )
 from ai_capital.kernel.inference import _validate_model_turn
 from ai_capital.kernel.models import (
@@ -330,27 +329,33 @@ class ReviewRemediationTests(unittest.TestCase):
             ),
         )
 
-    def test_idempotency_identity_cannot_be_reused_across_operations(self):
+    def test_caller_idempotency_token_is_not_backend_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             with ProgramRepository(Path(directory) / "kernel.db") as programs:
                 journal = OperationJournal(programs)
-                journal.create_intent(
+                first = journal.create_intent(
                     program_id="p-1",
                     actor_id="a-1",
                     resolution=self._resolution("req-1", "a.txt"),
                     authority_receipt_ref="auth-1",
-                    idempotency_key="idem-1",
+                    idempotency_key="same-caller-token",
                 )
-                with self.assertRaises(PersistenceConflict):
-                    journal.create_intent(
-                        program_id="p-1",
-                        actor_id="a-1",
-                        resolution=self._resolution("req-2", "b.txt"),
-                        authority_receipt_ref="auth-2",
-                        idempotency_key="idem-1",
-                    )
+                second = journal.create_intent(
+                    program_id="p-1",
+                    actor_id="a-1",
+                    resolution=self._resolution("req-2", "b.txt"),
+                    authority_receipt_ref="auth-2",
+                    idempotency_key="same-caller-token",
+                )
+                first_key = journal.idempotency_key(first.operation_id)
+                second_key = journal.idempotency_key(second.operation_id)
+                self.assertIsNotNone(first_key)
+                self.assertIsNotNone(second_key)
+                self.assertNotEqual(first_key, "same-caller-token")
+                self.assertNotEqual(second_key, "same-caller-token")
+                self.assertNotEqual(first_key, second_key)
 
-    def test_persisted_idempotency_identity_is_integrity_protected(self):
+    def test_persisted_idempotency_identity_is_independently_derivable(self):
         with tempfile.TemporaryDirectory() as directory:
             with ProgramRepository(Path(directory) / "kernel.db") as programs:
                 journal = OperationJournal(programs)
@@ -359,15 +364,31 @@ class ReviewRemediationTests(unittest.TestCase):
                     actor_id="a-1",
                     resolution=self._resolution("req-1", "a.txt"),
                     authority_receipt_ref="auth-1",
-                    idempotency_key="idem-1",
+                    idempotency_key="caller-opt-in",
+                )
+                forged_key = "forged-backend-key"
+                forged_binding_digest = canonical_digest(
+                    {
+                        "idempotency_key": forged_key,
+                        "operation_id": operation.operation_id,
+                        "resolution_digest": operation.request_digest,
+                    }
                 )
                 programs._db.execute(
                     """
                     UPDATE operation_projections
-                    SET idempotency_key = 'tampered'
+                    SET idempotency_key = ?
                     WHERE operation_id = ?
                     """,
-                    (operation.operation_id,),
+                    (forged_key, operation.operation_id),
+                )
+                programs._db.execute(
+                    """
+                    UPDATE operation_idempotency_bindings
+                    SET idempotency_key = ?, binding_digest = ?
+                    WHERE operation_id = ?
+                    """,
+                    (forged_key, forged_binding_digest, operation.operation_id),
                 )
                 with self.assertRaises(IntegrityViolation):
                     journal.idempotency_key(operation.operation_id)
