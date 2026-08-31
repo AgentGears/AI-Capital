@@ -17,7 +17,7 @@ from .serialization import canonical_digest, to_canonical_data
 
 
 _COMPONENT = "evidence_store"
-_COMPONENT_SCHEMA_VERSION = 1
+_COMPONENT_SCHEMA_VERSION = 2
 _ARTIFACT_PREFIX = "evidence-artifact:"
 
 
@@ -57,82 +57,8 @@ class EvidenceRepository:
                 )
             artifact_root = Path(database_path).resolve().parent / "evidence"
         self._artifact_root = Path(artifact_root)
-        root_existed = self._artifact_root.exists()
-        self._artifact_root.mkdir(parents=True, exist_ok=True)
-        if not root_existed:
-            self._fsync_directory(self._artifact_root.parent)
+        self._mkdir_durable(self._artifact_root)
         self._migrate()
-
-    def _migrate(self) -> None:
-        with self._host_store._transaction():
-            self._host_store._db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS component_schema (
-                    component TEXT PRIMARY KEY,
-                    version INTEGER NOT NULL
-                )
-                """
-            )
-            row = self._host_store._db.execute(
-                "SELECT version FROM component_schema WHERE component = ?",
-                (_COMPONENT,),
-            ).fetchone()
-            version = None if row is None else int(row[0])
-            if version is not None:
-                if version > _COMPONENT_SCHEMA_VERSION:
-                    raise IntegrityViolation(
-                        f"Evidence schema version {version} is newer than supported "
-                        f"{_COMPONENT_SCHEMA_VERSION}"
-                    )
-                if version != _COMPONENT_SCHEMA_VERSION:
-                    raise IntegrityViolation(f"unsupported Evidence schema version {version}")
-                return
-
-            self._host_store._db.execute(
-                """
-                CREATE TABLE evidence_artifacts (
-                    artifact_digest TEXT PRIMARY KEY,
-                    content_ref TEXT NOT NULL UNIQUE,
-                    byte_length INTEGER NOT NULL
-                )
-                """
-            )
-            self._host_store._db.execute(
-                """
-                CREATE TABLE evidence_records (
-                    evidence_id TEXT PRIMARY KEY,
-                    artifact_digest TEXT NOT NULL,
-                    admitted_event_id TEXT NOT NULL UNIQUE,
-                    evidence_json TEXT NOT NULL,
-                    evidence_record_digest TEXT NOT NULL,
-                    admission_json TEXT NOT NULL,
-                    admission_digest TEXT NOT NULL,
-                    FOREIGN KEY(artifact_digest) REFERENCES evidence_artifacts(artifact_digest)
-                )
-                """
-            )
-            self._host_store._db.execute(
-                "INSERT INTO component_schema(component, version) VALUES (?, ?)",
-                (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
-            )
-
-    @staticmethod
-    def _parse_time(value: str, *, field: str) -> datetime:
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise EvidenceInvalid(f"{field} must be valid ISO-8601") from exc
-        if parsed.tzinfo is None:
-            raise EvidenceInvalid(f"{field} must be timezone-aware")
-        return parsed.astimezone(timezone.utc)
-
-    @staticmethod
-    def _artifact_digest(content: bytes) -> str:
-        return hashlib.sha256(content).hexdigest()
-
-    @staticmethod
-    def _content_ref(artifact_digest: str) -> str:
-        return f"{_ARTIFACT_PREFIX}{artifact_digest}"
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
@@ -152,6 +78,176 @@ class EvidenceRepository:
         finally:
             os.close(descriptor)
 
+    def _mkdir_durable(self, path: Path) -> None:
+        """Create a directory chain and durably persist every new directory entry."""
+        missing: list[Path] = []
+        current = path
+        while not current.exists():
+            missing.append(current)
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+        path.mkdir(parents=True, exist_ok=True)
+        for created in reversed(missing):
+            self._fsync_directory(created.parent)
+
+    def _migrate(self) -> None:
+        with self._host_store._transaction():
+            self._host_store._db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS component_schema (
+                    component TEXT PRIMARY KEY,
+                    version INTEGER NOT NULL
+                )
+                """
+            )
+            row = self._host_store._db.execute(
+                "SELECT version FROM component_schema WHERE component = ?",
+                (_COMPONENT,),
+            ).fetchone()
+            version = None if row is None else int(row[0])
+            if version is not None and version > _COMPONENT_SCHEMA_VERSION:
+                raise IntegrityViolation(
+                    f"Evidence schema version {version} is newer than supported "
+                    f"{_COMPONENT_SCHEMA_VERSION}"
+                )
+            if version not in {None, 1, _COMPONENT_SCHEMA_VERSION}:
+                raise IntegrityViolation(f"unsupported Evidence schema version {version}")
+
+            if version is None:
+                self._host_store._db.execute(
+                    """
+                    CREATE TABLE evidence_artifacts (
+                        artifact_digest TEXT PRIMARY KEY,
+                        content_ref TEXT NOT NULL UNIQUE,
+                        byte_length INTEGER NOT NULL
+                    )
+                    """
+                )
+                self._host_store._db.execute(
+                    """
+                    CREATE TABLE evidence_records (
+                        evidence_id TEXT PRIMARY KEY,
+                        artifact_digest TEXT NOT NULL,
+                        admitted_event_id TEXT NOT NULL UNIQUE,
+                        evidence_json TEXT NOT NULL,
+                        evidence_record_digest TEXT NOT NULL,
+                        admission_json TEXT NOT NULL,
+                        admission_digest TEXT NOT NULL,
+                        FOREIGN KEY(artifact_digest) REFERENCES evidence_artifacts(artifact_digest)
+                    )
+                    """
+                )
+
+            if version in {None, 1}:
+                self._host_store._db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS evidence_event_index (
+                        sequence INTEGER PRIMARY KEY,
+                        evidence_id TEXT NOT NULL,
+                        event_id TEXT NOT NULL UNIQUE,
+                        event_type TEXT NOT NULL,
+                        FOREIGN KEY(sequence) REFERENCES events(sequence)
+                    )
+                    """
+                )
+                self._host_store._db.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS evidence_event_index_identity_sequence
+                    ON evidence_event_index(evidence_id, sequence)
+                    """
+                )
+                self._rebuild_event_index()
+                if version is None:
+                    self._host_store._db.execute(
+                        "INSERT INTO component_schema(component, version) VALUES (?, ?)",
+                        (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
+                    )
+                else:
+                    self._host_store._db.execute(
+                        "UPDATE component_schema SET version = ? WHERE component = ?",
+                        (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
+                    )
+
+    def _decode_event_row(self, row: sqlite3.Row) -> Event:
+        try:
+            event = record_from_json(Event, row["event_json"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("Evidence Event cannot be decoded") from exc
+        if not isinstance(event, Event):
+            raise IntegrityViolation("Evidence Event decoded wrong type")
+        if (
+            event.sequence != int(row["sequence"])
+            or event.event_id != row["event_id"]
+            or event.program_id != row["program_id"]
+            or event.event_type != row["event_type"]
+            or event.digest != row["event_digest"]
+            or not verify_event_digest(event)
+        ):
+            raise IntegrityViolation("Evidence Event integrity mismatch")
+        return event
+
+    def _rebuild_event_index(self) -> None:
+        self._host_store._db.execute("DELETE FROM evidence_event_index")
+        rows = self._host_store._db.execute(
+            """
+            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+            FROM events ORDER BY sequence
+            """
+        ).fetchall()
+        for row in rows:
+            event = self._decode_event_row(row)
+            if event.event_type != "evidence.admitted":
+                continue
+            if not event.correlation_id:
+                raise IntegrityViolation("Evidence admission Event lacks Evidence identity")
+            self._host_store._db.execute(
+                """
+                INSERT INTO evidence_event_index(sequence, evidence_id, event_id, event_type)
+                VALUES (?, ?, ?, ?)
+                """,
+                (event.sequence, event.correlation_id, event.event_id, event.event_type),
+            )
+
+        record_rows = self._host_store._db.execute(
+            "SELECT evidence_id, admitted_event_id FROM evidence_records"
+        ).fetchall()
+        for record in record_rows:
+            indexed = self._host_store._db.execute(
+                """
+                SELECT sequence, evidence_id, event_id, event_type
+                FROM evidence_event_index WHERE event_id = ?
+                """,
+                (record["admitted_event_id"],),
+            ).fetchone()
+            if (
+                indexed is None
+                or indexed["evidence_id"] != record["evidence_id"]
+                or indexed["event_type"] != "evidence.admitted"
+            ):
+                raise IntegrityViolation(
+                    "Evidence record is not represented by the rebuilt Event index"
+                )
+
+    @staticmethod
+    def _parse_time(value: str, *, field: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise EvidenceInvalid(f"{field} must be valid ISO-8601") from exc
+        if parsed.tzinfo is None:
+            raise EvidenceInvalid(f"{field} must be timezone-aware")
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _artifact_digest(content: bytes) -> str:
+        return hashlib.sha256(content).hexdigest()
+
+    @staticmethod
+    def _content_ref(artifact_digest: str) -> str:
+        return f"{_ARTIFACT_PREFIX}{artifact_digest}"
+
     def _artifact_path(self, artifact_digest: str) -> Path:
         if len(artifact_digest) != 64:
             raise EvidenceInvalid("Evidence artifact digest must be a SHA-256 hex digest")
@@ -163,10 +259,7 @@ class EvidenceRepository:
 
     def _store_artifact(self, content: bytes, artifact_digest: str) -> None:
         path = self._artifact_path(artifact_digest)
-        parent_existed = path.parent.exists()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not parent_existed:
-            self._fsync_directory(self._artifact_root)
+        self._mkdir_durable(path.parent)
         if path.exists():
             existing = path.read_bytes()
             if existing != content or self._artifact_digest(existing) != artifact_digest:
@@ -226,6 +319,13 @@ class EvidenceRepository:
             correlation_id=evidence_id,
         )
         self._host_store._insert_event(event)
+        self._host_store._db.execute(
+            """
+            INSERT INTO evidence_event_index(sequence, evidence_id, event_id, event_type)
+            VALUES (?, ?, ?, ?)
+            """,
+            (event.sequence, evidence_id, event.event_id, event.event_type),
+        )
         return event
 
     def _event(self, event_id: str) -> Event:
@@ -238,38 +338,36 @@ class EvidenceRepository:
         ).fetchone()
         if row is None:
             raise IntegrityViolation("Evidence admission Event is missing")
-        try:
-            event = record_from_json(Event, row["event_json"])
-        except (TypeError, ValueError) as exc:
-            raise IntegrityViolation("Evidence admission Event cannot be decoded") from exc
-        if not isinstance(event, Event):
-            raise IntegrityViolation("Evidence admission Event decoded wrong type")
-        if (
-            event.sequence != int(row["sequence"])
-            or event.event_id != row["event_id"]
-            or event.program_id != row["program_id"]
-            or event.event_type != row["event_type"]
-            or event.digest != row["event_digest"]
-            or not verify_event_digest(event)
-        ):
-            raise IntegrityViolation("Evidence admission Event integrity mismatch")
+        event = self._decode_event_row(row)
         if event.event_type != "evidence.admitted":
             raise IntegrityViolation("Evidence record is anchored to the wrong Event type")
         return event
 
-    def _identity_exists_in_history(self, evidence_id: str) -> bool:
+    def _indexed_events(self, evidence_id: str) -> tuple[Event, ...]:
         rows = self._host_store._db.execute(
             """
-            SELECT event_id FROM events
-            WHERE event_type = 'evidence.admitted'
+            SELECT sequence, evidence_id, event_id, event_type
+            FROM evidence_event_index
+            WHERE evidence_id = ?
             ORDER BY sequence
-            """
+            """,
+            (evidence_id,),
         ).fetchall()
+        events: list[Event] = []
         for row in rows:
             event = self._event(str(row["event_id"]))
-            if event.correlation_id == evidence_id:
-                return True
-        return False
+            if (
+                event.sequence != int(row["sequence"])
+                or event.correlation_id != row["evidence_id"]
+                or event.event_type != row["event_type"]
+                or row["evidence_id"] != evidence_id
+            ):
+                raise IntegrityViolation("Evidence Event index diverges from semantic Event")
+            events.append(event)
+        return tuple(events)
+
+    def _identity_exists_in_history(self, evidence_id: str) -> bool:
+        return bool(self._indexed_events(evidence_id))
 
     @classmethod
     def _validate_evidence(cls, evidence: Evidence) -> None:
@@ -381,7 +479,9 @@ class EvidenceRepository:
                     ),
                 )
         except sqlite3.IntegrityError as exc:
-            raise PersistenceConflict(f"Evidence identity already exists: {evidence.evidence_id}") from exc
+            raise PersistenceConflict(
+                f"Evidence identity already exists: {evidence.evidence_id}"
+            ) from exc
         return evidence
 
     def _row(self, evidence_id: str) -> sqlite3.Row:
@@ -405,7 +505,9 @@ class EvidenceRepository:
             admission = record_from_json(EvidenceAdmissionReceipt, row["admission_json"])
         except (TypeError, ValueError) as exc:
             raise IntegrityViolation("Evidence record cannot be decoded") from exc
-        if not isinstance(evidence, Evidence) or not isinstance(admission, EvidenceAdmissionReceipt):
+        if not isinstance(evidence, Evidence) or not isinstance(
+            admission, EvidenceAdmissionReceipt
+        ):
             raise IntegrityViolation("Evidence record decoded wrong type")
         if evidence.evidence_id != row["evidence_id"]:
             raise IntegrityViolation("Evidence row identity mismatch")
@@ -415,7 +517,10 @@ class EvidenceRepository:
             raise IntegrityViolation("Evidence record digest mismatch")
         if canonical_digest(admission) != row["admission_digest"]:
             raise IntegrityViolation("Evidence admission receipt digest mismatch")
-        if admission.evidence_id != evidence.evidence_id or admission.artifact_digest != evidence.digest:
+        if (
+            admission.evidence_id != evidence.evidence_id
+            or admission.artifact_digest != evidence.digest
+        ):
             raise IntegrityViolation("Evidence admission receipt binding mismatch")
         self._validate_evidence(evidence)
 
@@ -430,12 +535,32 @@ class EvidenceRepository:
             raise IntegrityViolation("Evidence artifact metadata is missing")
         if artifact["content_ref"] != evidence.content_ref:
             raise IntegrityViolation("Evidence artifact content reference mismatch")
-        self._read_artifact(evidence.digest, expected_length=int(artifact["byte_length"]))
+        self._read_artifact(
+            evidence.digest,
+            expected_length=int(artifact["byte_length"]),
+        )
 
+        indexed = self._host_store._db.execute(
+            """
+            SELECT sequence, evidence_id, event_id, event_type
+            FROM evidence_event_index WHERE event_id = ?
+            """,
+            (row["admitted_event_id"],),
+        ).fetchone()
+        if indexed is None:
+            raise IntegrityViolation("Evidence admission Event index entry is missing")
         event = self._event(str(row["admitted_event_id"]))
-        if event.correlation_id != evidence.evidence_id:
-            raise IntegrityViolation("Evidence admission Event correlation mismatch")
-        expected_payload = to_canonical_data({"evidence": evidence, "admission": admission})
+        if (
+            event.sequence != int(indexed["sequence"])
+            or indexed["evidence_id"] != evidence.evidence_id
+            or indexed["event_id"] != event.event_id
+            or indexed["event_type"] != event.event_type
+            or event.correlation_id != evidence.evidence_id
+        ):
+            raise IntegrityViolation("Evidence admission Event index binding mismatch")
+        expected_payload = to_canonical_data(
+            {"evidence": evidence, "admission": admission}
+        )
         if to_canonical_data(event.payload) != expected_payload:
             raise IntegrityViolation("Evidence record diverges from admission Event")
         return evidence
@@ -444,7 +569,10 @@ class EvidenceRepository:
         row = self._row(evidence_id)
         self.get(evidence_id)
         try:
-            admission = record_from_json(EvidenceAdmissionReceipt, row["admission_json"])
+            admission = record_from_json(
+                EvidenceAdmissionReceipt,
+                row["admission_json"],
+            )
         except (TypeError, ValueError) as exc:
             raise IntegrityViolation("Evidence admission receipt cannot be decoded") from exc
         assert isinstance(admission, EvidenceAdmissionReceipt)
@@ -460,7 +588,10 @@ class EvidenceRepository:
         ).fetchone()
         if row is None:
             raise IntegrityViolation("Evidence artifact metadata is missing")
-        return self._read_artifact(evidence.digest, expected_length=int(row["byte_length"]))
+        return self._read_artifact(
+            evidence.digest,
+            expected_length=int(row["byte_length"]),
+        )
 
     def reference(self, evidence_id: str) -> EvidenceReference:
         evidence = self.get(evidence_id)
