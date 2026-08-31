@@ -357,6 +357,7 @@ class ProgramRepository:
             raise StaleProgramRevision(
                 f"expected revision {expected_revision}, current revision {current.revision}"
             )
+        transition_program(current, target, expected_revision=expected_revision)
         event_type = _transition_event_type(current.status, target)
         return self._commit_change(
             program_id=program_id,
@@ -607,6 +608,8 @@ def _validate_event_semantics(
         return
 
     if event_type == "program.revised":
+        if candidate.work_items != previous.work_items:
+            raise IntegrityViolation("revised Event changed lifecycle-managed WorkItems")
         return
 
     raise IntegrityViolation(
