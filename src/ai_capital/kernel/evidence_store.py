@@ -171,6 +171,7 @@ class EvidenceRepository:
             existing = path.read_bytes()
             if existing != content or self._artifact_digest(existing) != artifact_digest:
                 raise IntegrityViolation("content-addressed Evidence artifact collision")
+            self._fsync_directory(path.parent)
             return
 
         temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
