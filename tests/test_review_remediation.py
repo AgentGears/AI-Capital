@@ -16,6 +16,7 @@ from ai_capital.kernel.capability_broker import CapabilityBroker, CapabilityHand
 from ai_capital.kernel.capability_store import CapabilityRepository
 from ai_capital.kernel.durable_program import ProgramRepository, _validate_event_semantics
 from ai_capital.kernel.enums import (
+    ContextCompleteness,
     EffectClass,
     ModelAttemptOutcome,
     ProgramStatus,
@@ -120,7 +121,7 @@ class ReviewRemediationTests(unittest.TestCase):
                     0,
                     (),
                     (),
-                    "complete",
+                    ContextCompleteness.COMPLETE,
                     10,
                     NOW,
                 )
