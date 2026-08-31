@@ -61,7 +61,86 @@ class EvidenceRepository:
         self._migrate()
 
     @staticmethod
+    def _windows_fsync_directory(path: Path) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        generic_write = 0x40000000
+        file_share_read = 0x00000001
+        file_share_write = 0x00000002
+        file_share_delete = 0x00000004
+        open_existing = 3
+        file_flag_backup_semantics = 0x02000000
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        flush_file_buffers = kernel32.FlushFileBuffers
+        flush_file_buffers.argtypes = (wintypes.HANDLE,)
+        flush_file_buffers.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        handle = create_file(
+            str(path),
+            generic_write,
+            file_share_read | file_share_write | file_share_delete,
+            None,
+            open_existing,
+            file_flag_backup_semantics,
+            None,
+        )
+        invalid_handle = wintypes.HANDLE(-1).value
+        if handle == invalid_handle:
+            error = ctypes.get_last_error()
+            raise PersistenceConflict(
+                f"cannot open Evidence artifact directory for durable flush: {path}"
+            ) from ctypes.WinError(error)
+        try:
+            if not flush_file_buffers(handle):
+                error = ctypes.get_last_error()
+                raise PersistenceConflict(
+                    f"cannot durably flush Evidence artifact directory: {path}"
+                ) from ctypes.WinError(error)
+        finally:
+            close_handle(handle)
+
+    @staticmethod
+    def _windows_replace_durable(source: Path, destination: Path) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        movefile_replace_existing = 0x00000001
+        movefile_write_through = 0x00000008
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        move_file_ex = kernel32.MoveFileExW
+        move_file_ex.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+        move_file_ex.restype = wintypes.BOOL
+        if not move_file_ex(
+            str(source),
+            str(destination),
+            movefile_replace_existing | movefile_write_through,
+        ):
+            error = ctypes.get_last_error()
+            raise PersistenceConflict(
+                f"cannot durably replace Evidence artifact: {destination}"
+            ) from ctypes.WinError(error)
+
+    @staticmethod
     def _fsync_directory(path: Path) -> None:
+        if os.name == "nt":
+            EvidenceRepository._windows_fsync_directory(path)
+            return
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         try:
             descriptor = os.open(path, flags)
@@ -77,6 +156,13 @@ class EvidenceRepository:
             ) from exc
         finally:
             os.close(descriptor)
+
+    def _replace_durable(self, source: Path, destination: Path) -> None:
+        if os.name == "nt":
+            self._windows_replace_durable(source, destination)
+        else:
+            os.replace(source, destination)
+        self._fsync_directory(destination.parent)
 
     def _mkdir_durable(self, path: Path) -> None:
         """Create a directory chain and durably persist every new directory entry."""
@@ -273,8 +359,7 @@ class EvidenceRepository:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, path)
-            self._fsync_directory(path.parent)
+            self._replace_durable(temporary, path)
         finally:
             if temporary.exists():
                 temporary.unlink()
@@ -408,7 +493,7 @@ class EvidenceRepository:
             raise EvidenceInvalid("Evidence content must be non-empty")
         artifact_digest = self._artifact_digest(content)
         evidence = Evidence(
-            evidence_id=evidence_id or str(uuid4()),
+            evidence_id=str(uuid4()) if evidence_id is None else evidence_id,
             source_class=source_class,
             observed_at=observed_at,
             content_ref=self._content_ref(artifact_digest),
