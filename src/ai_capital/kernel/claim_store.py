@@ -234,6 +234,22 @@ class ClaimRepository:
             raise InvalidRequest(f"unknown Claim: {claim_id}")
         return row
 
+    def _history_rows(self, claim_id: str) -> tuple[sqlite3.Row, ...]:
+        rows = tuple(
+            self._host_store._db.execute(
+                """
+                SELECT sequence, claim_id, event_type, claim_json, claim_digest
+                FROM claim_history WHERE claim_id = ? ORDER BY sequence
+                """,
+                (claim_id,),
+            ).fetchall()
+        )
+        history_sequences = tuple(int(row["sequence"]) for row in rows)
+        event_sequences = self._claim_event_sequences(claim_id)
+        if history_sequences != event_sequences:
+            raise IntegrityViolation("Claim history sequence diverges from semantic Event history")
+        return rows
+
     def _history_claim(self, row: sqlite3.Row) -> Claim:
         try:
             claim = record_from_json(Claim, row["claim_json"])
@@ -308,14 +324,12 @@ class ClaimRepository:
             raise IntegrityViolation("Claim projection digest mismatch")
         self._validate_claim(claim)
 
-        history_row = self._host_store._db.execute(
-            """
-            SELECT sequence, claim_id, event_type, claim_json, claim_digest
-            FROM claim_history WHERE sequence = ? AND claim_id = ?
-            """,
-            (int(row["last_sequence"]), claim_id),
-        ).fetchone()
-        if history_row is None or self._history_claim(history_row) != claim:
+        history_rows = self._history_rows(claim_id)
+        if (
+            not history_rows
+            or int(history_rows[-1]["sequence"]) != int(row["last_sequence"])
+            or self._history_claim(history_rows[-1]) != claim
+        ):
             raise IntegrityViolation("Claim projection diverges from durable history")
 
         links = self._links(claim_id)
@@ -511,6 +525,27 @@ class ClaimRepository:
                 ClaimStatus.SUPPORTED,
             }:
                 raise InvalidRequest("Claim cannot enter contradicted state from current status")
+            if relation in {
+                ClaimEvidenceRelation.SUPPORT,
+                ClaimEvidenceRelation.CONTRADICTION,
+            }:
+                opposite = (
+                    ClaimEvidenceRelation.CONTRADICTION
+                    if relation is ClaimEvidenceRelation.SUPPORT
+                    else ClaimEvidenceRelation.SUPPORT
+                )
+                rows = self._host_store._db.execute(
+                    """
+                    SELECT evidence_id FROM claim_evidence_links
+                    WHERE claim_id = ? AND relation = ?
+                    """,
+                    (claim_id, opposite.value),
+                ).fetchall()
+                opposite_ids = {str(row["evidence_id"]) for row in rows}
+                if opposite_ids.intersection(evidence_ids):
+                    raise EvidenceInvalid(
+                        "the same Evidence cannot both support and contradict one Claim"
+                    )
             links = tuple(
                 ClaimEvidenceLink(
                     claim_id=claim_id,
@@ -630,17 +665,7 @@ class ClaimRepository:
 
     def history(self, claim_id: str) -> tuple[Claim, ...]:
         self._row(claim_id)
-        rows = self._host_store._db.execute(
-            """
-            SELECT sequence, claim_id, event_type, claim_json, claim_digest
-            FROM claim_history WHERE claim_id = ? ORDER BY sequence
-            """,
-            (claim_id,),
-        ).fetchall()
-        history_sequences = tuple(int(row["sequence"]) for row in rows)
-        event_sequences = self._claim_event_sequences(claim_id)
-        if history_sequences != event_sequences:
-            raise IntegrityViolation("Claim history sequence diverges from semantic Event history")
+        rows = self._history_rows(claim_id)
         history = tuple(self._history_claim(row) for row in rows)
         if not history or history[0].status is not ClaimStatus.PROPOSED:
             raise IntegrityViolation("Claim history must begin in proposed state")
