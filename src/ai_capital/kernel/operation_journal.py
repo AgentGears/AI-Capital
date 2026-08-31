@@ -22,25 +22,31 @@ from .errors import (
     PersistenceConflict,
     ReconciliationRequired,
 )
-from .events import event_digest_fields, utc_now
+from .events import event_digest_fields, utc_now, verify_event_digest
 from .frozen_json import FrozenMap, freeze_json
 from .models import CapabilityResolution, Event, Operation, ResolvedEffect
 from .operations import retry_is_safe, validate_operation_semantics
 from .schema_codec import record_from_json, record_to_json
-from .serialization import canonical_digest, to_canonical_data
+from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "operation_journal"
 _COMPONENT_SCHEMA_VERSION = 3
 
 
-def _host_idempotency_key(*, operation_id: str, resolution_digest: str) -> str:
-    """Derive the backend identity from Host-owned immutable Operation inputs."""
+def _host_idempotency_key(
+    *,
+    operation_id: str,
+    resolution_digest: str,
+    requested_event_id: str,
+) -> str:
+    """Derive the backend identity from independent Host-owned durable identities."""
     return canonical_digest(
         {
             "kind": "operation_idempotency",
             "operation_id": operation_id,
             "resolution_digest": resolution_digest,
+            "requested_event_id": requested_event_id,
         }
     )
 
@@ -50,12 +56,14 @@ def _idempotency_binding_digest(
     idempotency_key: str,
     operation_id: str,
     resolution_digest: str,
+    requested_event_id: str,
 ) -> str:
     return canonical_digest(
         {
             "idempotency_key": idempotency_key,
             "operation_id": operation_id,
             "resolution_digest": resolution_digest,
+            "requested_event_id": requested_event_id,
         }
     )
 
@@ -211,6 +219,7 @@ class OperationJournal:
                         idempotency_key TEXT PRIMARY KEY,
                         operation_id TEXT NOT NULL UNIQUE,
                         resolution_digest TEXT NOT NULL,
+                        requested_event_id TEXT NOT NULL UNIQUE,
                         binding_digest TEXT NOT NULL
                     )
                     """
@@ -253,6 +262,7 @@ class OperationJournal:
                         idempotency_key TEXT PRIMARY KEY,
                         operation_id TEXT NOT NULL UNIQUE,
                         resolution_digest TEXT NOT NULL,
+                        requested_event_id TEXT NOT NULL UNIQUE,
                         binding_digest TEXT NOT NULL
                     )
                     """
@@ -321,11 +331,90 @@ class OperationJournal:
             raise InvalidRequest(f"unknown Operation: {operation_id}")
         return row
 
-    def _validate_idempotency_binding(self, row: sqlite3.Row) -> str | None:
+    def _requested_event(
+        self,
+        event_id: str,
+    ) -> tuple[Event, Operation, CapabilityResolution]:
+        row = self._host_store._db.execute(
+            """
+            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+            FROM events WHERE event_id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise IntegrityViolation("idempotency binding references missing requested Event")
+        try:
+            event = record_from_json(Event, row["event_json"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("requested Operation Event cannot be decoded") from exc
+        if not isinstance(event, Event):
+            raise IntegrityViolation("requested Operation Event decoded wrong type")
+        if (
+            event.sequence != int(row["sequence"])
+            or event.event_id != row["event_id"]
+            or event.program_id != row["program_id"]
+            or event.event_type != row["event_type"]
+            or event.digest != row["event_digest"]
+        ):
+            raise IntegrityViolation("requested Operation Event row binding mismatch")
+        if event.event_type != "operation.requested" or not verify_event_digest(event):
+            raise IntegrityViolation("idempotency binding does not reference a valid requested Event")
+        try:
+            operation_payload = event.payload["operation"]
+            resolution_payload = event.payload["resolution"]
+        except KeyError as exc:
+            raise IntegrityViolation("requested Operation Event lacks canonical payload") from exc
+        if not isinstance(operation_payload, FrozenMap) or not isinstance(
+            resolution_payload, FrozenMap
+        ):
+            raise IntegrityViolation("requested Operation Event payload is malformed")
+        try:
+            initial_operation = record_from_json(
+                Operation,
+                canonical_json(operation_payload),
+            )
+            resolution = record_from_json(
+                CapabilityResolution,
+                canonical_json(resolution_payload),
+            )
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("requested Operation Event payload cannot be decoded") from exc
+        if not isinstance(initial_operation, Operation) or not isinstance(
+            resolution, CapabilityResolution
+        ):
+            raise IntegrityViolation("requested Operation Event payload decoded wrong type")
+        return event, initial_operation, resolution
+
+    @staticmethod
+    def _same_operation_identity(initial: Operation, current: Operation) -> bool:
+        return (
+            initial.operation_id == current.operation_id
+            and initial.program_id == current.program_id
+            and initial.actor_id == current.actor_id
+            and initial.capability_id == current.capability_id
+            and initial.authority_receipt_ref == current.authority_receipt_ref
+            and initial.request_digest == current.request_digest
+            and initial.execution_outcome is ExecutionOutcome.NOT_STARTED
+            and initial.effect_status is EffectStatus.UNKNOWN
+            and initial.reconciliation_status is ReconciliationStatus.NOT_REQUIRED
+            and initial.started_at is None
+            and initial.finished_at is None
+            and initial.receipt_refs == ()
+        )
+
+    def _validate_idempotency_binding(
+        self,
+        row: sqlite3.Row,
+        *,
+        operation: Operation,
+        resolution: CapabilityResolution,
+    ) -> str | None:
         key = row["idempotency_key"]
         binding = self._host_store._db.execute(
             """
-            SELECT idempotency_key, operation_id, resolution_digest, binding_digest
+            SELECT idempotency_key, operation_id, resolution_digest,
+                   requested_event_id, binding_digest
             FROM operation_idempotency_bindings WHERE operation_id = ?
             """,
             (row["operation_id"],),
@@ -338,20 +427,31 @@ class OperationJournal:
             raise IntegrityViolation("Operation idempotency identity is invalid")
         if binding is None:
             raise IntegrityViolation("Operation idempotency identity lacks durable binding")
-        expected_key = _host_idempotency_key(
-            operation_id=str(row["operation_id"]),
-            resolution_digest=str(row["resolution_digest"]),
-        )
-        if key != expected_key or binding["idempotency_key"] != expected_key:
-            raise IntegrityViolation("Operation idempotency identity is not Host-derived")
         if binding["operation_id"] != row["operation_id"]:
             raise IntegrityViolation("idempotency binding Operation identity mismatch")
         if binding["resolution_digest"] != row["resolution_digest"]:
             raise IntegrityViolation("idempotency binding resolution mismatch")
+        event, initial_operation, initial_resolution = self._requested_event(
+            str(binding["requested_event_id"])
+        )
+        if not self._same_operation_identity(initial_operation, operation):
+            raise IntegrityViolation("idempotency binding disagrees with requested Operation")
+        if initial_resolution != resolution:
+            raise IntegrityViolation("idempotency binding disagrees with requested Resolution")
+        if event.actor_id != operation.actor_id or event.correlation_id != operation.program_id:
+            raise IntegrityViolation("requested Operation Event context binding mismatch")
+        expected_key = _host_idempotency_key(
+            operation_id=operation.operation_id,
+            resolution_digest=operation.request_digest,
+            requested_event_id=event.event_id,
+        )
+        if key != expected_key or binding["idempotency_key"] != expected_key:
+            raise IntegrityViolation("Operation idempotency identity is not Host-derived")
         expected_binding = _idempotency_binding_digest(
             idempotency_key=expected_key,
-            operation_id=str(row["operation_id"]),
-            resolution_digest=str(row["resolution_digest"]),
+            operation_id=operation.operation_id,
+            resolution_digest=operation.request_digest,
+            requested_event_id=event.event_id,
         )
         if binding["binding_digest"] != expected_binding:
             raise IntegrityViolation("idempotency binding digest mismatch")
@@ -385,7 +485,11 @@ class OperationJournal:
             raise IntegrityViolation("Operation request digest differs from resolution")
         if operation.capability_id != resolution.capability_id:
             raise IntegrityViolation("Operation Capability differs from resolution")
-        self._validate_idempotency_binding(row)
+        self._validate_idempotency_binding(
+            row,
+            operation=operation,
+            resolution=resolution,
+        )
         validate_operation_semantics(operation)
         return operation, resolution
 
@@ -399,8 +503,12 @@ class OperationJournal:
 
     def idempotency_key(self, operation_id: str) -> str | None:
         row = self._read_row(operation_id)
-        self._decode_row(row)
-        return self._validate_idempotency_binding(row)
+        operation, resolution = self._decode_row(row)
+        return self._validate_idempotency_binding(
+            row,
+            operation=operation,
+            resolution=resolution,
+        )
 
     def create_intent(
         self,
@@ -430,40 +538,44 @@ class OperationJournal:
             reconciliation_status=ReconciliationStatus.NOT_REQUIRED,
         )
         validate_operation_semantics(operation)
-        host_key = (
-            None
-            if idempotency_key is None
-            else _host_idempotency_key(
-                operation_id=operation.operation_id,
-                resolution_digest=resolution_digest,
-            )
-        )
         try:
             with self._host_store._transaction():
-                if host_key is not None:
-                    self._host_store._db.execute(
-                        """
-                        INSERT INTO operation_idempotency_bindings(
-                            idempotency_key, operation_id, resolution_digest, binding_digest
-                        ) VALUES (?, ?, ?, ?)
-                        """,
-                        (
-                            host_key,
-                            operation.operation_id,
-                            resolution_digest,
-                            _idempotency_binding_digest(
-                                idempotency_key=host_key,
-                                operation_id=operation.operation_id,
-                                resolution_digest=resolution_digest,
-                            ),
-                        ),
-                    )
                 event = self._append_event(
                     "operation.requested",
                     {"operation": operation, "resolution": resolution},
                     program_id=program_id,
                     actor_id=actor_id,
                 )
+                host_key = (
+                    None
+                    if idempotency_key is None
+                    else _host_idempotency_key(
+                        operation_id=operation.operation_id,
+                        resolution_digest=resolution_digest,
+                        requested_event_id=event.event_id,
+                    )
+                )
+                if host_key is not None:
+                    self._host_store._db.execute(
+                        """
+                        INSERT INTO operation_idempotency_bindings(
+                            idempotency_key, operation_id, resolution_digest,
+                            requested_event_id, binding_digest
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            host_key,
+                            operation.operation_id,
+                            resolution_digest,
+                            event.event_id,
+                            _idempotency_binding_digest(
+                                idempotency_key=host_key,
+                                operation_id=operation.operation_id,
+                                resolution_digest=resolution_digest,
+                                requested_event_id=event.event_id,
+                            ),
+                        ),
+                    )
                 self._host_store._db.execute(
                     """
                     INSERT INTO operation_projections(
