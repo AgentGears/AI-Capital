@@ -137,8 +137,8 @@ class CapabilityBroker:
             raise IntegrityViolation("resolved effect resource type violates Capability contract")
         if effect.effect_class is not current.effect_class:
             raise IntegrityViolation("resolved effect class violates Capability contract")
-        if not effect.target.strip():
-            raise IntegrityViolation("resolved effect target must be non-empty")
+        if type(effect.target) is not str or not effect.target.strip():
+            raise IntegrityViolation("resolved effect target must be a non-empty string")
 
         return CapabilityResolution(
             request_id=request.request_id,
