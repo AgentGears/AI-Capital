@@ -12,7 +12,7 @@ from .events import event_digest_fields, utc_now, verify_event_digest
 from .evidence_store import EvidenceReference, EvidenceRepository
 from .models import Claim, Event
 from .schema_codec import record_from_json, record_to_json
-from .serialization import canonical_digest, to_canonical_data
+from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "claim_store"
@@ -215,6 +215,31 @@ class ClaimRepository:
                 sequences.append(event.sequence)
         return tuple(sequences)
 
+    def _event_links(self, claim_id: str) -> tuple[ClaimEvidenceLink, ...]:
+        links: list[ClaimEvidenceLink] = []
+        for sequence in self._claim_event_sequences(claim_id):
+            event = self._event_by_sequence(sequence)
+            raw_links: list[object] = []
+            if "link" in event.payload:
+                raw_links.append(event.payload["link"])
+            if "links" in event.payload:
+                items = event.payload["links"]
+                if not isinstance(items, tuple):
+                    raise IntegrityViolation("Claim Event links payload is malformed")
+                raw_links.extend(items)
+            for raw_link in raw_links:
+                try:
+                    link = record_from_json(
+                        ClaimEvidenceLink,
+                        canonical_json(raw_link),
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise IntegrityViolation("Claim Event Evidence link cannot be decoded") from exc
+                if not isinstance(link, ClaimEvidenceLink) or link.claim_id != claim_id:
+                    raise IntegrityViolation("Claim Event Evidence link identity mismatch")
+                links.append(link)
+        return tuple(links)
+
     @staticmethod
     def _validate_claim(claim: Claim) -> None:
         if not claim.claim_id.strip() or not claim.statement.strip():
@@ -333,6 +358,9 @@ class ClaimRepository:
             raise IntegrityViolation("Claim projection diverges from durable history")
 
         links = self._links(claim_id)
+        event_links = self._event_links(claim_id)
+        if len(links) != len(event_links) or set(links) != set(event_links):
+            raise IntegrityViolation("Claim Evidence links diverge from semantic Event history")
         linked_refs = tuple(sorted({link.evidence_id for link in links}))
         if tuple(sorted(claim.evidence_refs)) != linked_refs:
             raise IntegrityViolation("Claim Evidence references disagree with durable links")
