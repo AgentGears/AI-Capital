@@ -57,7 +57,10 @@ class EvidenceRepository:
                 )
             artifact_root = Path(database_path).resolve().parent / "evidence"
         self._artifact_root = Path(artifact_root)
+        root_existed = self._artifact_root.exists()
         self._artifact_root.mkdir(parents=True, exist_ok=True)
+        if not root_existed:
+            self._fsync_directory(self._artifact_root.parent)
         self._migrate()
 
     def _migrate(self) -> None:
@@ -131,6 +134,24 @@ class EvidenceRepository:
     def _content_ref(artifact_digest: str) -> str:
         return f"{_ARTIFACT_PREFIX}{artifact_digest}"
 
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise PersistenceConflict(
+                f"cannot open Evidence artifact directory for durable flush: {path}"
+            ) from exc
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            raise PersistenceConflict(
+                f"cannot durably flush Evidence artifact directory: {path}"
+            ) from exc
+        finally:
+            os.close(descriptor)
+
     def _artifact_path(self, artifact_digest: str) -> Path:
         if len(artifact_digest) != 64:
             raise EvidenceInvalid("Evidence artifact digest must be a SHA-256 hex digest")
@@ -142,7 +163,10 @@ class EvidenceRepository:
 
     def _store_artifact(self, content: bytes, artifact_digest: str) -> None:
         path = self._artifact_path(artifact_digest)
+        parent_existed = path.parent.exists()
         path.parent.mkdir(parents=True, exist_ok=True)
+        if not parent_existed:
+            self._fsync_directory(self._artifact_root)
         if path.exists():
             existing = path.read_bytes()
             if existing != content or self._artifact_digest(existing) != artifact_digest:
@@ -156,6 +180,7 @@ class EvidenceRepository:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
+            self._fsync_directory(path.parent)
         finally:
             if temporary.exists():
                 temporary.unlink()
@@ -231,6 +256,20 @@ class EvidenceRepository:
             raise IntegrityViolation("Evidence record is anchored to the wrong Event type")
         return event
 
+    def _identity_exists_in_history(self, evidence_id: str) -> bool:
+        rows = self._host_store._db.execute(
+            """
+            SELECT event_id FROM events
+            WHERE event_type = 'evidence.admitted'
+            ORDER BY sequence
+            """
+        ).fetchall()
+        for row in rows:
+            event = self._event(str(row["event_id"]))
+            if event.correlation_id == evidence_id:
+                return True
+        return False
+
     @classmethod
     def _validate_evidence(cls, evidence: Evidence) -> None:
         if not evidence.evidence_id.strip() or not evidence.source_class.strip():
@@ -276,6 +315,10 @@ class EvidenceRepository:
             currentness=currentness,
         )
         self._validate_evidence(evidence)
+        if self._identity_exists_in_history(evidence.evidence_id):
+            raise PersistenceConflict(
+                f"Evidence identity already exists in durable history: {evidence.evidence_id}"
+            )
         admission = EvidenceAdmissionReceipt(
             admission_id=str(uuid4()),
             evidence_id=evidence.evidence_id,
@@ -285,6 +328,10 @@ class EvidenceRepository:
         self._store_artifact(content, artifact_digest)
         try:
             with self._host_store._transaction():
+                if self._identity_exists_in_history(evidence.evidence_id):
+                    raise PersistenceConflict(
+                        f"Evidence identity already exists in durable history: {evidence.evidence_id}"
+                    )
                 self._host_store._db.execute(
                     """
                     INSERT INTO evidence_artifacts(artifact_digest, content_ref, byte_length)
