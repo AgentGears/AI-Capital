@@ -200,6 +200,21 @@ class ClaimRepository:
             raise IntegrityViolation("Claim history Event integrity mismatch")
         return event
 
+    def _claim_event_sequences(self, claim_id: str) -> tuple[int, ...]:
+        rows = self._host_store._db.execute(
+            """
+            SELECT sequence FROM events
+            WHERE event_type LIKE 'claim.%'
+            ORDER BY sequence
+            """
+        ).fetchall()
+        sequences: list[int] = []
+        for row in rows:
+            event = self._event_by_sequence(int(row["sequence"]))
+            if event.correlation_id == claim_id:
+                sequences.append(event.sequence)
+        return tuple(sequences)
+
     @staticmethod
     def _validate_claim(claim: Claim) -> None:
         if not claim.claim_id.strip() or not claim.statement.strip():
@@ -364,6 +379,14 @@ class ClaimRepository:
         )
         try:
             with self._host_store._transaction():
+                history_row = self._host_store._db.execute(
+                    "SELECT 1 FROM claim_history WHERE claim_id = ? LIMIT 1",
+                    (claim.claim_id,),
+                ).fetchone()
+                if history_row is not None or self._claim_event_sequences(claim.claim_id):
+                    raise PersistenceConflict(
+                        f"Claim identity already exists in durable history: {claim.claim_id}"
+                    )
                 event = self._append_event(
                     "claim.created",
                     {"claim": claim, "state": state},
@@ -614,6 +637,10 @@ class ClaimRepository:
             """,
             (claim_id,),
         ).fetchall()
+        history_sequences = tuple(int(row["sequence"]) for row in rows)
+        event_sequences = self._claim_event_sequences(claim_id)
+        if history_sequences != event_sequences:
+            raise IntegrityViolation("Claim history sequence diverges from semantic Event history")
         history = tuple(self._history_claim(row) for row in rows)
         if not history or history[0].status is not ClaimStatus.PROPOSED:
             raise IntegrityViolation("Claim history must begin in proposed state")
