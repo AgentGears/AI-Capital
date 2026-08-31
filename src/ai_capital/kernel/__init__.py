@@ -7,11 +7,13 @@ from .authority_store import *
 from .builtin_capabilities import *
 from .capability_broker import *
 from .capability_store import *
+from .claim_store import *
 from .deterministic_provider import *
 from .durable_program import *
 from .enums import *
 from .errors import *
 from .events import *
+from .evidence_store import *
 from .frozen_json import *
 from .inference import *
 from .json_http_provider import *
