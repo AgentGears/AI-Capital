@@ -364,16 +364,20 @@ class ActorRepository:
     def turn(self, attempt_id: str) -> ModelTurn | None:
         row = self._host_store._db.execute(
             """
-            SELECT turn_json, turn_digest
+            SELECT attempt_id, actor_id, actor_generation, program_id, program_revision,
+                   request_digest, receipt_json, receipt_digest, turn_json, turn_digest
             FROM model_attempts WHERE attempt_id = ?
             """,
             (attempt_id,),
         ).fetchone()
         if row is None:
             raise InvalidRequest(f"unknown model attempt: {attempt_id}")
+        receipt = self._receipt_from_row(row)
         if row["turn_json"] is None:
-            if row["turn_digest"] is not None:
-                raise IntegrityViolation("failed model attempt has unexpected output digest")
+            if row["turn_digest"] is not None or receipt.output_digest is not None:
+                raise IntegrityViolation("model attempt lacks output but retains an output digest")
+            if receipt.outcome is not ModelAttemptOutcome.FAILED:
+                raise IntegrityViolation("non-failed model attempt is missing retained output")
             return None
         try:
             turn = record_from_json(ModelTurn, row["turn_json"])
@@ -381,8 +385,16 @@ class ActorRepository:
             raise IntegrityViolation("model output cannot be decoded") from exc
         if not isinstance(turn, ModelTurn):
             raise IntegrityViolation("decoded model output has wrong type")
-        if canonical_digest(turn) != row["turn_digest"]:
+        turn_digest = canonical_digest(turn)
+        if turn_digest != row["turn_digest"]:
             raise IntegrityViolation("model output digest mismatch")
+        if receipt.output_digest != turn_digest:
+            raise IntegrityViolation("model output digest disagrees with attempt receipt")
+        if receipt.outcome not in {
+            ModelAttemptOutcome.SUCCEEDED,
+            ModelAttemptOutcome.STALE,
+        }:
+            raise IntegrityViolation("failed model attempt unexpectedly retains output")
         if turn.provenance_receipt != attempt_id:
             raise IntegrityViolation("model output provenance disagrees with attempt identity")
         return turn
