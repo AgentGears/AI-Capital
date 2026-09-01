@@ -19,11 +19,11 @@ from .errors import (
 from .events import event_digest_fields, utc_now, verify_event_digest
 from .models import Event, Program, Verification
 from .schema_codec import record_from_json, record_to_json
-from .serialization import canonical_digest, to_canonical_data
+from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "verification"
-_COMPONENT_SCHEMA_VERSION = 1
+_COMPONENT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +86,7 @@ class VerificationRepository:
                     f"Verification schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Verification schema version {version}")
 
             self._host_store._db.execute(
@@ -133,11 +133,71 @@ class VerificationRepository:
                 ON verification_receipts(program_id, event_sequence)
                 """
             )
-            if version is None:
+            self._host_store._db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS verification_contract_event_index (
+                    sequence INTEGER PRIMARY KEY,
+                    program_id TEXT NOT NULL,
+                    contract_id TEXT NOT NULL UNIQUE,
+                    event_id TEXT NOT NULL UNIQUE,
+                    FOREIGN KEY(sequence) REFERENCES events(sequence)
+                )
+                """
+            )
+            self._host_store._db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS verification_contract_event_program
+                ON verification_contract_event_index(program_id, sequence)
+                """
+            )
+            self._host_store._db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS verification_event_index (
+                    sequence INTEGER PRIMARY KEY,
+                    program_id TEXT NOT NULL,
+                    contract_id TEXT NOT NULL,
+                    verification_id TEXT NOT NULL UNIQUE,
+                    event_id TEXT NOT NULL UNIQUE,
+                    FOREIGN KEY(sequence) REFERENCES events(sequence)
+                )
+                """
+            )
+            self._host_store._db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS verification_event_contract_sequence
+                ON verification_event_index(contract_id, sequence)
+                """
+            )
+            self._host_store._db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS verification_event_program_sequence
+                ON verification_event_index(program_id, sequence)
+                """
+            )
+            self._host_store._db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS events_type_sequence
+                ON events(event_type, sequence)
+                """
+            )
+
+            if version == 1:
+                self._rebuild_event_indexes()
+                self._host_store._db.execute(
+                    "UPDATE component_schema SET version = ? WHERE component = ?",
+                    (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
+                )
+                version = _COMPONENT_SCHEMA_VERSION
+            elif version is None:
                 self._host_store._db.execute(
                     "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                     (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
                 )
+                version = _COMPONENT_SCHEMA_VERSION
+
+            if version != _COMPONENT_SCHEMA_VERSION:
+                raise IntegrityViolation(f"unsupported Verification schema version {version}")
+            self._validate_index_alignment()
 
     def _append_event(
         self,
@@ -176,16 +236,7 @@ class VerificationRepository:
         self._host_store._insert_event(event)
         return event
 
-    def _event(self, event_id: str) -> Event:
-        row = self._host_store._db.execute(
-            """
-            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
-            FROM events WHERE event_id = ?
-            """,
-            (event_id,),
-        ).fetchone()
-        if row is None:
-            raise IntegrityViolation("Verification Event is missing")
+    def _decode_event_row(self, row: sqlite3.Row) -> Event:
         try:
             event = record_from_json(Event, row["event_json"])
         except (TypeError, ValueError) as exc:
@@ -202,6 +253,132 @@ class VerificationRepository:
         ):
             raise IntegrityViolation("Verification Event integrity mismatch")
         return event
+
+    def _event(self, event_id: str) -> Event:
+        row = self._host_store._db.execute(
+            """
+            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+            FROM events WHERE event_id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise IntegrityViolation("Verification Event is missing")
+        return self._decode_event_row(row)
+
+    def _rebuild_event_indexes(self) -> None:
+        self._host_store._db.execute("DELETE FROM verification_contract_event_index")
+        self._host_store._db.execute("DELETE FROM verification_event_index")
+        rows = self._host_store._db.execute(
+            """
+            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+            FROM events
+            WHERE event_type IN ('verification.contract_registered', 'verification.recorded')
+            ORDER BY sequence
+            """
+        ).fetchall()
+        for row in rows:
+            event = self._decode_event_row(row)
+            if event.event_type == "verification.contract_registered":
+                try:
+                    contract = record_from_json(
+                        VerificationContract,
+                        canonical_json(event.payload["contract"]),
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise IntegrityViolation("Verification contract Event is malformed") from exc
+                if not isinstance(contract, VerificationContract):
+                    raise IntegrityViolation("Verification contract Event decoded wrong type")
+                if event.correlation_id != contract.program_id:
+                    raise IntegrityViolation("Verification contract Event Program mismatch")
+                self._host_store._db.execute(
+                    """
+                    INSERT INTO verification_contract_event_index(
+                        sequence, program_id, contract_id, event_id
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (event.sequence, contract.program_id, contract.contract_id, event.event_id),
+                )
+                continue
+
+            try:
+                verification = record_from_json(
+                    Verification,
+                    canonical_json(event.payload["verification"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise IntegrityViolation("Verification recorded Event is malformed") from exc
+            if not isinstance(verification, Verification):
+                raise IntegrityViolation("Verification recorded Event decoded wrong type")
+            program_id = verification.subject_ref.removeprefix("program:")
+            if not program_id or event.correlation_id != program_id:
+                raise IntegrityViolation("Verification recorded Event Program mismatch")
+            self._host_store._db.execute(
+                """
+                INSERT INTO verification_event_index(
+                    sequence, program_id, contract_id, verification_id, event_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    event.sequence,
+                    program_id,
+                    verification.contract_ref,
+                    verification.verification_id,
+                    event.event_id,
+                ),
+            )
+        self._validate_index_alignment()
+
+    def _validate_index_alignment(self) -> None:
+        contract_rows = self._host_store._db.execute(
+            "SELECT contract_id, program_id, registered_event_id FROM verification_contracts"
+        ).fetchall()
+        indexed_contracts = self._host_store._db.execute(
+            "SELECT contract_id, program_id, event_id FROM verification_contract_event_index"
+        ).fetchall()
+        canonical_contracts = {
+            (str(row["contract_id"]), str(row["program_id"]), str(row["registered_event_id"]))
+            for row in contract_rows
+        }
+        indexed_contract_set = {
+            (str(row["contract_id"]), str(row["program_id"]), str(row["event_id"]))
+            for row in indexed_contracts
+        }
+        if canonical_contracts != indexed_contract_set:
+            raise IntegrityViolation("Verification contract index diverges from canonical records")
+
+        receipt_rows = self._host_store._db.execute(
+            """
+            SELECT verification_id, contract_id, program_id, event_id
+            FROM verification_receipts
+            """
+        ).fetchall()
+        indexed_receipts = self._host_store._db.execute(
+            """
+            SELECT verification_id, contract_id, program_id, event_id
+            FROM verification_event_index
+            """
+        ).fetchall()
+        canonical_receipts = {
+            (
+                str(row["verification_id"]),
+                str(row["contract_id"]),
+                str(row["program_id"]),
+                str(row["event_id"]),
+            )
+            for row in receipt_rows
+        }
+        indexed_receipt_set = {
+            (
+                str(row["verification_id"]),
+                str(row["contract_id"]),
+                str(row["program_id"]),
+                str(row["event_id"]),
+            )
+            for row in indexed_receipts
+        }
+        if canonical_receipts != indexed_receipt_set:
+            raise IntegrityViolation("Verification Event index diverges from canonical receipts")
 
     @staticmethod
     def _validate_contract(contract: VerificationContract, program: Program) -> None:
@@ -262,6 +439,14 @@ class VerificationRepository:
             try:
                 self._host_store._db.execute(
                     """
+                    INSERT INTO verification_contract_event_index(
+                        sequence, program_id, contract_id, event_id
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (event.sequence, contract.program_id, contract.contract_id, event.event_id),
+                )
+                self._host_store._db.execute(
+                    """
                     INSERT INTO verification_contracts(
                         contract_id, program_id, contract_json, contract_digest,
                         registered_event_id
@@ -280,6 +465,15 @@ class VerificationRepository:
         return contract
 
     def contract(self, contract_id: str) -> VerificationContract:
+        index = self._host_store._db.execute(
+            """
+            SELECT sequence, program_id, contract_id, event_id
+            FROM verification_contract_event_index WHERE contract_id = ?
+            """,
+            (contract_id,),
+        ).fetchone()
+        if index is None:
+            raise InvalidRequest(f"unknown Verification contract: {contract_id}")
         row = self._host_store._db.execute(
             """
             SELECT contract_id, program_id, contract_json, contract_digest,
@@ -289,7 +483,7 @@ class VerificationRepository:
             (contract_id,),
         ).fetchone()
         if row is None:
-            raise InvalidRequest(f"unknown Verification contract: {contract_id}")
+            raise IntegrityViolation("Verification contract index lacks canonical record")
         try:
             contract = record_from_json(VerificationContract, row["contract_json"])
         except (TypeError, ValueError) as exc:
@@ -300,11 +494,14 @@ class VerificationRepository:
             contract.contract_id != row["contract_id"]
             or contract.program_id != row["program_id"]
             or canonical_digest(contract) != row["contract_digest"]
+            or index["program_id"] != contract.program_id
+            or index["event_id"] != row["registered_event_id"]
         ):
-            raise IntegrityViolation("Verification contract row integrity mismatch")
+            raise IntegrityViolation("Verification contract row/index integrity mismatch")
         event = self._event(str(row["registered_event_id"]))
         if (
-            event.event_type != "verification.contract_registered"
+            event.sequence != int(index["sequence"])
+            or event.event_type != "verification.contract_registered"
             or event.correlation_id != contract.program_id
             or to_canonical_data(event.payload.get("contract")) != to_canonical_data(contract)
         ):
@@ -315,8 +512,8 @@ class VerificationRepository:
     def contracts_for_program(self, program_id: str) -> tuple[VerificationContract, ...]:
         rows = self._host_store._db.execute(
             """
-            SELECT contract_id FROM verification_contracts
-            WHERE program_id = ? ORDER BY contract_id
+            SELECT contract_id FROM verification_contract_event_index
+            WHERE program_id = ? ORDER BY sequence
             """,
             (program_id,),
         ).fetchall()
@@ -386,6 +583,20 @@ class VerificationRepository:
             try:
                 self._host_store._db.execute(
                     """
+                    INSERT INTO verification_event_index(
+                        sequence, program_id, contract_id, verification_id, event_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.sequence,
+                        program.program_id,
+                        contract.contract_id,
+                        verification.verification_id,
+                        event.event_id,
+                    ),
+                )
+                self._host_store._db.execute(
+                    """
                     INSERT INTO verification_receipts(
                         verification_id, contract_id, program_id,
                         event_sequence, event_id, verification_json,
@@ -408,6 +619,15 @@ class VerificationRepository:
         return verification
 
     def get(self, verification_id: str) -> Verification:
+        index = self._host_store._db.execute(
+            """
+            SELECT sequence, program_id, contract_id, verification_id, event_id
+            FROM verification_event_index WHERE verification_id = ?
+            """,
+            (verification_id,),
+        ).fetchone()
+        if index is None:
+            raise InvalidRequest(f"unknown Verification: {verification_id}")
         row = self._host_store._db.execute(
             """
             SELECT verification_id, contract_id, program_id,
@@ -418,7 +638,7 @@ class VerificationRepository:
             (verification_id,),
         ).fetchone()
         if row is None:
-            raise InvalidRequest(f"unknown Verification: {verification_id}")
+            raise IntegrityViolation("Verification Event index lacks canonical receipt")
         try:
             verification = record_from_json(Verification, row["verification_json"])
         except (TypeError, ValueError) as exc:
@@ -431,8 +651,12 @@ class VerificationRepository:
             or verification.subject_ref != f"program:{row['program_id']}"
             or canonical_digest(verification) != row["verification_digest"]
             or not str(row["rationale_code"]).strip()
+            or index["program_id"] != row["program_id"]
+            or index["contract_id"] != row["contract_id"]
+            or index["event_id"] != row["event_id"]
+            or int(index["sequence"]) != int(row["event_sequence"])
         ):
-            raise IntegrityViolation("Verification receipt row integrity mismatch")
+            raise IntegrityViolation("Verification receipt row/index integrity mismatch")
         event = self._event(str(row["event_id"]))
         if (
             event.sequence != int(row["event_sequence"])
@@ -449,8 +673,8 @@ class VerificationRepository:
         self.contract(contract_id)
         row = self._host_store._db.execute(
             """
-            SELECT verification_id FROM verification_receipts
-            WHERE contract_id = ? ORDER BY event_sequence DESC LIMIT 1
+            SELECT verification_id FROM verification_event_index
+            WHERE contract_id = ? ORDER BY sequence DESC LIMIT 1
             """,
             (contract_id,),
         ).fetchone()
