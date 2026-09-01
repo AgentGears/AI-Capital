@@ -8,6 +8,7 @@ from .builtin_capabilities import *
 from .capability_broker import *
 from .capability_store import *
 from .claim_store import *
+from .completion import *
 from .deterministic_provider import *
 from .durable_program import *
 from .enums import *
@@ -25,3 +26,4 @@ from .program_state import *
 from .schema_codec import *
 from .serialization import *
 from .structured_schema import *
+from .verification import *
