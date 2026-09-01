@@ -23,7 +23,7 @@ from .errors import (
     VerificationStale,
 )
 from .events import event_digest_fields, make_program_event, utc_now, verify_event_digest
-from .models import CompletionReceipt, Event, Operation, Program
+from .models import CapabilityResolution, CompletionReceipt, Event, Operation, Program
 from .operation_journal import OperationJournal
 from .program_state import transition_program
 from .schema_codec import record_from_json, record_to_json
@@ -408,14 +408,17 @@ class CompletionOracle:
             expected_revision=expected_revision,
         )
 
-    def _requested_operation_ids(self, program_id: str) -> tuple[str, ...]:
+    def _requested_operations(
+        self,
+        program_id: str,
+    ) -> dict[str, tuple[Operation, CapabilityResolution]]:
         rows = self._host_store._db.execute(
             """
             SELECT sequence, event_id, program_id, event_type, event_json, event_digest
             FROM events WHERE event_type = 'operation.requested' ORDER BY sequence
             """
         ).fetchall()
-        operation_ids: list[str] = []
+        requested: dict[str, tuple[Operation, CapabilityResolution]] = {}
         for row in rows:
             event = self._decode_event_row(row)
             try:
@@ -423,20 +426,43 @@ class CompletionOracle:
                     Operation,
                     canonical_json(event.payload["operation"]),
                 )
+                resolution = record_from_json(
+                    CapabilityResolution,
+                    canonical_json(event.payload["resolution"]),
+                )
             except (KeyError, TypeError, ValueError) as exc:
                 raise IntegrityViolation("requested Operation Event is malformed") from exc
-            if not isinstance(operation, Operation):
+            if not isinstance(operation, Operation) or not isinstance(
+                resolution, CapabilityResolution
+            ):
                 raise IntegrityViolation("requested Operation Event decoded wrong type")
             if (
                 event.correlation_id != operation.program_id
                 or event.actor_id != operation.actor_id
+                or operation.capability_id != resolution.capability_id
+                or operation.request_digest != canonical_digest(resolution)
             ):
-                raise IntegrityViolation("requested Operation Event context mismatch")
-            if operation.program_id == program_id:
-                if operation.operation_id in operation_ids:
-                    raise IntegrityViolation("duplicate requested Operation identity")
-                operation_ids.append(operation.operation_id)
-        return tuple(operation_ids)
+                raise IntegrityViolation("requested Operation Event binding mismatch")
+            if operation.program_id != program_id:
+                continue
+            if operation.operation_id in requested:
+                raise IntegrityViolation("duplicate requested Operation identity")
+            requested[operation.operation_id] = (operation, resolution)
+        return requested
+
+    @staticmethod
+    def _operation_identity_matches_requested(
+        current: Operation,
+        requested: Operation,
+    ) -> bool:
+        return (
+            current.operation_id == requested.operation_id
+            and current.program_id == requested.program_id
+            and current.actor_id == requested.actor_id
+            and current.capability_id == requested.capability_id
+            and current.authority_receipt_ref == requested.authority_receipt_ref
+            and current.request_digest == requested.request_digest
+        )
 
     def _program_operations(self, program_id: str) -> tuple[tuple[Operation, EffectClass], ...]:
         projection_rows = self._host_store._db.execute(
@@ -447,18 +473,36 @@ class CompletionOracle:
             (program_id,),
         ).fetchall()
         projection_ids = tuple(str(row["operation_id"]) for row in projection_rows)
-        requested_ids = self._requested_operation_ids(program_id)
+        requested = self._requested_operations(program_id)
+        requested_ids = tuple(requested)
         if set(projection_ids) != set(requested_ids) or len(projection_ids) != len(requested_ids):
             raise IntegrityViolation(
                 "Program Operation projections diverge from requested Operation Events"
             )
         operations: list[tuple[Operation, EffectClass]] = []
         for operation_id in sorted(requested_ids):
+            requested_operation, requested_resolution = requested[operation_id]
             operation = self._operations.get(operation_id)
-            resolution = self._operations.resolution(operation_id)
+            projected_resolution = self._operations.resolution(operation_id)
             if operation.program_id != program_id:
                 raise IntegrityViolation("Operation query returned wrong Program identity")
-            operations.append((operation, resolution.resolved_effect.effect_class))
+            if not self._operation_identity_matches_requested(
+                operation,
+                requested_operation,
+            ):
+                raise IntegrityViolation(
+                    "Operation projection identity diverges from requested Event"
+                )
+            if (
+                projected_resolution != requested_resolution
+                or operation.request_digest != canonical_digest(requested_resolution)
+            ):
+                raise IntegrityViolation(
+                    "Operation resolution diverges from requested semantic Event"
+                )
+            operations.append(
+                (operation, requested_resolution.resolved_effect.effect_class)
+            )
         return tuple(operations)
 
     @staticmethod
