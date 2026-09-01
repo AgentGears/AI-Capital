@@ -602,6 +602,12 @@ class VerificationRepository:
         if not observation.rationale_code.strip():
             raise InvalidRequest("Verifier rationale code must be non-empty")
 
+    def _event_high_water(self) -> int:
+        row = self._host_store._db.execute(
+            "SELECT COALESCE(MAX(sequence), 0) FROM events"
+        ).fetchone()
+        return int(row[0])
+
     def run(
         self,
         contract_id: str,
@@ -619,6 +625,7 @@ class VerificationRepository:
         if program.status is not ProgramStatus.COMPLETION_PENDING:
             raise InvalidRequest("Verification runs only during completion_pending")
         evidence_refs = self._required_evidence_refs(contract)
+        evaluation_boundary = self._event_high_water()
         observation = verifier.verify(contract, program, evidence_refs)
         self._validate_observation(observation)
         verification = Verification(
@@ -644,6 +651,13 @@ class VerificationRepository:
                 raise IntegrityViolation("Verification contract changed after evaluation")
             if self._required_evidence_refs(contract) != verification.evidence_refs:
                 raise VerificationStale("Verification Evidence roots changed before admission")
+            if self._has_later_protected_operation_change(
+                program.program_id,
+                after_sequence=evaluation_boundary,
+            ):
+                raise VerificationStale(
+                    "protected mutating Operation changed during Verification evaluation"
+                )
             event = self._append_event(
                 "verification.recorded",
                 {"verification": verification, "rationale_code": observation.rationale_code},
