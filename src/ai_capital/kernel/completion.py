@@ -218,6 +218,45 @@ class CompletionOracle:
             raise IntegrityViolation("Completion Event integrity mismatch")
         return event
 
+    def _decode_completion_decision_event(self, event: Event) -> CompletionReceipt:
+        try:
+            receipt = record_from_json(
+                CompletionReceipt,
+                canonical_json(event.payload["completion"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise IntegrityViolation("Completion decision Event is malformed") from exc
+        if not isinstance(receipt, CompletionReceipt):
+            raise IntegrityViolation("Completion decision Event decoded wrong type")
+        expected_type = (
+            "completion.certified"
+            if receipt.result is CompletionResult.CERTIFIED
+            else "completion.rejected"
+        )
+        if event.event_type != expected_type or event.correlation_id != receipt.program_id:
+            raise IntegrityViolation("Completion decision Event binding mismatch")
+        return receipt
+
+    def _semantic_decision_event_set(self) -> set[tuple[str, str, str]]:
+        rows = self._host_store._db.execute(
+            """
+            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+            FROM events
+            WHERE event_type IN ('completion.certified', 'completion.rejected')
+            ORDER BY sequence
+            """
+        ).fetchall()
+        semantic: set[tuple[str, str, str]] = set()
+        receipt_ids: set[str] = set()
+        for row in rows:
+            event = self._decode_event_row(row)
+            receipt = self._decode_completion_decision_event(event)
+            if receipt.receipt_id in receipt_ids:
+                raise IntegrityViolation("duplicate CompletionReceipt semantic identity")
+            receipt_ids.add(receipt.receipt_id)
+            semantic.add((receipt.receipt_id, receipt.program_id, event.event_id))
+        return semantic
+
     def _rebuild_decision_index(self) -> None:
         self._host_store._db.execute("DELETE FROM completion_decision_event_index")
         rows = self._host_store._db.execute(
@@ -230,22 +269,7 @@ class CompletionOracle:
         ).fetchall()
         for row in rows:
             event = self._decode_event_row(row)
-            try:
-                receipt = record_from_json(
-                    CompletionReceipt,
-                    canonical_json(event.payload["completion"]),
-                )
-            except (KeyError, TypeError, ValueError) as exc:
-                raise IntegrityViolation("Completion decision Event is malformed") from exc
-            if not isinstance(receipt, CompletionReceipt):
-                raise IntegrityViolation("Completion decision Event decoded wrong type")
-            expected_type = (
-                "completion.certified"
-                if receipt.result is CompletionResult.CERTIFIED
-                else "completion.rejected"
-            )
-            if event.event_type != expected_type or event.correlation_id != receipt.program_id:
-                raise IntegrityViolation("Completion decision Event binding mismatch")
+            receipt = self._decode_completion_decision_event(event)
             self._host_store._db.execute(
                 """
                 INSERT INTO completion_decision_event_index(
@@ -276,8 +300,11 @@ class CompletionOracle:
             (str(row["receipt_id"]), str(row["program_id"]), str(row["event_id"]))
             for row in index_rows
         }
-        if receipts != indexed:
-            raise IntegrityViolation("Completion receipt history diverges from decision Events")
+        semantic = self._semantic_decision_event_set()
+        if not (receipts == indexed == semantic):
+            raise IntegrityViolation(
+                "Completion receipt records/index diverge from semantic decision Events"
+            )
 
     def open_blocker(self, program_id: str, *, code: str, detail: str) -> CompletionBlocker:
         program = self._host_store.get(program_id)
@@ -464,6 +491,56 @@ class CompletionOracle:
             and current.request_digest == requested.request_digest
         )
 
+    def _latest_operation_event_states(
+        self,
+        program_id: str,
+        requested: dict[str, tuple[Operation, CapabilityResolution]],
+    ) -> dict[str, Operation]:
+        rows = self._host_store._db.execute(
+            """
+            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+            FROM events
+            WHERE event_type IN (
+                'operation.requested', 'operation.admitted', 'operation.started',
+                'operation.finished', 'operation.interrupted', 'operation.reconciled'
+            )
+            ORDER BY sequence
+            """
+        ).fetchall()
+        latest: dict[str, Operation] = {}
+        for row in rows:
+            event = self._decode_event_row(row)
+            if event.correlation_id != program_id:
+                continue
+            try:
+                operation = record_from_json(
+                    Operation,
+                    canonical_json(event.payload["operation"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise IntegrityViolation("Operation lifecycle Event is malformed") from exc
+            if not isinstance(operation, Operation):
+                raise IntegrityViolation("Operation lifecycle Event decoded wrong type")
+            root = requested.get(operation.operation_id)
+            if root is None:
+                raise IntegrityViolation("Operation lifecycle Event lacks requested root")
+            requested_operation = root[0]
+            if (
+                event.actor_id != operation.actor_id
+                or operation.program_id != program_id
+                or not self._operation_identity_matches_requested(
+                    operation,
+                    requested_operation,
+                )
+            ):
+                raise IntegrityViolation("Operation lifecycle Event identity mismatch")
+            if event.event_type == "operation.requested" and operation != requested_operation:
+                raise IntegrityViolation("requested Operation lifecycle snapshot mismatch")
+            latest[operation.operation_id] = operation
+        if set(latest) != set(requested):
+            raise IntegrityViolation("Operation lifecycle Event history is incomplete")
+        return latest
+
     def _program_operations(self, program_id: str) -> tuple[tuple[Operation, EffectClass], ...]:
         projection_rows = self._host_store._db.execute(
             """
@@ -479,6 +556,7 @@ class CompletionOracle:
             raise IntegrityViolation(
                 "Program Operation projections diverge from requested Operation Events"
             )
+        latest_states = self._latest_operation_event_states(program_id, requested)
         operations: list[tuple[Operation, EffectClass]] = []
         for operation_id in sorted(requested_ids):
             requested_operation, requested_resolution = requested[operation_id]
@@ -499,6 +577,10 @@ class CompletionOracle:
             ):
                 raise IntegrityViolation(
                     "Operation resolution diverges from requested semantic Event"
+                )
+            if operation != latest_states[operation_id]:
+                raise IntegrityViolation(
+                    "Operation projection lifecycle diverges from semantic Events"
                 )
             operations.append(
                 (operation, requested_resolution.resolved_effect.effect_class)
@@ -746,6 +828,7 @@ class CompletionOracle:
         return receipt
 
     def receipts_for_program(self, program_id: str) -> tuple[CompletionReceipt, ...]:
+        self._validate_decision_index_alignment()
         rows = self._host_store._db.execute(
             """
             SELECT receipt_id FROM completion_decision_event_index
