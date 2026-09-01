@@ -408,17 +408,52 @@ class CompletionOracle:
             expected_revision=expected_revision,
         )
 
-    def _program_operations(self, program_id: str) -> tuple[tuple[Operation, EffectClass], ...]:
+    def _requested_operation_ids(self, program_id: str) -> tuple[str, ...]:
         rows = self._host_store._db.execute(
+            """
+            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+            FROM events WHERE event_type = 'operation.requested' ORDER BY sequence
+            """
+        ).fetchall()
+        operation_ids: list[str] = []
+        for row in rows:
+            event = self._decode_event_row(row)
+            try:
+                operation = record_from_json(
+                    Operation,
+                    canonical_json(event.payload["operation"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise IntegrityViolation("requested Operation Event is malformed") from exc
+            if not isinstance(operation, Operation):
+                raise IntegrityViolation("requested Operation Event decoded wrong type")
+            if (
+                event.correlation_id != operation.program_id
+                or event.actor_id != operation.actor_id
+            ):
+                raise IntegrityViolation("requested Operation Event context mismatch")
+            if operation.program_id == program_id:
+                if operation.operation_id in operation_ids:
+                    raise IntegrityViolation("duplicate requested Operation identity")
+                operation_ids.append(operation.operation_id)
+        return tuple(operation_ids)
+
+    def _program_operations(self, program_id: str) -> tuple[tuple[Operation, EffectClass], ...]:
+        projection_rows = self._host_store._db.execute(
             """
             SELECT operation_id FROM operation_projections
             WHERE program_id = ? ORDER BY operation_id
             """,
             (program_id,),
         ).fetchall()
+        projection_ids = tuple(str(row["operation_id"]) for row in projection_rows)
+        requested_ids = self._requested_operation_ids(program_id)
+        if set(projection_ids) != set(requested_ids) or len(projection_ids) != len(requested_ids):
+            raise IntegrityViolation(
+                "Program Operation projections diverge from requested Operation Events"
+            )
         operations: list[tuple[Operation, EffectClass]] = []
-        for row in rows:
-            operation_id = str(row["operation_id"])
+        for operation_id in sorted(requested_ids):
             operation = self._operations.get(operation_id)
             resolution = self._operations.resolution(operation_id)
             if operation.program_id != program_id:
