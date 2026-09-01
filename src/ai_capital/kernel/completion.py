@@ -24,7 +24,7 @@ from .errors import (
 )
 from .events import event_digest_fields, make_program_event, utc_now, verify_event_digest
 from .models import CapabilityResolution, CompletionReceipt, Event, Operation, Program
-from .operation_journal import OperationJournal
+from .operation_journal import ExecutionReceipt, OperationJournal, ReconciliationReceipt
 from .program_state import transition_program
 from .schema_codec import record_from_json, record_to_json
 from .serialization import canonical_digest, canonical_json, to_canonical_data
@@ -493,6 +493,78 @@ class CompletionOracle:
             and current.request_digest == requested.request_digest
         )
 
+    def _validate_operation_event_receipt(
+        self,
+        event: Event,
+        operation: Operation,
+    ) -> str | None:
+        if event.event_type in {"operation.finished", "operation.interrupted"}:
+            receipt_record_type = ExecutionReceipt
+            expected_receipt_type = "execution"
+        elif event.event_type == "operation.reconciled":
+            receipt_record_type = ReconciliationReceipt
+            expected_receipt_type = "reconciliation"
+        else:
+            if event.payload.get("receipt") is not None:
+                raise IntegrityViolation("Operation lifecycle Event has an unexpected receipt")
+            return None
+
+        receipt_payload = event.payload.get("receipt")
+        if receipt_payload is None:
+            raise IntegrityViolation("Operation lifecycle Event lacks its receipt")
+        try:
+            receipt = record_from_json(
+                receipt_record_type,
+                canonical_json(receipt_payload),
+            )
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("Operation lifecycle receipt cannot be decoded") from exc
+        if not isinstance(receipt, receipt_record_type):
+            raise IntegrityViolation("Operation lifecycle receipt decoded wrong type")
+        if receipt.operation_id != operation.operation_id:
+            raise IntegrityViolation("Operation lifecycle receipt identity mismatch")
+
+        row = self._host_store._db.execute(
+            """
+            SELECT receipt_id, operation_id, receipt_type, receipt_json, receipt_digest
+            FROM operation_receipts WHERE receipt_id = ?
+            """,
+            (receipt.receipt_id,),
+        ).fetchone()
+        if row is None:
+            raise IntegrityViolation("Operation lifecycle Event lacks canonical receipt")
+        try:
+            stored = record_from_json(receipt_record_type, row["receipt_json"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("Operation receipt record cannot be decoded") from exc
+        if not isinstance(stored, receipt_record_type):
+            raise IntegrityViolation("Operation receipt record decoded wrong type")
+        if (
+            row["receipt_id"] != receipt.receipt_id
+            or row["operation_id"] != operation.operation_id
+            or row["receipt_type"] != expected_receipt_type
+            or canonical_digest(stored) != row["receipt_digest"]
+            or stored != receipt
+        ):
+            raise IntegrityViolation(
+                "Operation receipt record diverges from semantic lifecycle Event"
+            )
+
+        if isinstance(receipt, ExecutionReceipt):
+            if (
+                receipt.execution_outcome is not operation.execution_outcome
+                or receipt.effect_status is not operation.effect_status
+                or receipt.observed_at != operation.finished_at
+            ):
+                raise IntegrityViolation(
+                    "Execution receipt diverges from Operation lifecycle snapshot"
+                )
+        elif receipt.effect_status is not operation.effect_status:
+            raise IntegrityViolation(
+                "Reconciliation receipt diverges from Operation lifecycle snapshot"
+            )
+        return receipt.receipt_id
+
     def _latest_operation_event_states(
         self,
         program_id: str,
@@ -510,6 +582,9 @@ class CompletionOracle:
             """
         ).fetchall()
         latest: dict[str, Operation] = {}
+        semantic_receipt_refs: dict[str, list[str]] = {
+            operation_id: [] for operation_id in requested
+        }
         for row in rows:
             event = self._decode_event_row(row)
             if event.correlation_id != program_id:
@@ -538,9 +613,32 @@ class CompletionOracle:
                 raise IntegrityViolation("Operation lifecycle Event identity mismatch")
             if event.event_type == "operation.requested" and operation != requested_operation:
                 raise IntegrityViolation("requested Operation lifecycle snapshot mismatch")
+
+            receipt_id = self._validate_operation_event_receipt(event, operation)
+            expected_refs = semantic_receipt_refs[operation.operation_id]
+            if receipt_id is not None:
+                expected_refs.append(receipt_id)
+            if operation.receipt_refs != tuple(expected_refs):
+                raise IntegrityViolation(
+                    "Operation receipt references diverge from semantic lifecycle Events"
+                )
             latest[operation.operation_id] = operation
+
         if set(latest) != set(requested):
             raise IntegrityViolation("Operation lifecycle Event history is incomplete")
+        for operation_id, expected_refs in semantic_receipt_refs.items():
+            rows = self._host_store._db.execute(
+                """
+                SELECT receipt_id FROM operation_receipts
+                WHERE operation_id = ? ORDER BY sequence
+                """,
+                (operation_id,),
+            ).fetchall()
+            stored_refs = tuple(str(row["receipt_id"]) for row in rows)
+            if len(stored_refs) != len(expected_refs) or set(stored_refs) != set(expected_refs):
+                raise IntegrityViolation(
+                    "Operation receipt records diverge from semantic lifecycle Events"
+                )
         return latest
 
     def _program_operations(self, program_id: str) -> tuple[tuple[Operation, EffectClass], ...]:
