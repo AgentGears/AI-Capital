@@ -137,10 +137,14 @@ class K7IntegrityAndFaultTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fx = ReadyFixture(directory)
             try:
-                fx.programs._db.execute(
-                    "DELETE FROM verification_contracts WHERE contract_id = ?",
-                    (fx.contract.contract_id,),
-                )
+                fx.programs._db.execute("PRAGMA foreign_keys = OFF")
+                try:
+                    fx.programs._db.execute(
+                        "DELETE FROM verification_contracts WHERE contract_id = ?",
+                        (fx.contract.contract_id,),
+                    )
+                finally:
+                    fx.programs._db.execute("PRAGMA foreign_keys = ON")
                 with self.assertRaises(IntegrityViolation):
                     fx.oracle.decide("p-1", expected_revision=fx.pending.revision)
             finally:
