@@ -27,8 +27,8 @@ from .models import CompletionReceipt, Event, Operation, Program
 from .operation_journal import OperationJournal
 from .program_state import transition_program
 from .schema_codec import record_from_json, record_to_json
-from .serialization import canonical_digest, to_canonical_data
-from .verification import VerificationContract, VerificationRepository
+from .serialization import canonical_digest, canonical_json, to_canonical_data
+from .verification import VerificationRepository
 
 
 _COMPONENT = "completion"
@@ -236,7 +236,7 @@ class CompletionOracle:
                 try:
                     blocker = record_from_json(
                         CompletionBlocker,
-                        record_to_json(event.payload["blocker"]),
+                        canonical_json(event.payload["blocker"]),
                     )
                 except (KeyError, TypeError, ValueError) as exc:
                     raise IntegrityViolation("completion blocker Event is malformed") from exc
@@ -250,7 +250,7 @@ class CompletionOracle:
             try:
                 resolution = record_from_json(
                     CompletionBlockerResolution,
-                    record_to_json(event.payload["resolution"]),
+                    canonical_json(event.payload["resolution"]),
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise IntegrityViolation("completion blocker resolution Event is malformed") from exc
