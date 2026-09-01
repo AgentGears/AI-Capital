@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from .claim_store import ClaimRepository
 from .durable_program import ProgramRepository
-from .enums import ProgramStatus, VerificationResult
+from .enums import EffectClass, ProgramStatus, VerificationResult
 from .errors import (
     EvidenceInvalid,
     EvidenceMissing,
@@ -17,7 +17,7 @@ from .errors import (
     VerificationStale,
 )
 from .events import event_digest_fields, utc_now, verify_event_digest
-from .models import Event, Program, Verification
+from .models import CapabilityResolution, Event, Operation, Program, Verification
 from .schema_codec import record_from_json, record_to_json
 from .serialization import canonical_digest, canonical_json, to_canonical_data
 
@@ -329,6 +329,65 @@ class VerificationRepository:
             )
         self._validate_index_alignment()
 
+    def _semantic_event_sets(
+        self,
+    ) -> tuple[
+        set[tuple[str, str, str]],
+        set[tuple[str, str, str, str]],
+    ]:
+        contract_events: set[tuple[str, str, str]] = set()
+        verification_events: set[tuple[str, str, str, str]] = set()
+        rows = self._host_store._db.execute(
+            """
+            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+            FROM events
+            WHERE event_type IN ('verification.contract_registered', 'verification.recorded')
+            ORDER BY sequence
+            """
+        ).fetchall()
+        for row in rows:
+            event = self._decode_event_row(row)
+            if event.event_type == "verification.contract_registered":
+                try:
+                    contract = record_from_json(
+                        VerificationContract,
+                        canonical_json(event.payload["contract"]),
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise IntegrityViolation("Verification contract Event is malformed") from exc
+                if not isinstance(contract, VerificationContract):
+                    raise IntegrityViolation("Verification contract Event decoded wrong type")
+                if event.correlation_id != contract.program_id:
+                    raise IntegrityViolation("Verification contract Event Program mismatch")
+                binding = (contract.contract_id, contract.program_id, event.event_id)
+                if any(item[0] == contract.contract_id for item in contract_events):
+                    raise IntegrityViolation("duplicate Verification contract semantic identity")
+                contract_events.add(binding)
+                continue
+
+            try:
+                verification = record_from_json(
+                    Verification,
+                    canonical_json(event.payload["verification"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise IntegrityViolation("Verification recorded Event is malformed") from exc
+            if not isinstance(verification, Verification):
+                raise IntegrityViolation("Verification recorded Event decoded wrong type")
+            program_id = verification.subject_ref.removeprefix("program:")
+            if not program_id or event.correlation_id != program_id:
+                raise IntegrityViolation("Verification recorded Event Program mismatch")
+            binding = (
+                verification.verification_id,
+                verification.contract_ref,
+                program_id,
+                event.event_id,
+            )
+            if any(item[0] == verification.verification_id for item in verification_events):
+                raise IntegrityViolation("duplicate Verification semantic identity")
+            verification_events.add(binding)
+        return contract_events, verification_events
+
     def _validate_index_alignment(self) -> None:
         contract_rows = self._host_store._db.execute(
             "SELECT contract_id, program_id, registered_event_id FROM verification_contracts"
@@ -344,8 +403,6 @@ class VerificationRepository:
             (str(row["contract_id"]), str(row["program_id"]), str(row["event_id"]))
             for row in indexed_contracts
         }
-        if canonical_contracts != indexed_contract_set:
-            raise IntegrityViolation("Verification contract index diverges from canonical records")
 
         receipt_rows = self._host_store._db.execute(
             """
@@ -377,8 +434,19 @@ class VerificationRepository:
             )
             for row in indexed_receipts
         }
-        if canonical_receipts != indexed_receipt_set:
-            raise IntegrityViolation("Verification Event index diverges from canonical receipts")
+        event_contracts, event_receipts = self._semantic_event_sets()
+        if not (
+            canonical_contracts == indexed_contract_set == event_contracts
+        ):
+            raise IntegrityViolation(
+                "Verification contract records/index diverge from semantic Events"
+            )
+        if not (
+            canonical_receipts == indexed_receipt_set == event_receipts
+        ):
+            raise IntegrityViolation(
+                "Verification receipt records/index diverge from semantic Events"
+            )
 
     @staticmethod
     def _validate_contract(contract: VerificationContract, program: Program) -> None:
@@ -510,6 +578,7 @@ class VerificationRepository:
         return contract
 
     def contracts_for_program(self, program_id: str) -> tuple[VerificationContract, ...]:
+        self._validate_index_alignment()
         rows = self._host_store._db.execute(
             """
             SELECT contract_id FROM verification_contract_event_index
@@ -682,6 +751,90 @@ class VerificationRepository:
             return None
         return self.get(str(row["verification_id"]))
 
+    def _requested_operation_effects(self, program_id: str) -> dict[str, EffectClass]:
+        rows = self._host_store._db.execute(
+            """
+            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+            FROM events WHERE event_type = 'operation.requested' ORDER BY sequence
+            """
+        ).fetchall()
+        effects: dict[str, EffectClass] = {}
+        for row in rows:
+            event = self._decode_event_row(row)
+            try:
+                operation = record_from_json(
+                    Operation,
+                    canonical_json(event.payload["operation"]),
+                )
+                resolution = record_from_json(
+                    CapabilityResolution,
+                    canonical_json(event.payload["resolution"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise IntegrityViolation("requested Operation Event is malformed") from exc
+            if not isinstance(operation, Operation) or not isinstance(
+                resolution, CapabilityResolution
+            ):
+                raise IntegrityViolation("requested Operation Event decoded wrong type")
+            if (
+                event.correlation_id != operation.program_id
+                or event.actor_id != operation.actor_id
+                or operation.capability_id != resolution.capability_id
+                or operation.request_digest != canonical_digest(resolution)
+            ):
+                raise IntegrityViolation("requested Operation Event binding mismatch")
+            if operation.program_id != program_id:
+                continue
+            if operation.operation_id in effects:
+                raise IntegrityViolation("duplicate requested Operation identity")
+            effects[operation.operation_id] = resolution.resolved_effect.effect_class
+        return effects
+
+    def _has_later_protected_operation_change(
+        self,
+        program_id: str,
+        *,
+        after_sequence: int,
+    ) -> bool:
+        effects = self._requested_operation_effects(program_id)
+        rows = self._host_store._db.execute(
+            """
+            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+            FROM events
+            WHERE sequence > ?
+              AND event_type IN (
+                  'operation.requested', 'operation.admitted', 'operation.started',
+                  'operation.finished', 'operation.reconciled'
+              )
+            ORDER BY sequence
+            """,
+            (after_sequence,),
+        ).fetchall()
+        for row in rows:
+            event = self._decode_event_row(row)
+            if event.correlation_id != program_id:
+                continue
+            try:
+                operation = record_from_json(
+                    Operation,
+                    canonical_json(event.payload["operation"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise IntegrityViolation("Operation change Event is malformed") from exc
+            if not isinstance(operation, Operation):
+                raise IntegrityViolation("Operation change Event decoded wrong type")
+            if (
+                operation.program_id != program_id
+                or event.actor_id != operation.actor_id
+            ):
+                raise IntegrityViolation("Operation change Event context mismatch")
+            effect_class = effects.get(operation.operation_id)
+            if effect_class is None:
+                raise IntegrityViolation("Operation change lacks requested semantic root")
+            if effect_class is not EffectClass.OBSERVE:
+                return True
+        return False
+
     def current(self, verification_id: str) -> Verification:
         verification = self.get(verification_id)
         contract = self.contract(verification.contract_ref)
@@ -699,6 +852,19 @@ class VerificationRepository:
             raise VerificationStale("Verification Claim/Evidence roots are no longer current") from exc
         if current_evidence != verification.evidence_refs:
             raise VerificationStale("Verification Evidence roots are no longer current")
+        index = self._host_store._db.execute(
+            "SELECT sequence FROM verification_event_index WHERE verification_id = ?",
+            (verification_id,),
+        ).fetchone()
+        if index is None:
+            raise IntegrityViolation("Verification currentness lacks semantic Event index")
+        if self._has_later_protected_operation_change(
+            program.program_id,
+            after_sequence=int(index["sequence"]),
+        ):
+            raise VerificationStale(
+                "Verification predates a protected mutating Operation change"
+            )
         return verification
 
     def current_latest_for_contract(self, contract_id: str) -> Verification | None:
