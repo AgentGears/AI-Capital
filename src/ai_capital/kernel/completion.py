@@ -305,6 +305,8 @@ class CompletionOracle:
             raise IntegrityViolation(
                 "Completion receipt records/index diverge from semantic decision Events"
             )
+        for row in receipt_rows:
+            self.receipt(str(row["receipt_id"]))
 
     def open_blocker(self, program_id: str, *, code: str, detail: str) -> CompletionBlocker:
         program = self._host_store.get(program_id)
