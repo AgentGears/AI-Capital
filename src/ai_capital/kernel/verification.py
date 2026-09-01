@@ -756,7 +756,7 @@ class VerificationRepository:
             """
             SELECT sequence, event_id, program_id, event_type, event_json, event_digest
             FROM events WHERE event_type = 'operation.requested' ORDER BY sequence
-            """
+            """,
         ).fetchall()
         effects: dict[str, EffectClass] = {}
         for row in rows:
@@ -804,7 +804,7 @@ class VerificationRepository:
             WHERE sequence > ?
               AND event_type IN (
                   'operation.requested', 'operation.admitted', 'operation.started',
-                  'operation.finished', 'operation.reconciled'
+                  'operation.finished', 'operation.interrupted', 'operation.reconciled'
               )
             ORDER BY sequence
             """,
