@@ -32,7 +32,7 @@ from .verification import VerificationRepository
 
 
 _COMPONENT = "completion"
-_COMPONENT_SCHEMA_VERSION = 1
+_COMPONENT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,8 +87,9 @@ class CompletionOracle:
                     f"Completion schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Completion schema version {version}")
+
             self._host_store._db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS completion_receipts (
@@ -109,15 +110,46 @@ class CompletionOracle:
             )
             self._host_store._db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS completion_decision_event_index (
+                    sequence INTEGER PRIMARY KEY,
+                    program_id TEXT NOT NULL,
+                    receipt_id TEXT NOT NULL UNIQUE,
+                    event_id TEXT NOT NULL UNIQUE,
+                    result TEXT NOT NULL,
+                    FOREIGN KEY(sequence) REFERENCES events(sequence)
+                )
+                """
+            )
+            self._host_store._db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS completion_decision_event_program_sequence
+                ON completion_decision_event_index(program_id, sequence)
+                """
+            )
+            self._host_store._db.execute(
+                """
                 CREATE INDEX IF NOT EXISTS events_type_sequence
                 ON events(event_type, sequence)
                 """
             )
-            if version is None:
-                self._host_store._db.execute(
-                    "INSERT INTO component_schema(component, version) VALUES (?, ?)",
-                    (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
-                )
+
+            if version in {None, 1}:
+                self._rebuild_decision_index()
+                if version is None:
+                    self._host_store._db.execute(
+                        "INSERT INTO component_schema(component, version) VALUES (?, ?)",
+                        (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
+                    )
+                else:
+                    self._host_store._db.execute(
+                        "UPDATE component_schema SET version = ? WHERE component = ?",
+                        (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
+                    )
+                version = _COMPONENT_SCHEMA_VERSION
+
+            if version != _COMPONENT_SCHEMA_VERSION:
+                raise IntegrityViolation(f"unsupported Completion schema version {version}")
+            self._validate_decision_index_alignment()
 
     def _append_event(
         self,
@@ -185,6 +217,67 @@ class CompletionOracle:
         ):
             raise IntegrityViolation("Completion Event integrity mismatch")
         return event
+
+    def _rebuild_decision_index(self) -> None:
+        self._host_store._db.execute("DELETE FROM completion_decision_event_index")
+        rows = self._host_store._db.execute(
+            """
+            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+            FROM events
+            WHERE event_type IN ('completion.certified', 'completion.rejected')
+            ORDER BY sequence
+            """
+        ).fetchall()
+        for row in rows:
+            event = self._decode_event_row(row)
+            try:
+                receipt = record_from_json(
+                    CompletionReceipt,
+                    canonical_json(event.payload["completion"]),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise IntegrityViolation("Completion decision Event is malformed") from exc
+            if not isinstance(receipt, CompletionReceipt):
+                raise IntegrityViolation("Completion decision Event decoded wrong type")
+            expected_type = (
+                "completion.certified"
+                if receipt.result is CompletionResult.CERTIFIED
+                else "completion.rejected"
+            )
+            if event.event_type != expected_type or event.correlation_id != receipt.program_id:
+                raise IntegrityViolation("Completion decision Event binding mismatch")
+            self._host_store._db.execute(
+                """
+                INSERT INTO completion_decision_event_index(
+                    sequence, program_id, receipt_id, event_id, result
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    event.sequence,
+                    receipt.program_id,
+                    receipt.receipt_id,
+                    event.event_id,
+                    receipt.result.value,
+                ),
+            )
+
+    def _validate_decision_index_alignment(self) -> None:
+        receipt_rows = self._host_store._db.execute(
+            "SELECT receipt_id, program_id, decision_event_id FROM completion_receipts"
+        ).fetchall()
+        index_rows = self._host_store._db.execute(
+            "SELECT receipt_id, program_id, event_id FROM completion_decision_event_index"
+        ).fetchall()
+        receipts = {
+            (str(row["receipt_id"]), str(row["program_id"]), str(row["decision_event_id"]))
+            for row in receipt_rows
+        }
+        indexed = {
+            (str(row["receipt_id"]), str(row["program_id"]), str(row["event_id"]))
+            for row in index_rows
+        }
+        if receipts != indexed:
+            raise IntegrityViolation("Completion receipt history diverges from decision Events")
 
     def open_blocker(self, program_id: str, *, code: str, detail: str) -> CompletionBlocker:
         program = self._host_store.get(program_id)
@@ -393,10 +486,7 @@ class CompletionOracle:
                 ExecutionOutcome.RUNNING,
             }:
                 reasons.append(f"protected_operation_outstanding:{operation.operation_id}")
-            if (
-                require_effect_certainty
-                and operation.effect_status is EffectStatus.INDETERMINATE
-            ):
+            if require_effect_certainty and operation.effect_status is EffectStatus.INDETERMINATE:
                 reasons.append(f"protected_effect_indeterminate:{operation.operation_id}")
 
         return (
@@ -424,6 +514,7 @@ class CompletionOracle:
             program=updated,
         )
         self._host_store._insert_event(event)
+        self._host_store._fault("completion_after_program_event")
         cursor = self._host_store._db.execute(
             """
             UPDATE program_projections
@@ -443,6 +534,7 @@ class CompletionOracle:
             raise StaleProgramRevision(
                 f"Program revision changed during completion decision: {current.program_id}"
             )
+        self._host_store._fault("completion_after_projection_write")
         return updated
 
     def decide(
@@ -451,6 +543,7 @@ class CompletionOracle:
         *,
         expected_revision: int,
     ) -> CompletionReceipt:
+        receipt: CompletionReceipt
         with self._host_store._transaction():
             self._host_store.verify_integrity(program_id)
             current = self._host_store.get(program_id)
@@ -482,6 +575,20 @@ class CompletionOracle:
             try:
                 self._host_store._db.execute(
                     """
+                    INSERT INTO completion_decision_event_index(
+                        sequence, program_id, receipt_id, event_id, result
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        decision_event.sequence,
+                        receipt.program_id,
+                        receipt.receipt_id,
+                        decision_event.event_id,
+                        receipt.result.value,
+                    ),
+                )
+                self._host_store._db.execute(
+                    """
                     INSERT INTO completion_receipts(
                         receipt_id, program_id, program_revision,
                         decision_event_id, receipt_json, receipt_digest
@@ -498,15 +605,26 @@ class CompletionOracle:
                 )
             except sqlite3.IntegrityError as exc:
                 raise PersistenceConflict("Completion receipt identity collision") from exc
+            self._host_store._fault("completion_after_decision_receipt")
 
             self._transition_program_in_transaction(
                 current,
                 target=ProgramStatus.ACTIVE if reasons else ProgramStatus.COMPLETED,
                 event_type="program.completion_rejected" if reasons else "program.completed",
             )
+        self._host_store._fault("completion_after_commit")
         return receipt
 
     def receipt(self, receipt_id: str) -> CompletionReceipt:
+        index = self._host_store._db.execute(
+            """
+            SELECT sequence, program_id, receipt_id, event_id, result
+            FROM completion_decision_event_index WHERE receipt_id = ?
+            """,
+            (receipt_id,),
+        ).fetchone()
+        if index is None:
+            raise InvalidRequest(f"unknown CompletionReceipt: {receipt_id}")
         row = self._host_store._db.execute(
             """
             SELECT receipt_id, program_id, program_revision,
@@ -516,7 +634,7 @@ class CompletionOracle:
             (receipt_id,),
         ).fetchone()
         if row is None:
-            raise InvalidRequest(f"unknown CompletionReceipt: {receipt_id}")
+            raise IntegrityViolation("Completion decision Event index lacks canonical receipt")
         try:
             receipt = record_from_json(CompletionReceipt, row["receipt_json"])
         except (TypeError, ValueError) as exc:
@@ -528,8 +646,11 @@ class CompletionOracle:
             or receipt.program_id != row["program_id"]
             or receipt.program_revision != int(row["program_revision"])
             or canonical_digest(receipt) != row["receipt_digest"]
+            or index["program_id"] != receipt.program_id
+            or index["event_id"] != row["decision_event_id"]
+            or index["result"] != receipt.result.value
         ):
-            raise IntegrityViolation("Completion receipt row integrity mismatch")
+            raise IntegrityViolation("Completion receipt row/index integrity mismatch")
         event = self._event_by_id(str(row["decision_event_id"]))
         expected_type = (
             "completion.certified"
@@ -537,7 +658,8 @@ class CompletionOracle:
             else "completion.rejected"
         )
         if (
-            event.event_type != expected_type
+            event.sequence != int(index["sequence"])
+            or event.event_type != expected_type
             or event.correlation_id != receipt.program_id
             or to_canonical_data(event.payload.get("completion")) != to_canonical_data(receipt)
         ):
@@ -547,8 +669,8 @@ class CompletionOracle:
     def receipts_for_program(self, program_id: str) -> tuple[CompletionReceipt, ...]:
         rows = self._host_store._db.execute(
             """
-            SELECT receipt_id FROM completion_receipts
-            WHERE program_id = ? ORDER BY program_revision, receipt_id
+            SELECT receipt_id FROM completion_decision_event_index
+            WHERE program_id = ? ORDER BY sequence
             """,
             (program_id,),
         ).fetchall()
