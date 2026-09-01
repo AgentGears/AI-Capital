@@ -9,6 +9,8 @@ from .claim_store import ClaimRepository
 from .durable_program import ProgramRepository
 from .enums import ProgramStatus, VerificationResult
 from .errors import (
+    EvidenceInvalid,
+    EvidenceMissing,
     IntegrityViolation,
     InvalidRequest,
     PersistenceConflict,
@@ -467,7 +469,10 @@ class VerificationRepository:
             or program.status is not ProgramStatus.COMPLETION_PENDING
         ):
             raise VerificationStale("Verification no longer matches current Program state")
-        current_evidence = self._required_evidence_refs(contract)
+        try:
+            current_evidence = self._required_evidence_refs(contract)
+        except (EvidenceMissing, EvidenceInvalid) as exc:
+            raise VerificationStale("Verification Claim/Evidence roots are no longer current") from exc
         if current_evidence != verification.evidence_refs:
             raise VerificationStale("Verification Evidence roots are no longer current")
         return verification
