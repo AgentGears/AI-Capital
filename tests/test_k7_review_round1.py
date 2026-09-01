@@ -52,7 +52,7 @@ class Fixture:
             Program(
                 "p-1",
                 0,
-                "Codex K7 remediation proof",
+                "K7 review remediation proof",
                 work_items=(WorkItem("w-1", "complete required work"),),
                 success_criteria=(CRITERION,),
             )
@@ -129,7 +129,7 @@ class Fixture:
         self.programs.close()
 
 
-class K7CodexRoundOneTests(unittest.TestCase):
+class K7ReviewRoundOneTests(unittest.TestCase):
     def test_later_confirmed_mutation_stales_prior_pass_verification(self):
         with tempfile.TemporaryDirectory() as directory:
             fx = Fixture(directory)

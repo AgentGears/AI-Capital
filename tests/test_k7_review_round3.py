@@ -30,7 +30,7 @@ class PassingVerifier:
         return VerificationObservation(VerificationResult.PASS, "fixture_pass")
 
 
-class K7CodexRoundThreeTests(unittest.TestCase):
+class K7ReviewRoundThreeTests(unittest.TestCase):
     def test_corrupt_prior_decision_history_blocks_later_certification(self):
         with tempfile.TemporaryDirectory() as directory:
             programs = ProgramRepository(Path(directory) / "kernel.db")

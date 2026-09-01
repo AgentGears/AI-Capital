@@ -54,7 +54,7 @@ class Fixture:
             Program(
                 "p-1",
                 0,
-                "Codex K7 round-two proof",
+                "K7 review round-two proof",
                 work_items=(WorkItem("w-1", "complete required work"),),
                 success_criteria=(CRITERION,),
             )
@@ -133,7 +133,7 @@ class Fixture:
         self.programs.close()
 
 
-class K7CodexRoundTwoTests(unittest.TestCase):
+class K7ReviewRoundTwoTests(unittest.TestCase):
     def test_interrupted_mutation_stales_verification_even_without_effect_certainty_requirement(self):
         with tempfile.TemporaryDirectory() as directory:
             fx = Fixture(directory, require_effect_certainty=False)

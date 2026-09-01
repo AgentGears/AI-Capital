@@ -47,7 +47,7 @@ class MutatingVerifier:
         return VerificationObservation(VerificationResult.PASS, "fixture_pass")
 
 
-class K7CodexRoundFourTests(unittest.TestCase):
+class K7ReviewRoundFourTests(unittest.TestCase):
     def test_protected_mutation_during_verifier_execution_blocks_admission(self):
         with tempfile.TemporaryDirectory() as directory:
             programs = ProgramRepository(Path(directory) / "kernel.db")
