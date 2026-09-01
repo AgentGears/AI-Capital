@@ -447,6 +447,8 @@ class VerificationRepository:
             raise IntegrityViolation(
                 "Verification receipt records/index diverge from semantic Events"
             )
+        for row in receipt_rows:
+            self.get(str(row["verification_id"]))
 
     @staticmethod
     def _validate_contract(contract: VerificationContract, program: Program) -> None:
