@@ -706,6 +706,7 @@ class CompletionOracle:
     ) -> CompletionReceipt:
         receipt: CompletionReceipt
         with self._host_store._transaction():
+            self._validate_decision_index_alignment()
             self._host_store.verify_integrity(program_id)
             current = self._host_store.get(program_id)
             if current.revision != expected_revision:
