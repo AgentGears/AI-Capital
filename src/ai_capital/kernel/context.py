@@ -185,6 +185,8 @@ class ContextRepository:
         host_store: ProgramRepository,
         evidence: EvidenceRepository | None = None,
     ):
+        if evidence is not None and evidence._host_store is not host_store:
+            raise InvalidRequest("Context Evidence repository must share the Host store")
         self._host_store = host_store
         self._evidence = evidence
         self._migrate()
@@ -763,10 +765,11 @@ class ContextRepository:
         if len(set(source_refs)) != len(source_refs):
             raise InvalidRequest("bounded recall does not accept duplicate source addresses")
 
+        ordered_refs = tuple(sorted(source_refs))
         items: list[ContextSource] = []
         included: list[str] = []
         excluded: list[str] = []
-        for source_ref_value in source_refs:
+        for source_ref_value in ordered_refs:
             source = self._resolve_recall(program_id, source_ref_value)
             if len(items) >= max_items:
                 excluded.append(source_ref_value)
@@ -787,7 +790,7 @@ class ContextRepository:
             ContextCompleteness.TRUNCATED if excluded else ContextCompleteness.COMPLETE
         )
         return RecallResult(
-            requested_refs=source_refs,
+            requested_refs=ordered_refs,
             included_refs=tuple(included),
             excluded_refs=tuple(excluded),
             items=tuple(items),
