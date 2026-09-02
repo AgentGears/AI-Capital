@@ -128,8 +128,8 @@ class K7ReviewRoundEightTests(unittest.TestCase):
             programs, oracle, pending = self._ready_with_confirmed_mutation(directory)
             try:
                 cursor = programs._db.execute(
-                    "DELETE FROM events WHERE event_type = ? AND correlation_id = ?",
-                    (event_type, "p-1"),
+                    "DELETE FROM events WHERE event_type = ?",
+                    (event_type,),
                 )
                 self.assertEqual(cursor.rowcount, 1)
 
