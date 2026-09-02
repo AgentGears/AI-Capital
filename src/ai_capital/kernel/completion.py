@@ -11,6 +11,7 @@ from .enums import (
     EffectStatus,
     ExecutionOutcome,
     ProgramStatus,
+    ReconciliationStatus,
     VerificationResult,
     WorkItemStatus,
 )
@@ -25,6 +26,7 @@ from .errors import (
 from .events import event_digest_fields, make_program_event, utc_now, verify_event_digest
 from .models import CapabilityResolution, CompletionReceipt, Event, Operation, Program
 from .operation_journal import ExecutionReceipt, OperationJournal, ReconciliationReceipt
+from .operations import validate_operation_semantics
 from .program_state import transition_program
 from .schema_codec import record_from_json, record_to_json
 from .serialization import canonical_digest, canonical_json, to_canonical_data
@@ -565,6 +567,170 @@ class CompletionOracle:
             )
         return receipt.receipt_id
 
+    @staticmethod
+    def _validate_operation_lifecycle_transition(
+        previous_event_type: str | None,
+        previous: Operation | None,
+        event_type: str,
+        operation: Operation,
+        effect_class: EffectClass,
+    ) -> None:
+        validate_operation_semantics(operation)
+
+        if previous is None:
+            if event_type != "operation.requested":
+                raise IntegrityViolation("Operation lifecycle history does not begin with request")
+            if (
+                operation.execution_outcome is not ExecutionOutcome.NOT_STARTED
+                or operation.effect_status is not EffectStatus.UNKNOWN
+                or operation.reconciliation_status is not ReconciliationStatus.NOT_REQUIRED
+                or operation.started_at is not None
+                or operation.finished_at is not None
+                or operation.receipt_refs
+            ):
+                raise IntegrityViolation("requested Operation lifecycle snapshot is not initial")
+            return
+
+        if event_type == "operation.requested":
+            raise IntegrityViolation("duplicate requested Operation lifecycle Event")
+
+        if event_type == "operation.admitted":
+            if previous_event_type != "operation.requested" or operation != previous:
+                raise IntegrityViolation("Operation admission is not reachable from request")
+            return
+
+        if event_type == "operation.started":
+            if (
+                previous_event_type != "operation.admitted"
+                or previous.execution_outcome is not ExecutionOutcome.NOT_STARTED
+                or operation.execution_outcome is not ExecutionOutcome.RUNNING
+                or operation.started_at is None
+                or operation.finished_at is not None
+                or operation.receipt_refs != previous.receipt_refs
+            ):
+                raise IntegrityViolation("Operation start is not reachable from admission")
+            return
+
+        if event_type == "operation.finished":
+            if previous.execution_outcome is ExecutionOutcome.RUNNING:
+                if (
+                    previous_event_type != "operation.started"
+                    or previous.started_at is None
+                    or operation.started_at != previous.started_at
+                ):
+                    raise IntegrityViolation(
+                        "terminal Operation finish lacks complete started history"
+                    )
+            elif previous.execution_outcome is ExecutionOutcome.NOT_STARTED:
+                expected_effect = (
+                    EffectStatus.NOT_APPLICABLE
+                    if effect_class is EffectClass.OBSERVE
+                    else EffectStatus.ABSENT
+                )
+                if (
+                    previous_event_type
+                    not in {"operation.requested", "operation.admitted"}
+                    or operation.execution_outcome is not ExecutionOutcome.FAILED
+                    or operation.started_at is not None
+                    or operation.effect_status is not expected_effect
+                    or operation.reconciliation_status
+                    is not ReconciliationStatus.NOT_REQUIRED
+                ):
+                    raise IntegrityViolation(
+                        "pre-dispatch Operation failure has invalid lifecycle history"
+                    )
+            else:
+                raise IntegrityViolation("Operation cannot finish from terminal lifecycle state")
+
+            if (
+                operation.execution_outcome
+                in {ExecutionOutcome.NOT_STARTED, ExecutionOutcome.RUNNING}
+                or operation.finished_at is None
+            ):
+                raise IntegrityViolation("Operation finish is not terminal")
+            if effect_class is EffectClass.OBSERVE:
+                if operation.effect_status is not EffectStatus.NOT_APPLICABLE:
+                    raise IntegrityViolation(
+                        "observational Operation finish has invalid effect status"
+                    )
+            elif operation.effect_status is EffectStatus.NOT_APPLICABLE:
+                raise IntegrityViolation("mutating Operation finish lacks effect truth")
+            expected_reconciliation = (
+                ReconciliationStatus.PENDING
+                if operation.effect_status is EffectStatus.INDETERMINATE
+                else ReconciliationStatus.NOT_REQUIRED
+            )
+            if operation.reconciliation_status is not expected_reconciliation:
+                raise IntegrityViolation(
+                    "Operation finish has invalid initial reconciliation state"
+                )
+            return
+
+        if event_type == "operation.interrupted":
+            expected_effect = (
+                EffectStatus.NOT_APPLICABLE
+                if effect_class is EffectClass.OBSERVE
+                else EffectStatus.INDETERMINATE
+            )
+            expected_reconciliation = (
+                ReconciliationStatus.NOT_REQUIRED
+                if effect_class is EffectClass.OBSERVE
+                else ReconciliationStatus.PENDING
+            )
+            if (
+                previous_event_type != "operation.started"
+                or previous.execution_outcome is not ExecutionOutcome.RUNNING
+                or previous.started_at is None
+                or operation.execution_outcome is not ExecutionOutcome.FAILED
+                or operation.started_at != previous.started_at
+                or operation.finished_at is None
+                or operation.effect_status is not expected_effect
+                or operation.reconciliation_status is not expected_reconciliation
+            ):
+                raise IntegrityViolation(
+                    "Operation interruption is not reachable from running state"
+                )
+            return
+
+        if event_type == "operation.reconciled":
+            if (
+                previous_event_type
+                not in {
+                    "operation.finished",
+                    "operation.interrupted",
+                    "operation.reconciled",
+                }
+                or previous.execution_outcome
+                in {ExecutionOutcome.NOT_STARTED, ExecutionOutcome.RUNNING}
+                or previous.effect_status is not EffectStatus.INDETERMINATE
+                or previous.reconciliation_status
+                not in {ReconciliationStatus.PENDING, ReconciliationStatus.UNRESOLVED}
+                or operation.execution_outcome is not previous.execution_outcome
+                or operation.started_at != previous.started_at
+                or operation.finished_at != previous.finished_at
+                or operation.effect_status
+                not in {
+                    EffectStatus.CONFIRMED,
+                    EffectStatus.ABSENT,
+                    EffectStatus.INDETERMINATE,
+                }
+            ):
+                raise IntegrityViolation(
+                    "Operation reconciliation is not reachable from open indeterminate state"
+                )
+            expected_reconciliation = (
+                ReconciliationStatus.UNRESOLVED
+                if operation.effect_status is EffectStatus.INDETERMINATE
+                else ReconciliationStatus.RESOLVED
+            )
+            if operation.reconciliation_status is not expected_reconciliation:
+                raise IntegrityViolation(
+                    "Operation reconciliation snapshot has invalid state"
+                )
+            return
+
+        raise IntegrityViolation(f"unsupported Operation lifecycle Event: {event_type}")
+
     def _latest_operation_event_states(
         self,
         program_id: str,
@@ -582,6 +748,7 @@ class CompletionOracle:
             """
         ).fetchall()
         latest: dict[str, Operation] = {}
+        latest_event_types: dict[str, str] = {}
         semantic_receipt_refs: dict[str, list[str]] = {
             operation_id: [] for operation_id in requested
         }
@@ -601,7 +768,7 @@ class CompletionOracle:
             root = requested.get(operation.operation_id)
             if root is None:
                 raise IntegrityViolation("Operation lifecycle Event lacks requested root")
-            requested_operation = root[0]
+            requested_operation, requested_resolution = root
             if (
                 event.actor_id != operation.actor_id
                 or operation.program_id != program_id
@@ -614,6 +781,13 @@ class CompletionOracle:
             if event.event_type == "operation.requested" and operation != requested_operation:
                 raise IntegrityViolation("requested Operation lifecycle snapshot mismatch")
 
+            self._validate_operation_lifecycle_transition(
+                latest_event_types.get(operation.operation_id),
+                latest.get(operation.operation_id),
+                event.event_type,
+                operation,
+                requested_resolution.resolved_effect.effect_class,
+            )
             receipt_id = self._validate_operation_event_receipt(event, operation)
             expected_refs = semantic_receipt_refs[operation.operation_id]
             if receipt_id is not None:
@@ -623,6 +797,7 @@ class CompletionOracle:
                     "Operation receipt references diverge from semantic lifecycle Events"
                 )
             latest[operation.operation_id] = operation
+            latest_event_types[operation.operation_id] = event.event_type
 
         if set(latest) != set(requested):
             raise IntegrityViolation("Operation lifecycle Event history is incomplete")
