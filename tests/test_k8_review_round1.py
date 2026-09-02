@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ai_capital.kernel.actor_store import ActorRepository
 from ai_capital.kernel.bounded_inference import BoundedInferenceHost
