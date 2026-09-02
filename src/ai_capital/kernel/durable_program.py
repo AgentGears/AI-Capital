@@ -358,6 +358,8 @@ class ProgramRepository:
                 f"expected revision {expected_revision}, current revision {current.revision}"
             )
         transition_program(current, target, expected_revision=expected_revision)
+        if target is ProgramStatus.COMPLETED:
+            raise InvalidRequest("Program completion is reserved for CompletionOracle")
         event_type = _transition_event_type(current.status, target)
         return self._commit_change(
             program_id=program_id,
