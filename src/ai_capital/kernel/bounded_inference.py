@@ -28,6 +28,12 @@ class BoundedInferenceHost(InferenceHost):
     ):
         if contexts._host_store is not programs:
             raise InvalidRequest("bounded inference Context must share the Host store")
+        if actors._host_store is not programs:
+            raise InvalidRequest("bounded inference Actor repository must share the Host store")
+        if capabilities is not None and capabilities._host_store is not programs:
+            raise InvalidRequest(
+                "bounded inference Capability repository must share the Host store"
+            )
         super().__init__(programs, actors, bindings, capabilities)
         self._contexts = contexts
 
