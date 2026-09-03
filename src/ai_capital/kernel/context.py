@@ -776,10 +776,10 @@ class ContextRepository:
         included: list[str] = []
         excluded: list[str] = []
         for source_ref_value in ordered_refs:
-            source = self._resolve_recall(program_id, source_ref_value)
             if len(items) >= max_items:
                 excluded.append(source_ref_value)
                 continue
+            source = self._resolve_recall(program_id, source_ref_value)
             trial = {
                 "sources": tuple(_source_entry(item) for item in (*items, source))
             }
