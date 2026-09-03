@@ -737,6 +737,46 @@ class ContextRepository:
             },
         )
 
+    def _validate_recall_address(self, program_id: str, source_ref: str) -> None:
+        if source_ref.startswith(_EVENT_REF_PREFIX):
+            event = self._event_by_id(source_ref[len(_EVENT_REF_PREFIX) :])
+            if not self._event_belongs_to_program(event, program_id):
+                raise InvalidRequest("historical Event belongs to a different Program")
+            return
+        if source_ref.startswith(_EVIDENCE_REF_PREFIX):
+            if self._evidence is None:
+                raise InvalidRequest("Evidence recall requires the Host Evidence repository")
+            evidence_id = source_ref[len(_EVIDENCE_REF_PREFIX) :]
+            self._evidence._row(evidence_id)
+            return
+        if source_ref.startswith(_CONTEXT_RECEIPT_PREFIX):
+            row = self._host_store._db.execute(
+                """
+                SELECT program_id, compiled_event_id
+                FROM context_receipts WHERE context_receipt_id = ?
+                """,
+                (source_ref,),
+            ).fetchone()
+            if row is None:
+                raise InvalidRequest(f"unknown ContextReceipt: {source_ref}")
+            index = self._host_store._db.execute(
+                """
+                SELECT program_id, event_id
+                FROM context_receipt_event_index WHERE context_receipt_id = ?
+                """,
+                (source_ref,),
+            ).fetchone()
+            if (
+                index is None
+                or index["program_id"] != row["program_id"]
+                or index["event_id"] != row["compiled_event_id"]
+            ):
+                raise IntegrityViolation("ContextReceipt lacks valid semantic Event binding")
+            if row["program_id"] != program_id:
+                raise InvalidRequest("historical Context belongs to a different Program")
+            return
+        raise InvalidRequest(f"unsupported durable recall address: {source_ref}")
+
     def _resolve_recall(self, program_id: str, source_ref: str) -> ContextSource:
         if source_ref.startswith(_EVENT_REF_PREFIX):
             event = self._event_by_id(source_ref[len(_EVENT_REF_PREFIX) :])
@@ -772,13 +812,18 @@ class ContextRepository:
             )
 
         ordered_refs = tuple(sorted(source_refs))
+        for source_ref_value in ordered_refs:
+            self._validate_recall_address(program_id, source_ref_value)
+
         items: list[ContextSource] = []
         included: list[str] = []
         excluded: list[str] = []
+        materialization_attempts = 0
         for source_ref_value in ordered_refs:
-            if len(items) >= max_items:
+            if materialization_attempts >= max_items:
                 excluded.append(source_ref_value)
                 continue
+            materialization_attempts += 1
             source = self._resolve_recall(program_id, source_ref_value)
             trial = {
                 "sources": tuple(_source_entry(item) for item in (*items, source))
