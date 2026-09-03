@@ -963,8 +963,13 @@ class ContextCompiler:
         evidence: EvidenceRepository | None = None,
         capabilities: CapabilityRepository | None = None,
     ):
-        if evidence is not None and evidence._host_store is not contexts._host_store:
-            raise InvalidRequest("Context Evidence repository must share the Host store")
+        if evidence is not None:
+            if evidence._host_store is not contexts._host_store:
+                raise InvalidRequest("Context Evidence repository must share the Host store")
+            if contexts._evidence is not evidence:
+                raise InvalidRequest(
+                    "Context Compiler Evidence repository must match the Context repository"
+                )
         if capabilities is not None and capabilities._host_store is not contexts._host_store:
             raise InvalidRequest("Context Capability repository must share the Host store")
         self._contexts = contexts
