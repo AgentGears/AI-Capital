@@ -253,6 +253,60 @@ class ContextRepository:
                 """
             )
 
+            self._host_store._db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS context_recall_event_index (
+                    sequence INTEGER PRIMARY KEY,
+                    event_id TEXT NOT NULL UNIQUE,
+                    program_id TEXT,
+                    event_type TEXT NOT NULL,
+                    event_digest TEXT NOT NULL,
+                    FOREIGN KEY(sequence) REFERENCES events(sequence)
+                )
+                """
+            )
+            self._host_store._db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS context_recall_event_program_sequence
+                ON context_recall_event_index(program_id, sequence)
+                """
+            )
+            self._host_store._db.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS context_recall_event_index_insert
+                AFTER INSERT ON events
+                BEGIN
+                    INSERT INTO context_recall_event_index(
+                        sequence, event_id, program_id, event_type, event_digest
+                    ) VALUES (
+                        NEW.sequence,
+                        NEW.event_id,
+                        COALESCE(
+                            NEW.program_id,
+                            json_extract(NEW.event_json, '$.correlation_id')
+                        ),
+                        NEW.event_type,
+                        NEW.event_digest
+                    );
+                END
+                """
+            )
+            self._host_store._db.execute("DELETE FROM context_recall_event_index")
+            self._host_store._db.execute(
+                """
+                INSERT INTO context_recall_event_index(
+                    sequence, event_id, program_id, event_type, event_digest
+                )
+                SELECT
+                    sequence,
+                    event_id,
+                    COALESCE(program_id, json_extract(event_json, '$.correlation_id')),
+                    event_type,
+                    event_digest
+                FROM events
+                """
+            )
+
             if version is None:
                 self._host_store._db.execute(
                     "INSERT INTO component_schema(component, version) VALUES (?, ?)",
@@ -738,9 +792,44 @@ class ContextRepository:
         )
 
     def _validate_recall_address(self, program_id: str, source_ref: str) -> None:
+
         if source_ref.startswith(_EVENT_REF_PREFIX):
-            event = self._event_by_id(source_ref[len(_EVENT_REF_PREFIX) :])
-            if not self._event_belongs_to_program(event, program_id):
+            event_id = source_ref[len(_EVENT_REF_PREFIX) :]
+            row = self._host_store._db.execute(
+                """
+                SELECT
+                    events.sequence,
+                    events.program_id AS event_program_id,
+                    events.event_type,
+                    events.event_digest,
+                    context_recall_event_index.sequence AS indexed_sequence,
+                    context_recall_event_index.program_id AS indexed_program_id,
+                    context_recall_event_index.event_type AS indexed_event_type,
+                    context_recall_event_index.event_digest AS indexed_event_digest
+                FROM events
+                LEFT JOIN context_recall_event_index
+                  ON context_recall_event_index.event_id = events.event_id
+                WHERE events.event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise InvalidRequest(
+                    f"unknown durable Context address: {event_ref(event_id)}"
+                )
+            if row["indexed_sequence"] is None:
+                raise IntegrityViolation("Event recall address lacks durable metadata index")
+            if (
+                int(row["indexed_sequence"]) != int(row["sequence"])
+                or row["indexed_event_type"] != row["event_type"]
+                or row["indexed_event_digest"] != row["event_digest"]
+                or (
+                    row["event_program_id"] is not None
+                    and row["indexed_program_id"] != row["event_program_id"]
+                )
+            ):
+                raise IntegrityViolation("Event recall metadata index diverges from Event row")
+            if row["indexed_program_id"] != program_id:
                 raise InvalidRequest("historical Event belongs to a different Program")
             return
         if source_ref.startswith(_EVIDENCE_REF_PREFIX):
