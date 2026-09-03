@@ -765,6 +765,12 @@ class ContextRepository:
         if len(set(source_refs)) != len(source_refs):
             raise InvalidRequest("bounded recall does not accept duplicate source addresses")
 
+        minimum_units = _canonical_units({"sources": tuple()})
+        if max_units < minimum_units:
+            raise ContextBudgetExceeded(
+                "bounded recall budget cannot fit the empty Context envelope"
+            )
+
         ordered_refs = tuple(sorted(source_refs))
         items: list[ContextSource] = []
         included: list[str] = []
