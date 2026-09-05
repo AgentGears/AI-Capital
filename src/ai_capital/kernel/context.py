@@ -51,6 +51,18 @@ _PERSISTABLE_PRIORITIES = frozenset(
         ContextPriority.ADVISORY_MEMORY,
     }
 )
+_PROGRAM_CORRELATION_EVENT_PREFIXES = (
+    "context.",
+    "operation.",
+    "completion.",
+    "verification.",
+)
+
+
+def _correlation_identifies_program(event_type: str) -> bool:
+    return event_type.startswith(_PROGRAM_CORRELATION_EVENT_PREFIXES)
+
+
 _PRIORITY_ORDER = {
     ContextPriority.HOST_CONTROL: 0,
     ContextPriority.CURRENT_PROGRAM: 1,
@@ -348,8 +360,11 @@ class ContextRepository:
                 )
 
             self._host_store._db.execute(
+                "DROP TRIGGER IF EXISTS context_recall_event_index_insert"
+            )
+            self._host_store._db.execute(
                 """
-                CREATE TRIGGER IF NOT EXISTS context_recall_event_index_insert
+                CREATE TRIGGER context_recall_event_index_insert
                 AFTER INSERT ON events
                 BEGIN
                     INSERT INTO context_recall_event_index(
@@ -357,10 +372,15 @@ class ContextRepository:
                     ) VALUES (
                         NEW.sequence,
                         NEW.event_id,
-                        COALESCE(
-                            NEW.program_id,
-                            json_extract(NEW.event_json, '$.correlation_id')
-                        ),
+                        CASE
+                            WHEN NEW.program_id IS NOT NULL THEN NEW.program_id
+                            WHEN NEW.event_type LIKE 'context.%'
+                              OR NEW.event_type LIKE 'operation.%'
+                              OR NEW.event_type LIKE 'completion.%'
+                              OR NEW.event_type LIKE 'verification.%'
+                            THEN json_extract(NEW.event_json, '$.correlation_id')
+                            ELSE NULL
+                        END,
                         NEW.event_type,
                         NEW.event_digest
                     );
@@ -376,7 +396,15 @@ class ContextRepository:
                 SELECT
                     sequence,
                     event_id,
-                    COALESCE(program_id, json_extract(event_json, '$.correlation_id')),
+                    CASE
+                        WHEN program_id IS NOT NULL THEN program_id
+                        WHEN event_type LIKE 'context.%'
+                          OR event_type LIKE 'operation.%'
+                          OR event_type LIKE 'completion.%'
+                          OR event_type LIKE 'verification.%'
+                        THEN json_extract(event_json, '$.correlation_id')
+                        ELSE NULL
+                    END,
                     event_type,
                     event_digest
                 FROM events
@@ -1049,7 +1077,10 @@ class ContextRepository:
         )
 
     def _event_belongs_to_program(self, event: Event, program_id: str) -> bool:
-        return event.program_id == program_id or event.correlation_id == program_id
+        return event.program_id == program_id or (
+            _correlation_identifies_program(event.event_type)
+            and event.correlation_id == program_id
+        )
 
     def _historical_event_source(self, event: Event, program_id: str) -> ContextSource:
         if not self._event_belongs_to_program(event, program_id):
@@ -1135,6 +1166,11 @@ class ContextRepository:
                 )
             ):
                 raise IntegrityViolation("Event recall metadata index diverges from Event row")
+            if (
+                row["event_program_id"] is None
+                and not _correlation_identifies_program(str(row["event_type"]))
+            ):
+                raise InvalidRequest("historical Event has no Program ownership binding")
             if row["indexed_program_id"] != program_id:
                 raise InvalidRequest("historical Event belongs to a different Program")
             return
