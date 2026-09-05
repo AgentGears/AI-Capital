@@ -27,7 +27,7 @@ from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "bounded_context"
-_COMPONENT_SCHEMA_VERSION = 1
+_COMPONENT_SCHEMA_VERSION = 2
 _EVENT_REF_PREFIX = "event:"
 _EVIDENCE_REF_PREFIX = "evidence:"
 _CAPABILITY_REF_PREFIX = "capability_snapshot:"
@@ -154,6 +154,32 @@ def _canonical_units(value: object) -> int:
     return len(canonical_json(value).encode("utf-8"))
 
 
+def _persisted_source_projection_digest(
+    *,
+    sequence: int,
+    event_id: str,
+    program_id: str,
+    program_revision: int,
+    priority: str,
+    source_digest: str,
+    payload_units: int,
+    event_digest: str,
+) -> str:
+    return canonical_digest(
+        {
+            "projection": "context.persisted_source_preflight",
+            "sequence": sequence,
+            "event_id": event_id,
+            "program_id": program_id,
+            "program_revision": program_revision,
+            "priority": priority,
+            "source_digest": source_digest,
+            "payload_units": payload_units,
+            "event_digest": event_digest,
+        }
+    )
+
+
 def _source_entry(source: ContextSource) -> dict[str, object]:
     return {
         "source_ref": source.source_ref,
@@ -221,7 +247,7 @@ class ContextRepository:
                     f"Context schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Context schema version {version}")
 
             self._host_store._db.execute(
@@ -292,6 +318,7 @@ class ContextRepository:
                     source_digest TEXT NOT NULL,
                     payload_units INTEGER NOT NULL,
                     event_digest TEXT NOT NULL,
+                    projection_digest TEXT NOT NULL,
                     FOREIGN KEY(sequence) REFERENCES events(sequence)
                 )
                 """
@@ -302,6 +329,23 @@ class ContextRepository:
                 ON context_persisted_source_index(program_id, priority, event_id)
                 """
             )
+
+            persisted_source_columns = {
+                str(column["name"])
+                for column in self._host_store._db.execute(
+                    "PRAGMA table_info(context_persisted_source_index)"
+                ).fetchall()
+            }
+            if version == 1 and "projection_digest" not in persisted_source_columns:
+                self._host_store._db.execute(
+                    "ALTER TABLE context_persisted_source_index "
+                    "ADD COLUMN projection_digest TEXT"
+                )
+                persisted_source_columns.add("projection_digest")
+            if "projection_digest" not in persisted_source_columns:
+                raise IntegrityViolation(
+                    "persisted Context source schema lacks projection authentication"
+                )
 
             self._host_store._db.execute(
                 """
@@ -345,6 +389,11 @@ class ContextRepository:
                 self._host_store._db.execute(
                     "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                     (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
+                )
+            elif version == 1:
+                self._host_store._db.execute(
+                    "UPDATE component_schema SET version = ? WHERE component = ?",
+                    (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
                 )
 
             # Context receipts are rebuildable projections over semantic Events.
@@ -558,13 +607,24 @@ class ContextRepository:
                 event,
                 expected_program_id=event.correlation_id,
             )
+            payload_units = _canonical_units(persisted.payload)
+            projection_digest = _persisted_source_projection_digest(
+                sequence=event.sequence,
+                event_id=event.event_id,
+                program_id=persisted.program_id,
+                program_revision=persisted.program_revision,
+                priority=persisted.priority.value,
+                source_digest=persisted.source_digest,
+                payload_units=payload_units,
+                event_digest=event.digest,
+            )
             try:
                 self._host_store._db.execute(
                     """
                     INSERT INTO context_persisted_source_index(
                         sequence, event_id, program_id, program_revision, priority,
-                        source_digest, payload_units, event_digest
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        source_digest, payload_units, event_digest, projection_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.sequence,
@@ -573,8 +633,9 @@ class ContextRepository:
                         persisted.program_revision,
                         persisted.priority.value,
                         persisted.source_digest,
-                        _canonical_units(persisted.payload),
+                        payload_units,
                         event.digest,
+                        projection_digest,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -723,13 +784,24 @@ class ContextRepository:
                 {"source": source},
                 program_id=program_id,
             )
+            payload_units = _canonical_units(source.payload)
+            projection_digest = _persisted_source_projection_digest(
+                sequence=event.sequence,
+                event_id=event.event_id,
+                program_id=source.program_id,
+                program_revision=source.program_revision,
+                priority=source.priority.value,
+                source_digest=source.source_digest,
+                payload_units=payload_units,
+                event_digest=event.digest,
+            )
             try:
                 self._host_store._db.execute(
                     """
                     INSERT INTO context_persisted_source_index(
                         sequence, event_id, program_id, program_revision, priority,
-                        source_digest, payload_units, event_digest
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        source_digest, payload_units, event_digest, projection_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.sequence,
@@ -738,8 +810,9 @@ class ContextRepository:
                         source.program_revision,
                         source.priority.value,
                         source.source_digest,
-                        _canonical_units(source.payload),
+                        payload_units,
                         event.digest,
+                        projection_digest,
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -827,7 +900,8 @@ class ContextRepository:
                 context_persisted_source_index.priority AS indexed_priority,
                 context_persisted_source_index.source_digest AS indexed_source_digest,
                 context_persisted_source_index.payload_units AS indexed_payload_units,
-                context_persisted_source_index.event_digest AS indexed_event_digest
+                context_persisted_source_index.event_digest AS indexed_event_digest,
+                context_persisted_source_index.projection_digest AS indexed_projection_digest
             FROM events
             LEFT JOIN context_persisted_source_index
               ON context_persisted_source_index.event_id = events.event_id
@@ -845,30 +919,66 @@ class ContextRepository:
             raise InvalidRequest(
                 "Context source reference does not identify persisted source"
             )
+        try:
+            indexed_sequence = int(row["indexed_sequence"])
+            event_sequence = int(row["event_sequence"])
+            indexed_program_revision = int(row["indexed_program_revision"])
+            indexed_payload_units = int(row["indexed_payload_units"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("persisted Context source metadata is malformed") from exc
+        indexed_event_id = row["indexed_event_id"]
+        indexed_program_id = row["indexed_program_id"]
+        indexed_priority = row["indexed_priority"]
+        indexed_source_digest = row["indexed_source_digest"]
+        indexed_event_digest = row["indexed_event_digest"]
+        indexed_projection_digest = row["indexed_projection_digest"]
         if (
             row["event_type"] != "context.source_persisted"
-            or int(row["indexed_sequence"]) != int(row["event_sequence"])
-            or row["indexed_event_digest"] != row["semantic_event_digest"]
+            or indexed_sequence != event_sequence
+            or indexed_event_id != event_id
+            or indexed_event_digest != row["semantic_event_digest"]
         ):
             raise IntegrityViolation(
                 "persisted Context source metadata diverges from Event row"
             )
-        if row["indexed_program_id"] != program_id:
+        if (
+            type(indexed_program_id) is not str
+            or not indexed_program_id.strip()
+            or type(indexed_priority) is not str
+            or type(indexed_source_digest) is not str
+            or not indexed_source_digest.strip()
+            or type(indexed_event_digest) is not str
+            or not indexed_event_digest.strip()
+            or type(indexed_projection_digest) is not str
+            or not indexed_projection_digest.strip()
+            or indexed_program_revision < 0
+            or indexed_payload_units < _canonical_units({})
+        ):
+            raise IntegrityViolation("persisted Context source metadata is invalid")
+        expected_projection_digest = _persisted_source_projection_digest(
+            sequence=indexed_sequence,
+            event_id=indexed_event_id,
+            program_id=indexed_program_id,
+            program_revision=indexed_program_revision,
+            priority=indexed_priority,
+            source_digest=indexed_source_digest,
+            payload_units=indexed_payload_units,
+            event_digest=indexed_event_digest,
+        )
+        if indexed_projection_digest != expected_projection_digest:
+            raise IntegrityViolation(
+                "persisted Context source metadata authentication mismatch"
+            )
+        if indexed_program_id != program_id:
             raise InvalidRequest("persisted Context source belongs to a different Program")
         try:
-            priority = ContextPriority(str(row["indexed_priority"]))
-            program_revision = int(row["indexed_program_revision"])
-            payload_units = int(row["indexed_payload_units"])
-        except (TypeError, ValueError) as exc:
-            raise IntegrityViolation("persisted Context source metadata is malformed") from exc
-        source_digest = row["indexed_source_digest"]
-        if (
-            priority not in _PERSISTABLE_PRIORITIES
-            or program_revision < 0
-            or payload_units < _canonical_units({})
-            or type(source_digest) is not str
-            or not source_digest.strip()
-        ):
+            priority = ContextPriority(indexed_priority)
+        except ValueError as exc:
+            raise IntegrityViolation("persisted Context source priority is invalid") from exc
+        program_revision = indexed_program_revision
+        payload_units = indexed_payload_units
+        source_digest = indexed_source_digest
+        if priority not in _PERSISTABLE_PRIORITIES:
             raise IntegrityViolation("persisted Context source metadata is invalid")
         return _PersistedSourcePreflight(
             source_ref=source_ref,
