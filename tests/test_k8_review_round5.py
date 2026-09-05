@@ -53,8 +53,8 @@ class K8ReviewRound5Tests(unittest.TestCase):
                         max_units=128,
                     )
 
-                self.assertEqual(resolve.call_count, 1)
-                self.assertEqual(artifact.call_count, 1)
+                self.assertEqual(resolve.call_count, 0)
+                self.assertEqual(artifact.call_count, 0)
                 self.assertEqual(result.included_refs, ())
                 self.assertEqual(result.excluded_refs, tuple(sorted(requested)))
                 self.assertIs(result.completeness, ContextCompleteness.TRUNCATED)

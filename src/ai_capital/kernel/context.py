@@ -1222,6 +1222,40 @@ class ContextRepository:
             return source
         raise InvalidRequest(f"unsupported durable recall address: {source_ref}")
 
+    def _recall_materialization_lower_bound(self, source_ref: str) -> int:
+        if source_ref.startswith(_EVIDENCE_REF_PREFIX):
+            if self._evidence is None:
+                raise InvalidRequest("Evidence recall requires the Host Evidence repository")
+            evidence_id = source_ref[len(_EVIDENCE_REF_PREFIX) :]
+            row = self._evidence._row(evidence_id)
+            artifact = self._host_store._db.execute(
+                "SELECT byte_length FROM evidence_artifacts WHERE artifact_digest = ?",
+                (row["artifact_digest"],),
+            ).fetchone()
+            if artifact is None:
+                raise IntegrityViolation("Evidence artifact metadata is missing")
+            byte_length = int(artifact["byte_length"])
+            if byte_length <= 0:
+                raise IntegrityViolation("Evidence artifact byte length is invalid")
+            return 4 * ((byte_length + 2) // 3)
+        if source_ref.startswith(_CONTEXT_RECEIPT_PREFIX):
+            row = self._host_store._db.execute(
+                "SELECT length(CAST(context_json AS BLOB)) AS context_bytes FROM context_receipts WHERE context_receipt_id = ?",
+                (source_ref,),
+            ).fetchone()
+            if row is None:
+                raise InvalidRequest(f"unknown ContextReceipt: {source_ref}")
+            return int(row["context_bytes"])
+        if source_ref.startswith(_EVENT_REF_PREFIX):
+            event_id = source_ref[len(_EVENT_REF_PREFIX) :]
+            persisted = self._host_store._db.execute(
+                "SELECT payload_units FROM context_persisted_source_index WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if persisted is not None:
+                return int(persisted["payload_units"])
+        return 0
+
     def recall(
         self,
         program_id: str,
@@ -1255,6 +1289,13 @@ class ContextRepository:
                 excluded.append(source_ref_value)
                 continue
             materialization_attempts += 1
+            lower_bound = self._recall_materialization_lower_bound(source_ref_value)
+            current_units = _canonical_units(
+                {"sources": tuple(_source_entry(item) for item in items)}
+            )
+            if current_units + lower_bound > max_units:
+                excluded.append(source_ref_value)
+                continue
             source = self._resolve_recall(program_id, source_ref_value)
             trial = {
                 "sources": tuple(_source_entry(item) for item in (*items, source))
@@ -1609,6 +1650,18 @@ class ContextCompiler:
 
         program = self._host_store.get(program_id)
         program_source = self._contexts.current_program_source(program_id)
+        evidence_source_refs = tuple(
+            evidence_ref(evidence_id) for evidence_id in evidence_refs
+        )
+        requested_source_ids = (
+            [program_source.source_ref]
+            + list(source_refs)
+            + list(evidence_source_refs)
+            + list(recalled_refs)
+        )
+        if len(set(requested_source_ids)) != len(requested_source_ids):
+            raise InvalidRequest("Context compilation contains duplicate durable sources")
+
         persisted_preflights = tuple(
             self._contexts._persisted_source_preflight(program_id, source_ref_value)
             for source_ref_value in source_refs
@@ -1633,17 +1686,12 @@ class ContextCompiler:
             )
             recalled_sources = self._sort_sources(list(recall_result.items))
 
-        evidence_source_refs = tuple(
-            evidence_ref(evidence_id) for evidence_id in evidence_refs
-        )
         source_ids = (
             [program_source.source_ref]
             + [preflight.source_ref for preflight in persisted_preflights]
             + [source.source_ref for source in recalled_sources]
             + list(evidence_source_refs)
         )
-        if len(set(source_ids)) != len(source_ids):
-            raise InvalidRequest("Context compilation contains duplicate durable sources")
 
         capability_ref_value, capability_payload = self._capability_context(
             capability_snapshot
