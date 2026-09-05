@@ -1222,7 +1222,11 @@ class ContextRepository:
             return source
         raise InvalidRequest(f"unsupported durable recall address: {source_ref}")
 
-    def _recall_materialization_lower_bound(self, source_ref: str) -> int:
+    def _recall_materialization_lower_bound(
+        self,
+        program_id: str,
+        source_ref: str,
+    ) -> int:
         if source_ref.startswith(_EVIDENCE_REF_PREFIX):
             if self._evidence is None:
                 raise InvalidRequest("Evidence recall requires the Host Evidence repository")
@@ -1240,20 +1244,55 @@ class ContextRepository:
             return 4 * ((byte_length + 2) // 3)
         if source_ref.startswith(_CONTEXT_RECEIPT_PREFIX):
             row = self._host_store._db.execute(
-                "SELECT length(CAST(context_json AS BLOB)) AS context_bytes FROM context_receipts WHERE context_receipt_id = ?",
+                """
+                SELECT
+                    length(CAST(context_json AS BLOB)) AS context_bytes,
+                    length(CAST(receipt_json AS BLOB)) AS receipt_bytes,
+                    used_units
+                FROM context_receipts
+                WHERE context_receipt_id = ?
+                """,
                 (source_ref,),
             ).fetchone()
             if row is None:
                 raise InvalidRequest(f"unknown ContextReceipt: {source_ref}")
-            return int(row["context_bytes"])
+            try:
+                context_bytes = int(row["context_bytes"])
+                receipt_bytes = int(row["receipt_bytes"])
+                used_units = int(row["used_units"])
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation("ContextReceipt size metadata is malformed") from exc
+            if context_bytes <= 0 or receipt_bytes <= 0 or used_units < 0:
+                raise IntegrityViolation("ContextReceipt size metadata is invalid")
+            return context_bytes + receipt_bytes + len(str(used_units))
         if source_ref.startswith(_EVENT_REF_PREFIX):
             event_id = source_ref[len(_EVENT_REF_PREFIX) :]
             persisted = self._host_store._db.execute(
-                "SELECT payload_units FROM context_persisted_source_index WHERE event_id = ?",
+                "SELECT event_id FROM context_persisted_source_index WHERE event_id = ?",
                 (event_id,),
             ).fetchone()
             if persisted is not None:
-                return int(persisted["payload_units"])
+                return self._persisted_source_preflight(
+                    program_id,
+                    source_ref,
+                ).payload_units
+            row = self._host_store._db.execute(
+                """
+                SELECT length(CAST(event_json AS BLOB)) AS event_bytes
+                FROM events
+                WHERE event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise InvalidRequest(f"unknown durable Context address: {source_ref}")
+            try:
+                event_bytes = int(row["event_bytes"])
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation("Event size metadata is malformed") from exc
+            if event_bytes <= 0:
+                raise IntegrityViolation("Event size metadata is invalid")
+            return event_bytes
         return 0
 
     def recall(
@@ -1289,7 +1328,9 @@ class ContextRepository:
                 excluded.append(source_ref_value)
                 continue
             materialization_attempts += 1
-            lower_bound = self._recall_materialization_lower_bound(source_ref_value)
+            lower_bound = self._recall_materialization_lower_bound(
+                program_id, source_ref_value
+            )
             current_units = _canonical_units(
                 {"sources": tuple(_source_entry(item) for item in items)}
             )
