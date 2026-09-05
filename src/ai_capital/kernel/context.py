@@ -19,9 +19,9 @@ from .errors import (
     StaleProgramRevision,
 )
 from .events import event_digest_fields, utc_now, verify_event_digest
-from .evidence_store import EvidenceRepository
+from .evidence_store import EvidenceAdmissionReceipt, EvidenceRepository
 from .frozen_json import FrozenMap, freeze_json
-from .models import CapabilitySnapshot, ContextReceipt, Event
+from .models import CapabilitySnapshot, ContextReceipt, Event, Evidence
 from .schema_codec import record_from_json, record_to_json
 from .serialization import canonical_digest, canonical_json, to_canonical_data
 
@@ -317,7 +317,7 @@ class ContextRepository:
             # Rebuilding on process start makes projection loss recoverable while the
             # exact Event history remains the durable authority.
             self._rebuild_receipt_projection()
-            self._validate_receipt_alignment()
+            self.audit_integrity()
 
     def _append_event(
         self,
@@ -606,6 +606,10 @@ class ContextRepository:
             )
         for row in receipt_rows:
             self.get(str(row["context_receipt_id"]))
+
+    def audit_integrity(self) -> None:
+        """Run the full Host-wide Context receipt alignment audit explicitly."""
+        self._validate_receipt_alignment()
 
     def persist_source(
         self,
@@ -953,7 +957,6 @@ class ContextRepository:
             raise ContextBudgetExceeded("compiled Context exceeds its receipted budget")
 
         with self._host_store._transaction():
-            self._validate_receipt_alignment()
             current = self._host_store.get(receipt.program_id)
             if current.revision != receipt.program_revision:
                 raise StaleProgramRevision(
@@ -1068,7 +1071,6 @@ class ContextRepository:
         receipt: ContextReceipt,
         context: Mapping[str, object] | FrozenMap,
     ) -> CompiledContext:
-        self._validate_receipt_alignment()
         durable = self.get(receipt.context_receipt_id)
         frozen = freeze_json(context)
         if not isinstance(frozen, FrozenMap):
@@ -1080,7 +1082,6 @@ class ContextRepository:
         return durable
 
     def receipts_for_program(self, program_id: str) -> tuple[ContextReceipt, ...]:
-        self._validate_receipt_alignment()
         rows = self._host_store._db.execute(
             """
             SELECT context_receipt_id FROM context_receipt_event_index
@@ -1117,17 +1118,91 @@ class ContextCompiler:
         self._evidence = evidence
         self._capabilities = capabilities
 
-    def _current_evidence_source(self, evidence_id: str) -> ContextSource:
+    def _current_evidence_preflight(self, evidence_id: str) -> tuple[Evidence, int]:
         if self._evidence is None:
             raise InvalidRequest("current Evidence Context requires the Evidence repository")
-        evidence = self._evidence.get(evidence_id)
+        row = self._evidence._row(evidence_id)
+        try:
+            evidence = record_from_json(Evidence, row["evidence_json"])
+            admission = record_from_json(
+                EvidenceAdmissionReceipt,
+                row["admission_json"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("Evidence record cannot be preflighted") from exc
+        if not isinstance(evidence, Evidence) or not isinstance(
+            admission, EvidenceAdmissionReceipt
+        ):
+            raise IntegrityViolation("Evidence preflight decoded wrong type")
+        if (
+            evidence.evidence_id != row["evidence_id"]
+            or evidence.digest != row["artifact_digest"]
+            or canonical_digest(evidence) != row["evidence_record_digest"]
+            or canonical_digest(admission) != row["admission_digest"]
+            or admission.evidence_id != evidence.evidence_id
+            or admission.artifact_digest != evidence.digest
+        ):
+            raise IntegrityViolation("Evidence preflight record binding mismatch")
+        self._evidence._validate_evidence(evidence)
         if evidence.currentness != "current":
             raise ContextIncomplete(
                 f"Evidence is not current and cannot enter current-evidence Context: {evidence_id}"
             )
-        artifact = self._evidence.artifact(evidence_id)
+
+        artifact = self._host_store._db.execute(
+            """
+            SELECT content_ref, byte_length
+            FROM evidence_artifacts WHERE artifact_digest = ?
+            """,
+            (evidence.digest,),
+        ).fetchone()
+        if artifact is None:
+            raise IntegrityViolation("Evidence artifact metadata is missing")
+        byte_length = int(artifact["byte_length"])
+        if byte_length <= 0 or artifact["content_ref"] != evidence.content_ref:
+            raise IntegrityViolation("Evidence artifact metadata binding mismatch")
+        artifact_path = self._evidence._artifact_path(evidence.digest)
+        try:
+            stored_length = artifact_path.stat().st_size
+        except FileNotFoundError as exc:
+            raise IntegrityViolation("Evidence artifact is missing") from exc
+        except OSError as exc:
+            raise IntegrityViolation("Evidence artifact metadata cannot be read") from exc
+        if stored_length != byte_length:
+            raise IntegrityViolation("Evidence artifact byte length mismatch")
+
+        indexed = self._host_store._db.execute(
+            """
+            SELECT
+                evidence_event_index.sequence AS indexed_sequence,
+                evidence_event_index.evidence_id AS indexed_evidence_id,
+                evidence_event_index.event_type AS indexed_event_type,
+                events.sequence AS event_sequence,
+                events.event_id AS semantic_event_id,
+                events.event_type AS semantic_event_type
+            FROM evidence_event_index
+            JOIN events ON events.event_id = evidence_event_index.event_id
+            WHERE evidence_event_index.event_id = ?
+            """,
+            (row["admitted_event_id"],),
+        ).fetchone()
+        if (
+            indexed is None
+            or int(indexed["indexed_sequence"]) != int(indexed["event_sequence"])
+            or indexed["indexed_evidence_id"] != evidence.evidence_id
+            or indexed["indexed_event_type"] != "evidence.admitted"
+            or indexed["semantic_event_id"] != row["admitted_event_id"]
+            or indexed["semantic_event_type"] != "evidence.admitted"
+        ):
+            raise IntegrityViolation("Evidence preflight Event binding mismatch")
+        return evidence, byte_length
+
+    def _current_evidence_source(self, evidence: Evidence) -> ContextSource:
+        if self._evidence is None:
+            raise InvalidRequest("current Evidence Context requires the Evidence repository")
+        artifact = self._evidence.artifact(evidence.evidence_id)
         return _make_source(
-            source_ref=evidence_ref(evidence_id),
+            source_ref=evidence_ref(evidence.evidence_id),
             priority=ContextPriority.CURRENT_EVIDENCE,
             payload={
                 "evidence": to_canonical_data(evidence),
@@ -1207,9 +1282,6 @@ class ContextCompiler:
                 )
             sources.append(source)
 
-        for evidence_id in evidence_refs:
-            sources.append(self._current_evidence_source(evidence_id))
-
         recall_result: RecallResult | None = None
         if recalled_refs:
             recall_result = self._contexts.recall(
@@ -1220,7 +1292,12 @@ class ContextCompiler:
             )
             sources.extend(recall_result.items)
 
-        source_ids = [source.source_ref for source in sources]
+        evidence_source_refs = tuple(
+            evidence_ref(evidence_id) for evidence_id in evidence_refs
+        )
+        source_ids = [source.source_ref for source in sources] + list(
+            evidence_source_refs
+        )
         if len(set(source_ids)) != len(source_ids):
             raise InvalidRequest("Context compilation contains duplicate durable sources")
 
@@ -1256,6 +1333,40 @@ class ContextCompiler:
                 )
             included_sources.append(source)
             included_refs.append(source.source_ref)
+
+        for evidence_id in sorted(evidence_refs):
+            evidence, byte_length = self._current_evidence_preflight(evidence_id)
+            source_ref_value = evidence_ref(evidence_id)
+            shell = _make_source(
+                source_ref=source_ref_value,
+                priority=ContextPriority.CURRENT_EVIDENCE,
+                payload={
+                    "evidence": to_canonical_data(evidence),
+                    "content_base64": "",
+                },
+            )
+            encoded_length = 4 * ((byte_length + 2) // 3)
+            shell_trial = self._build_context(
+                [*included_sources, shell],
+                capability_payload,
+            )
+            predicted_units = _canonical_units(shell_trial) + encoded_length
+            if predicted_units > budget_units:
+                excluded_refs.append(source_ref_value)
+                continue
+
+            source = self._current_evidence_source(evidence)
+            trial = self._build_context(
+                [*included_sources, source],
+                capability_payload,
+            )
+            actual_units = _canonical_units(trial)
+            if actual_units != predicted_units:
+                raise IntegrityViolation(
+                    "Evidence Context size preflight diverges from materialized source"
+                )
+            included_sources.append(source)
+            included_refs.append(source_ref_value)
 
         for source in optional:
             trial = self._build_context(
