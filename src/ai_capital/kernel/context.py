@@ -1241,7 +1241,11 @@ class ContextRepository:
             byte_length = int(artifact["byte_length"])
             if byte_length <= 0:
                 raise IntegrityViolation("Evidence artifact byte length is invalid")
-            return 4 * ((byte_length + 2) // 3)
+            return (
+                int(row["evidence_json_bytes"])
+                + int(row["admission_json_bytes"])
+                + 4 * ((byte_length + 2) // 3)
+            )
         if source_ref.startswith(_CONTEXT_RECEIPT_PREFIX):
             row = self._host_store._db.execute(
                 """
@@ -1892,7 +1896,11 @@ class ContextCompiler:
             current_units = _canonical_units(
                 self._build_context(included_sources, capability_payload)
             )
-            metadata_lower_bound = int(metadata["evidence_json_bytes"]) + encoded_length
+            metadata_lower_bound = (
+                int(metadata["evidence_json_bytes"])
+                + int(metadata["admission_json_bytes"])
+                + encoded_length
+            )
             if current_units + metadata_lower_bound > budget_units:
                 excluded_refs.append(source_ref_value)
                 continue
