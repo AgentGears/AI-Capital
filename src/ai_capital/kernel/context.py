@@ -88,6 +88,16 @@ class PersistedContextSource:
 
 
 @dataclass(frozen=True, slots=True)
+class _PersistedSourcePreflight:
+    source_ref: str
+    program_id: str
+    program_revision: int
+    priority: ContextPriority
+    source_digest: str
+    payload_units: int
+
+
+@dataclass(frozen=True, slots=True)
 class ContextSource:
     source_ref: str
     priority: ContextPriority
@@ -273,6 +283,28 @@ class ContextRepository:
             )
             self._host_store._db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS context_persisted_source_index (
+                    sequence INTEGER PRIMARY KEY,
+                    event_id TEXT NOT NULL UNIQUE,
+                    program_id TEXT NOT NULL,
+                    program_revision INTEGER NOT NULL,
+                    priority TEXT NOT NULL,
+                    source_digest TEXT NOT NULL,
+                    payload_units INTEGER NOT NULL,
+                    event_digest TEXT NOT NULL,
+                    FOREIGN KEY(sequence) REFERENCES events(sequence)
+                )
+                """
+            )
+            self._host_store._db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS context_persisted_source_program_priority
+                ON context_persisted_source_index(program_id, priority, event_id)
+                """
+            )
+
+            self._host_store._db.execute(
+                """
                 CREATE TRIGGER IF NOT EXISTS context_recall_event_index_insert
                 AFTER INSERT ON events
                 BEGIN
@@ -306,6 +338,8 @@ class ContextRepository:
                 FROM events
                 """
             )
+
+            self._rebuild_persisted_source_projection()
 
             if version is None:
                 self._host_store._db.execute(
@@ -508,6 +542,46 @@ class ContextRepository:
             raise IntegrityViolation("compiled Context exceeds its receipted budget")
         return receipt, context, used_units
 
+    def _rebuild_persisted_source_projection(self) -> None:
+        self._host_store._db.execute("DELETE FROM context_persisted_source_index")
+        rows = self._host_store._db.execute(
+            """
+            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+            FROM events WHERE event_type = 'context.source_persisted' ORDER BY sequence
+            """
+        ).fetchall()
+        for row in rows:
+            event = self._decode_event_row(row)
+            if not event.correlation_id:
+                raise IntegrityViolation("persisted Context source Event lacks Program binding")
+            persisted, _ = self._source_from_persisted_event(
+                event,
+                expected_program_id=event.correlation_id,
+            )
+            try:
+                self._host_store._db.execute(
+                    """
+                    INSERT INTO context_persisted_source_index(
+                        sequence, event_id, program_id, program_revision, priority,
+                        source_digest, payload_units, event_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.sequence,
+                        event.event_id,
+                        persisted.program_id,
+                        persisted.program_revision,
+                        persisted.priority.value,
+                        persisted.source_digest,
+                        _canonical_units(persisted.payload),
+                        event.digest,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise IntegrityViolation(
+                    "persisted Context source projection rebuild collided"
+                ) from exc
+
     def _semantic_receipts(self) -> dict[str, tuple[Event, ContextReceipt, FrozenMap, int]]:
         rows = self._host_store._db.execute(
             """
@@ -649,6 +723,29 @@ class ContextRepository:
                 {"source": source},
                 program_id=program_id,
             )
+            try:
+                self._host_store._db.execute(
+                    """
+                    INSERT INTO context_persisted_source_index(
+                        sequence, event_id, program_id, program_revision, priority,
+                        source_digest, payload_units, event_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.sequence,
+                        event.event_id,
+                        source.program_id,
+                        source.program_revision,
+                        source.priority.value,
+                        source.source_digest,
+                        _canonical_units(source.payload),
+                        event.digest,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise PersistenceConflict(
+                    "persisted Context source metadata identity collision"
+                ) from exc
         return event_ref(event.event_id)
 
     def _source_from_persisted_event(
@@ -708,6 +805,101 @@ class ContextRepository:
             expected_program_id=program_id,
         )
         return persisted.program_revision
+
+    def _persisted_source_preflight(
+        self,
+        program_id: str,
+        source_ref: str,
+    ) -> _PersistedSourcePreflight:
+        if not source_ref.startswith(_EVENT_REF_PREFIX):
+            raise InvalidRequest("persisted Context source must use an Event address")
+        event_id = source_ref[len(_EVENT_REF_PREFIX) :]
+        row = self._host_store._db.execute(
+            """
+            SELECT
+                events.sequence AS event_sequence,
+                events.event_type AS event_type,
+                events.event_digest AS semantic_event_digest,
+                context_persisted_source_index.sequence AS indexed_sequence,
+                context_persisted_source_index.event_id AS indexed_event_id,
+                context_persisted_source_index.program_id AS indexed_program_id,
+                context_persisted_source_index.program_revision AS indexed_program_revision,
+                context_persisted_source_index.priority AS indexed_priority,
+                context_persisted_source_index.source_digest AS indexed_source_digest,
+                context_persisted_source_index.payload_units AS indexed_payload_units,
+                context_persisted_source_index.event_digest AS indexed_event_digest
+            FROM events
+            LEFT JOIN context_persisted_source_index
+              ON context_persisted_source_index.event_id = events.event_id
+            WHERE events.event_id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise InvalidRequest(f"unknown durable Context address: {source_ref}")
+        if row["indexed_event_id"] is None:
+            if row["event_type"] == "context.source_persisted":
+                raise IntegrityViolation(
+                    "persisted Context source lacks durable metadata projection"
+                )
+            raise InvalidRequest(
+                "Context source reference does not identify persisted source"
+            )
+        if (
+            row["event_type"] != "context.source_persisted"
+            or int(row["indexed_sequence"]) != int(row["event_sequence"])
+            or row["indexed_event_digest"] != row["semantic_event_digest"]
+        ):
+            raise IntegrityViolation(
+                "persisted Context source metadata diverges from Event row"
+            )
+        if row["indexed_program_id"] != program_id:
+            raise InvalidRequest("persisted Context source belongs to a different Program")
+        try:
+            priority = ContextPriority(str(row["indexed_priority"]))
+            program_revision = int(row["indexed_program_revision"])
+            payload_units = int(row["indexed_payload_units"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("persisted Context source metadata is malformed") from exc
+        source_digest = row["indexed_source_digest"]
+        if (
+            priority not in _PERSISTABLE_PRIORITIES
+            or program_revision < 0
+            or payload_units < _canonical_units({})
+            or type(source_digest) is not str
+            or not source_digest.strip()
+        ):
+            raise IntegrityViolation("persisted Context source metadata is invalid")
+        return _PersistedSourcePreflight(
+            source_ref=source_ref,
+            program_id=program_id,
+            program_revision=program_revision,
+            priority=priority,
+            source_digest=source_digest,
+            payload_units=payload_units,
+        )
+
+    def _materialize_persisted_source(
+        self,
+        program_id: str,
+        preflight: _PersistedSourcePreflight,
+    ) -> ContextSource:
+        event = self._event_by_id(preflight.source_ref[len(_EVENT_REF_PREFIX) :])
+        persisted, source = self._source_from_persisted_event(
+            event,
+            expected_program_id=program_id,
+        )
+        if (
+            persisted.program_id != preflight.program_id
+            or persisted.program_revision != preflight.program_revision
+            or persisted.priority is not preflight.priority
+            or persisted.source_digest != preflight.source_digest
+            or _canonical_units(persisted.payload) != preflight.payload_units
+        ):
+            raise IntegrityViolation(
+                "persisted Context source materialization diverges from preflight"
+            )
+        return source
 
     def current_program_source(self, program_id: str) -> ContextSource:
         self._host_store.verify_integrity(program_id)
@@ -1266,23 +1458,26 @@ class ContextCompiler:
     ) -> CompiledContext:
         if budget_units <= 0:
             raise ContextBudgetExceeded("Context budget must be positive")
+        if len(set(source_refs)) != len(source_refs):
+            raise InvalidRequest("Context compilation contains duplicate durable sources")
+
         program = self._host_store.get(program_id)
         program_source = self._contexts.current_program_source(program_id)
-
-        sources: list[ContextSource] = [program_source]
-        for source_ref_value in source_refs:
-            source = self._contexts.persisted_source(program_id, source_ref_value)
+        persisted_preflights = tuple(
+            self._contexts._persisted_source_preflight(program_id, source_ref_value)
+            for source_ref_value in source_refs
+        )
+        for preflight in persisted_preflights:
             if (
-                source.priority is ContextPriority.HOST_CONTROL
-                and self._contexts.persisted_source_revision(program_id, source_ref_value)
-                != program.revision
+                preflight.priority is ContextPriority.HOST_CONTROL
+                and preflight.program_revision != program.revision
             ):
                 raise ContextIncomplete(
                     "Host control Context source is stale for current Program revision"
                 )
-            sources.append(source)
 
         recall_result: RecallResult | None = None
+        recalled_sources: list[ContextSource] = []
         if recalled_refs:
             recall_result = self._contexts.recall(
                 program_id,
@@ -1290,13 +1485,16 @@ class ContextCompiler:
                 max_items=recall_max_items,
                 max_units=budget_units if recall_max_units is None else recall_max_units,
             )
-            sources.extend(recall_result.items)
+            recalled_sources = self._sort_sources(list(recall_result.items))
 
         evidence_source_refs = tuple(
             evidence_ref(evidence_id) for evidence_id in evidence_refs
         )
-        source_ids = [source.source_ref for source in sources] + list(
-            evidence_source_refs
+        source_ids = (
+            [program_source.source_ref]
+            + [preflight.source_ref for preflight in persisted_preflights]
+            + [source.source_ref for source in recalled_sources]
+            + list(evidence_source_refs)
         )
         if len(set(source_ids)) != len(source_ids):
             raise InvalidRequest("Context compilation contains duplicate durable sources")
@@ -1307,14 +1505,22 @@ class ContextCompiler:
         if capability_ref_value is not None and capability_ref_value in source_ids:
             raise InvalidRequest("Capability snapshot Context identity collides with source")
 
-        ordered = self._sort_sources(sources)
-        mandatory = [
-            source
-            for source in ordered
-            if source.priority
-            in {ContextPriority.HOST_CONTROL, ContextPriority.CURRENT_PROGRAM}
-        ]
-        optional = [source for source in ordered if source not in mandatory]
+        ordered_preflights = sorted(
+            persisted_preflights,
+            key=lambda item: (_PRIORITY_ORDER[item.priority], item.source_ref),
+        )
+        host_controls = tuple(
+            item for item in ordered_preflights
+            if item.priority is ContextPriority.HOST_CONTROL
+        )
+        recent_sources = tuple(
+            item for item in ordered_preflights
+            if item.priority is ContextPriority.RECENT_INTERACTION
+        )
+        advisory_sources = tuple(
+            item for item in ordered_preflights
+            if item.priority is ContextPriority.ADVISORY_MEMORY
+        )
 
         included_sources: list[ContextSource] = []
         included_refs: list[str] = []
@@ -1322,17 +1528,69 @@ class ContextCompiler:
         if capability_ref_value is not None:
             included_refs.append(capability_ref_value)
 
-        for source in mandatory:
+        def consider_persisted(
+            preflight: _PersistedSourcePreflight,
+            *,
+            mandatory: bool,
+        ) -> None:
+            currentness, authority, historical = _PRIORITY_SEMANTICS[preflight.priority]
+            empty_payload = freeze_json({})
+            assert isinstance(empty_payload, FrozenMap)
+            shell = ContextSource(
+                source_ref=preflight.source_ref,
+                priority=preflight.priority,
+                payload=empty_payload,
+                source_digest=preflight.source_digest,
+                currentness=currentness,
+                authority=authority,
+                historical=historical,
+            )
+            shell_trial = self._build_context(
+                [*included_sources, shell],
+                capability_payload,
+            )
+            predicted_units = (
+                _canonical_units(shell_trial)
+                - _canonical_units(empty_payload)
+                + preflight.payload_units
+            )
+            if predicted_units > budget_units:
+                if mandatory:
+                    raise ContextBudgetExceeded(
+                        "Context budget cannot fit mandatory Host control/current Program sources"
+                    )
+                excluded_refs.append(preflight.source_ref)
+                return
+
+            source = self._contexts._materialize_persisted_source(
+                program_id,
+                preflight,
+            )
             trial = self._build_context(
                 [*included_sources, source],
                 capability_payload,
             )
-            if _canonical_units(trial) > budget_units:
-                raise ContextBudgetExceeded(
-                    "Context budget cannot fit mandatory Host control/current Program sources"
+            actual_units = _canonical_units(trial)
+            if actual_units != predicted_units:
+                raise IntegrityViolation(
+                    "persisted Context source size preflight diverges from materialization"
                 )
             included_sources.append(source)
             included_refs.append(source.source_ref)
+
+        for preflight in host_controls:
+            consider_persisted(preflight, mandatory=True)
+
+        program_trial = self._build_context(
+            [*included_sources, program_source],
+            capability_payload,
+        )
+        if _canonical_units(program_trial) > budget_units:
+            raise ContextBudgetExceeded(
+                "Context budget cannot fit mandatory Host control/current Program sources"
+            )
+        included_sources.append(program_source)
+        included_refs.append(program_source.source_ref)
 
         for evidence_id in sorted(evidence_refs):
             evidence, byte_length = self._current_evidence_preflight(evidence_id)
@@ -1368,7 +1626,10 @@ class ContextCompiler:
             included_sources.append(source)
             included_refs.append(source_ref_value)
 
-        for source in optional:
+        for preflight in recent_sources:
+            consider_persisted(preflight, mandatory=False)
+
+        for source in recalled_sources:
             trial = self._build_context(
                 [*included_sources, source],
                 capability_payload,
@@ -1378,6 +1639,9 @@ class ContextCompiler:
                 continue
             included_sources.append(source)
             included_refs.append(source.source_ref)
+
+        for preflight in advisory_sources:
+            consider_persisted(preflight, mandatory=False)
 
         if recall_result is not None:
             for ref in recall_result.excluded_refs:
