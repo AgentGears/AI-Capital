@@ -1178,7 +1178,7 @@ class ContextRepository:
             if self._evidence is None:
                 raise InvalidRequest("Evidence recall requires the Host Evidence repository")
             evidence_id = source_ref[len(_EVIDENCE_REF_PREFIX) :]
-            self._evidence._row(evidence_id)
+            self._evidence._metadata_row(evidence_id)
             return
         if source_ref.startswith(_CONTEXT_RECEIPT_PREFIX):
             row = self._host_store._db.execute(
@@ -1231,7 +1231,7 @@ class ContextRepository:
             if self._evidence is None:
                 raise InvalidRequest("Evidence recall requires the Host Evidence repository")
             evidence_id = source_ref[len(_EVIDENCE_REF_PREFIX) :]
-            row = self._evidence._row(evidence_id)
+            row = self._evidence._metadata_row(evidence_id)
             artifact = self._host_store._db.execute(
                 "SELECT byte_length FROM evidence_artifacts WHERE artifact_digest = ?",
                 (row["artifact_digest"],),
@@ -1538,10 +1538,67 @@ class ContextCompiler:
         self._evidence = evidence
         self._capabilities = capabilities
 
+    def _current_evidence_metadata_preflight(
+        self, evidence_id: str
+    ) -> tuple[sqlite3.Row, int]:
+        if self._evidence is None:
+            raise InvalidRequest("current Evidence Context requires the Evidence repository")
+        row = self._evidence._metadata_row(evidence_id)
+        artifact = self._host_store._db.execute(
+            """
+            SELECT content_ref, byte_length
+            FROM evidence_artifacts WHERE artifact_digest = ?
+            """,
+            (row["artifact_digest"],),
+        ).fetchone()
+        if artifact is None:
+            raise IntegrityViolation("Evidence artifact metadata is missing")
+        try:
+            byte_length = int(artifact["byte_length"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("Evidence artifact byte length is malformed") from exc
+        if byte_length <= 0:
+            raise IntegrityViolation("Evidence artifact byte length is invalid")
+
+        indexed = self._host_store._db.execute(
+            """
+            SELECT
+                evidence_event_index.sequence AS indexed_sequence,
+                evidence_event_index.evidence_id AS indexed_evidence_id,
+                evidence_event_index.event_type AS indexed_event_type,
+                events.sequence AS event_sequence,
+                events.event_id AS semantic_event_id,
+                events.event_type AS semantic_event_type
+            FROM evidence_event_index
+            JOIN events ON events.event_id = evidence_event_index.event_id
+            WHERE evidence_event_index.event_id = ?
+            """,
+            (row["admitted_event_id"],),
+        ).fetchone()
+        if (
+            indexed is None
+            or int(indexed["indexed_sequence"]) != int(indexed["event_sequence"])
+            or indexed["indexed_evidence_id"] != row["evidence_id"]
+            or indexed["indexed_event_type"] != "evidence.admitted"
+            or indexed["semantic_event_id"] != row["admitted_event_id"]
+            or indexed["semantic_event_type"] != "evidence.admitted"
+        ):
+            raise IntegrityViolation("Evidence preflight Event binding mismatch")
+        return row, byte_length
+
     def _current_evidence_preflight(self, evidence_id: str) -> tuple[Evidence, int]:
         if self._evidence is None:
             raise InvalidRequest("current Evidence Context requires the Evidence repository")
+        metadata, byte_length = self._current_evidence_metadata_preflight(evidence_id)
         row = self._evidence._row(evidence_id)
+        if (
+            row["evidence_id"] != metadata["evidence_id"]
+            or row["artifact_digest"] != metadata["artifact_digest"]
+            or row["admitted_event_id"] != metadata["admitted_event_id"]
+            or row["evidence_record_digest"] != metadata["evidence_record_digest"]
+            or row["admission_digest"] != metadata["admission_digest"]
+        ):
+            raise IntegrityViolation("Evidence metadata changed during preflight")
         try:
             evidence = record_from_json(Evidence, row["evidence_json"])
             admission = record_from_json(
@@ -1576,10 +1633,11 @@ class ContextCompiler:
             """,
             (evidence.digest,),
         ).fetchone()
-        if artifact is None:
-            raise IntegrityViolation("Evidence artifact metadata is missing")
-        byte_length = int(artifact["byte_length"])
-        if byte_length <= 0 or artifact["content_ref"] != evidence.content_ref:
+        if (
+            artifact is None
+            or int(artifact["byte_length"]) != byte_length
+            or artifact["content_ref"] != evidence.content_ref
+        ):
             raise IntegrityViolation("Evidence artifact metadata binding mismatch")
         artifact_path = self._evidence._artifact_path(evidence.digest)
         try:
@@ -1828,8 +1886,19 @@ class ContextCompiler:
         included_refs.append(program_source.source_ref)
 
         for evidence_id in sorted(evidence_refs):
-            evidence, byte_length = self._current_evidence_preflight(evidence_id)
+            metadata, byte_length = self._current_evidence_metadata_preflight(evidence_id)
             source_ref_value = evidence_ref(evidence_id)
+            encoded_length = 4 * ((byte_length + 2) // 3)
+            current_units = _canonical_units(
+                self._build_context(included_sources, capability_payload)
+            )
+            metadata_lower_bound = int(metadata["evidence_json_bytes"]) + encoded_length
+            if current_units + metadata_lower_bound > budget_units:
+                excluded_refs.append(source_ref_value)
+                continue
+            evidence, verified_byte_length = self._current_evidence_preflight(evidence_id)
+            if verified_byte_length != byte_length:
+                raise IntegrityViolation("Evidence byte length changed during preflight")
             shell = _make_source(
                 source_ref=source_ref_value,
                 priority=ContextPriority.CURRENT_EVIDENCE,
@@ -1838,7 +1907,6 @@ class ContextCompiler:
                     "content_base64": "",
                 },
             )
-            encoded_length = 4 * ((byte_length + 2) // 3)
             shell_trial = self._build_context(
                 [*included_sources, shell],
                 capability_payload,

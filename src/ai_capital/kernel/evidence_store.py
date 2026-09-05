@@ -569,6 +569,28 @@ class EvidenceRepository:
             ) from exc
         return evidence
 
+    def _metadata_row(self, evidence_id: str) -> sqlite3.Row:
+        row = self._host_store._db.execute(
+            """
+            SELECT evidence_id, artifact_digest, admitted_event_id,
+                   evidence_record_digest, admission_digest,
+                   length(CAST(evidence_json AS BLOB)) AS evidence_json_bytes,
+                   length(CAST(admission_json AS BLOB)) AS admission_json_bytes
+            FROM evidence_records WHERE evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+        if row is None:
+            raise EvidenceMissing(f"unknown Evidence: {evidence_id}")
+        try:
+            evidence_json_bytes = int(row["evidence_json_bytes"])
+            admission_json_bytes = int(row["admission_json_bytes"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("Evidence metadata lengths are malformed") from exc
+        if evidence_json_bytes <= 0 or admission_json_bytes <= 0:
+            raise IntegrityViolation("Evidence metadata lengths are invalid")
+        return row
+
     def _row(self, evidence_id: str) -> sqlite3.Row:
         row = self._host_store._db.execute(
             """
