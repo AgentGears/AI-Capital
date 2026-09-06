@@ -1365,8 +1365,10 @@ class ContextRepository:
                 raise InvalidRequest("Evidence recall requires the Host Evidence repository")
             evidence_id = source_ref[len(_EVIDENCE_REF_PREFIX) :]
             row = self._evidence._metadata_row(evidence_id)
+            artifact_digest = str(row["artifact_digest"])
             byte_length = self._evidence._artifact_preflight(
-                str(row["artifact_digest"])
+                artifact_digest,
+                expected_content_ref=self._evidence._content_ref(artifact_digest),
             )
             return (
                 int(row["evidence_json_bytes"])
@@ -1679,8 +1681,10 @@ class ContextCompiler:
             raise ContextIncomplete(
                 f"Evidence is not current and cannot enter current-evidence Context: {evidence_id}"
             )
+        artifact_digest = str(row["artifact_digest"])
         byte_length = self._evidence._artifact_preflight(
-            str(row["artifact_digest"])
+            artifact_digest,
+            expected_content_ref=self._evidence._content_ref(artifact_digest),
         )
 
         indexed = self._host_store._db.execute(
