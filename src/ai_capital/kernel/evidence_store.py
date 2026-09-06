@@ -460,11 +460,59 @@ class EvidenceRepository:
             if temporary.exists():
                 temporary.unlink()
 
-    def _read_artifact(self, artifact_digest: str, *, expected_length: int) -> bytes:
+    def _artifact_stored_length(self, artifact_digest: str) -> int:
         path = self._artifact_path(artifact_digest)
-        if not path.exists():
-            raise IntegrityViolation("Evidence artifact is missing")
-        content = path.read_bytes()
+        try:
+            stored_length = path.stat().st_size
+        except FileNotFoundError as exc:
+            raise IntegrityViolation("Evidence artifact is missing") from exc
+        except OSError as exc:
+            raise IntegrityViolation("Evidence artifact metadata cannot be read") from exc
+        if stored_length <= 0:
+            raise IntegrityViolation("Evidence artifact byte length is invalid")
+        return stored_length
+
+    def _artifact_preflight(
+        self,
+        artifact_digest: str,
+        *,
+        expected_content_ref: str | None = None,
+    ) -> int:
+        row = self._host_store._db.execute(
+            """
+            SELECT content_ref, byte_length FROM evidence_artifacts
+            WHERE artifact_digest = ?
+            """,
+            (artifact_digest,),
+        ).fetchone()
+        if row is None:
+            raise IntegrityViolation("Evidence artifact metadata is missing")
+        try:
+            expected_length = int(row["byte_length"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("Evidence artifact byte length is malformed") from exc
+        if expected_length <= 0:
+            raise IntegrityViolation("Evidence artifact byte length is invalid")
+        if (
+            expected_content_ref is not None
+            and row["content_ref"] != expected_content_ref
+        ):
+            raise IntegrityViolation("Evidence artifact content reference mismatch")
+        if self._artifact_stored_length(artifact_digest) != expected_length:
+            raise IntegrityViolation("Evidence artifact byte length mismatch")
+        return expected_length
+
+    def _read_artifact(self, artifact_digest: str, *, expected_length: int) -> bytes:
+        if expected_length <= 0:
+            raise IntegrityViolation("Evidence artifact byte length is invalid")
+        path = self._artifact_path(artifact_digest)
+        if self._artifact_stored_length(artifact_digest) != expected_length:
+            raise IntegrityViolation("Evidence artifact byte length mismatch")
+        try:
+            with path.open("rb") as handle:
+                content = handle.read(expected_length + 1)
+        except OSError as exc:
+            raise IntegrityViolation("Evidence artifact cannot be read") from exc
         if len(content) != expected_length:
             raise IntegrityViolation("Evidence artifact byte length mismatch")
         if self._artifact_digest(content) != artifact_digest:

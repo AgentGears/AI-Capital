@@ -324,6 +324,26 @@ class CapabilityRepository:
             )
         return snapshot
 
+    def _snapshot_metadata(self, snapshot_id: str) -> tuple[str, int]:
+        row = self._host_store._db.execute(
+            """
+            SELECT snapshot_digest,
+                   length(CAST(snapshot_json AS BLOB)) AS snapshot_units
+            FROM capability_snapshots WHERE snapshot_id = ?
+            """,
+            (snapshot_id,),
+        ).fetchone()
+        if row is None:
+            raise InvalidRequest(f"unknown Capability snapshot: {snapshot_id}")
+        digest = row["snapshot_digest"]
+        try:
+            units = int(row["snapshot_units"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("Capability snapshot size metadata is malformed") from exc
+        if type(digest) is not str or not digest.strip() or units <= 0:
+            raise IntegrityViolation("Capability snapshot metadata is invalid")
+        return digest, units
+
     def get_snapshot(self, snapshot_id: str) -> CapabilitySnapshot:
         row = self._host_store._db.execute(
             """

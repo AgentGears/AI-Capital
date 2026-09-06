@@ -123,6 +123,14 @@ class _CurrentProgramPreflight:
 
 
 @dataclass(frozen=True, slots=True)
+class _CapabilitySnapshotPreflight:
+    source_ref: str
+    snapshot_id: str
+    snapshot_digest: str
+    payload_units: int
+
+
+@dataclass(frozen=True, slots=True)
 class ContextSource:
     source_ref: str
     priority: ContextPriority
@@ -1357,15 +1365,9 @@ class ContextRepository:
                 raise InvalidRequest("Evidence recall requires the Host Evidence repository")
             evidence_id = source_ref[len(_EVIDENCE_REF_PREFIX) :]
             row = self._evidence._metadata_row(evidence_id)
-            artifact = self._host_store._db.execute(
-                "SELECT byte_length FROM evidence_artifacts WHERE artifact_digest = ?",
-                (row["artifact_digest"],),
-            ).fetchone()
-            if artifact is None:
-                raise IntegrityViolation("Evidence artifact metadata is missing")
-            byte_length = int(artifact["byte_length"])
-            if byte_length <= 0:
-                raise IntegrityViolation("Evidence artifact byte length is invalid")
+            byte_length = self._evidence._artifact_preflight(
+                str(row["artifact_digest"])
+            )
             return (
                 int(row["evidence_json_bytes"])
                 + int(row["admission_json_bytes"])
@@ -1677,21 +1679,9 @@ class ContextCompiler:
             raise ContextIncomplete(
                 f"Evidence is not current and cannot enter current-evidence Context: {evidence_id}"
             )
-        artifact = self._host_store._db.execute(
-            """
-            SELECT content_ref, byte_length
-            FROM evidence_artifacts WHERE artifact_digest = ?
-            """,
-            (row["artifact_digest"],),
-        ).fetchone()
-        if artifact is None:
-            raise IntegrityViolation("Evidence artifact metadata is missing")
-        try:
-            byte_length = int(artifact["byte_length"])
-        except (TypeError, ValueError) as exc:
-            raise IntegrityViolation("Evidence artifact byte length is malformed") from exc
-        if byte_length <= 0:
-            raise IntegrityViolation("Evidence artifact byte length is invalid")
+        byte_length = self._evidence._artifact_preflight(
+            str(row["artifact_digest"])
+        )
 
         indexed = self._host_store._db.execute(
             """
@@ -1822,25 +1812,71 @@ class ContextCompiler:
             },
         )
 
+    def _capability_preflight(
+        self,
+        capability_snapshot: CapabilitySnapshot | None,
+    ) -> _CapabilitySnapshotPreflight | None:
+        if capability_snapshot is None:
+            return None
+        if self._capabilities is None:
+            raise InvalidRequest(
+                "Capability snapshot Context requires the Host Capability repository"
+            )
+        durable_digest, durable_units = self._capabilities._snapshot_metadata(
+            capability_snapshot.snapshot_id
+        )
+        supplied_digest = canonical_digest(capability_snapshot)
+        supplied_units = _canonical_units(capability_snapshot)
+        if durable_digest != supplied_digest or durable_units != supplied_units:
+            raise IntegrityViolation(
+                "Capability snapshot metadata differs from supplied Context source"
+            )
+        return _CapabilitySnapshotPreflight(
+            source_ref=f"{_CAPABILITY_REF_PREFIX}{capability_snapshot.snapshot_id}",
+            snapshot_id=capability_snapshot.snapshot_id,
+            snapshot_digest=durable_digest,
+            payload_units=durable_units,
+        )
+
     def _capability_context(
         self,
         capability_snapshot: CapabilitySnapshot | None,
+        *,
+        preflight: _CapabilitySnapshotPreflight | None = None,
     ) -> tuple[str | None, object | None]:
         if capability_snapshot is None:
+            if preflight is not None:
+                raise IntegrityViolation("Capability preflight exists without a snapshot")
             return None, None
         if self._capabilities is None:
             raise InvalidRequest(
                 "Capability snapshot Context requires the Host Capability repository"
             )
+        preflight = (
+            self._capability_preflight(capability_snapshot)
+            if preflight is None
+            else preflight
+        )
+        if (
+            preflight.snapshot_id != capability_snapshot.snapshot_id
+            or preflight.source_ref
+            != f"{_CAPABILITY_REF_PREFIX}{capability_snapshot.snapshot_id}"
+        ):
+            raise IntegrityViolation("Capability snapshot preflight identity mismatch")
         durable = self._capabilities.get_snapshot(capability_snapshot.snapshot_id)
         if durable != capability_snapshot:
             raise IntegrityViolation(
                 "Capability snapshot differs from durable Host Context source"
             )
-        return (
-            f"{_CAPABILITY_REF_PREFIX}{durable.snapshot_id}",
-            to_canonical_data(durable),
-        )
+        payload = to_canonical_data(durable)
+        if (
+            canonical_digest(durable) != preflight.snapshot_digest
+            or _canonical_units(payload) != preflight.payload_units
+        ):
+            raise IntegrityViolation(
+                "Capability snapshot materialization diverges from size preflight"
+            )
+        return (preflight.source_ref, payload)
 
     @staticmethod
     def _sort_sources(sources: list[ContextSource]) -> list[ContextSource]:
@@ -1943,10 +1979,31 @@ class ContextCompiler:
             for recalled_ref in sorted(recalled_refs):
                 self._contexts._validate_recall_address(program_id, recalled_ref)
 
+        capability_preflight = self._capability_preflight(capability_snapshot)
+        if capability_preflight is not None:
+            empty_capability_payload = freeze_json({})
+            assert isinstance(empty_capability_payload, FrozenMap)
+            capability_shell_trial = self._build_context(
+                [program_shell],
+                empty_capability_payload,
+            )
+            minimum_program_units = (
+                _canonical_units(capability_shell_trial)
+                - _canonical_units(empty_program_payload)
+                + program_preflight.payload_units
+                - _canonical_units(empty_capability_payload)
+                + capability_preflight.payload_units
+            )
+
         if minimum_program_units > budget_units:
             raise ContextBudgetExceeded(
                 "Context budget cannot fit mandatory Host control/current Program sources"
             )
+
+        capability_ref_value, capability_payload = self._capability_context(
+            capability_snapshot,
+            preflight=capability_preflight,
+        )
 
         recall_result: RecallResult | None = None
         recalled_sources: list[ContextSource] = []
@@ -1966,9 +2023,6 @@ class ContextCompiler:
             + list(evidence_source_refs)
         )
 
-        capability_ref_value, capability_payload = self._capability_context(
-            capability_snapshot
-        )
         if capability_ref_value is not None and capability_ref_value in source_ids:
             raise InvalidRequest("Capability snapshot Context identity collides with source")
 
