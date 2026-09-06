@@ -1902,11 +1902,6 @@ class ContextCompiler:
             - _canonical_units(empty_program_payload)
             + program_preflight.payload_units
         )
-        if minimum_program_units > budget_units:
-            raise ContextBudgetExceeded(
-                "Context budget cannot fit mandatory Host control/current Program sources"
-            )
-
         evidence_source_refs = tuple(
             evidence_ref(evidence_id) for evidence_id in evidence_refs
         )
@@ -1931,6 +1926,27 @@ class ContextCompiler:
                 raise ContextIncomplete(
                     "Host control Context source is stale for current Program revision"
                 )
+
+        if recalled_refs:
+            effective_recall_units = (
+                budget_units if recall_max_units is None else recall_max_units
+            )
+            if recall_max_items <= 0 or effective_recall_units <= 0:
+                raise InvalidRequest(
+                    "bounded recall requires positive item and size limits"
+                )
+            minimum_recall_units = _canonical_units({"sources": tuple()})
+            if effective_recall_units < minimum_recall_units:
+                raise ContextBudgetExceeded(
+                    "bounded recall budget cannot fit the empty Context envelope"
+                )
+            for recalled_ref in sorted(recalled_refs):
+                self._contexts._validate_recall_address(program_id, recalled_ref)
+
+        if minimum_program_units > budget_units:
+            raise ContextBudgetExceeded(
+                "Context budget cannot fit mandatory Host control/current Program sources"
+            )
 
         recall_result: RecallResult | None = None
         recalled_sources: list[ContextSource] = []

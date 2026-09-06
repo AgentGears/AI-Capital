@@ -12,6 +12,7 @@ from ai_capital.kernel.errors import (
     ContextBudgetExceeded,
     ContextIncomplete,
     IntegrityViolation,
+    InvalidRequest,
 )
 from ai_capital.kernel.evidence_store import EvidenceRepository
 from ai_capital.kernel.models import Program
@@ -57,6 +58,55 @@ class K8ReviewRound14Tests(unittest.TestCase):
                     with self.assertRaises(ContextBudgetExceeded):
                         compiler.compile(program.program_id, budget_units=128)
                 get_program.assert_not_called()
+            finally:
+                programs.close()
+
+    def test_duplicate_validation_precedes_oversized_program_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            programs = ProgramRepository(Path(directory) / "host.db")
+            try:
+                program = programs.create(Program("p-large", 0, "x" * 131072))
+                evidence = EvidenceRepository(programs)
+                item = evidence.admit(
+                    content=b"small",
+                    source_class="test",
+                    observed_at="2026-01-01T00:00:00Z",
+                    provenance=("test",),
+                    trust_class="test",
+                    currentness="current",
+                )
+                contexts = ContextRepository(programs, evidence)
+                compiler = ContextCompiler(contexts, evidence=evidence)
+                ref = f"evidence:{item.evidence_id}"
+                with patch.object(
+                    contexts,
+                    "recall",
+                    side_effect=AssertionError("duplicate request reached recall"),
+                ) as recall:
+                    with self.assertRaises(InvalidRequest):
+                        compiler.compile(
+                            program.program_id,
+                            budget_units=128,
+                            evidence_refs=(item.evidence_id,),
+                            recalled_refs=(ref,),
+                        )
+                recall.assert_not_called()
+            finally:
+                programs.close()
+
+    def test_invalid_recall_address_precedes_oversized_program_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            programs = ProgramRepository(Path(directory) / "host.db")
+            try:
+                program = programs.create(Program("p-large", 0, "x" * 131072))
+                contexts = ContextRepository(programs)
+                compiler = ContextCompiler(contexts)
+                with self.assertRaises(InvalidRequest):
+                    compiler.compile(
+                        program.program_id,
+                        budget_units=128,
+                        recalled_refs=("event:missing",),
+                    )
             finally:
                 programs.close()
 
