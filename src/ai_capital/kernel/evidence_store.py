@@ -17,8 +17,30 @@ from .serialization import canonical_digest, to_canonical_data
 
 
 _COMPONENT = "evidence_store"
-_COMPONENT_SCHEMA_VERSION = 2
+_COMPONENT_SCHEMA_VERSION = 3
 _ARTIFACT_PREFIX = "evidence-artifact:"
+
+
+def _evidence_metadata_projection_digest(
+    *,
+    evidence_id: str,
+    artifact_digest: str,
+    admitted_event_id: str,
+    evidence_record_digest: str,
+    admission_digest: str,
+    currentness: str,
+) -> str:
+    return canonical_digest(
+        {
+            "projection": "evidence.context_metadata",
+            "evidence_id": evidence_id,
+            "artifact_digest": artifact_digest,
+            "admitted_event_id": admitted_event_id,
+            "evidence_record_digest": evidence_record_digest,
+            "admission_digest": admission_digest,
+            "currentness": currentness,
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,7 +220,7 @@ class EvidenceRepository:
                     f"Evidence schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, 1, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, 2, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Evidence schema version {version}")
 
             if version is None:
@@ -221,6 +243,8 @@ class EvidenceRepository:
                         evidence_record_digest TEXT NOT NULL,
                         admission_json TEXT NOT NULL,
                         admission_digest TEXT NOT NULL,
+                        currentness TEXT NOT NULL,
+                        metadata_projection_digest TEXT NOT NULL,
                         FOREIGN KEY(artifact_digest) REFERENCES evidence_artifacts(artifact_digest)
                     )
                     """
@@ -244,17 +268,38 @@ class EvidenceRepository:
                     ON evidence_event_index(evidence_id, sequence)
                     """
                 )
+
+            if version in {1, 2}:
+                columns = {
+                    str(column["name"])
+                    for column in self._host_store._db.execute(
+                        "PRAGMA table_info(evidence_records)"
+                    ).fetchall()
+                }
+                if "currentness" not in columns:
+                    self._host_store._db.execute(
+                        "ALTER TABLE evidence_records ADD COLUMN currentness TEXT"
+                    )
+                if "metadata_projection_digest" not in columns:
+                    self._host_store._db.execute(
+                        "ALTER TABLE evidence_records ADD COLUMN metadata_projection_digest TEXT"
+                    )
+
+            if version in {None, 1}:
                 self._rebuild_event_index()
-                if version is None:
-                    self._host_store._db.execute(
-                        "INSERT INTO component_schema(component, version) VALUES (?, ?)",
-                        (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
-                    )
-                else:
-                    self._host_store._db.execute(
-                        "UPDATE component_schema SET version = ? WHERE component = ?",
-                        (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
-                    )
+            if version in {1, 2}:
+                self._rebuild_metadata_projection()
+
+            if version is None:
+                self._host_store._db.execute(
+                    "INSERT INTO component_schema(component, version) VALUES (?, ?)",
+                    (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
+                )
+            elif version in {1, 2}:
+                self._host_store._db.execute(
+                    "UPDATE component_schema SET version = ? WHERE component = ?",
+                    (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
+                )
 
     def _decode_event_row(self, row: sqlite3.Row) -> Event:
         try:
@@ -315,6 +360,57 @@ class EvidenceRepository:
                 raise IntegrityViolation(
                     "Evidence record is not represented by the rebuilt Event index"
                 )
+
+    def _rebuild_metadata_projection(self) -> None:
+        rows = self._host_store._db.execute(
+            """
+            SELECT evidence_id, artifact_digest, admitted_event_id,
+                   evidence_json, evidence_record_digest,
+                   admission_json, admission_digest
+            FROM evidence_records
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                evidence = record_from_json(Evidence, row["evidence_json"])
+                admission = record_from_json(
+                    EvidenceAdmissionReceipt,
+                    row["admission_json"],
+                )
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation(
+                    "Evidence metadata projection source cannot be decoded"
+                ) from exc
+            if not isinstance(evidence, Evidence) or not isinstance(
+                admission, EvidenceAdmissionReceipt
+            ):
+                raise IntegrityViolation("Evidence metadata projection decoded wrong type")
+            if (
+                evidence.evidence_id != row["evidence_id"]
+                or evidence.digest != row["artifact_digest"]
+                or canonical_digest(evidence) != row["evidence_record_digest"]
+                or canonical_digest(admission) != row["admission_digest"]
+                or admission.evidence_id != evidence.evidence_id
+                or admission.artifact_digest != evidence.digest
+            ):
+                raise IntegrityViolation("Evidence metadata projection source mismatch")
+            self._validate_evidence(evidence)
+            projection_digest = _evidence_metadata_projection_digest(
+                evidence_id=evidence.evidence_id,
+                artifact_digest=evidence.digest,
+                admitted_event_id=str(row["admitted_event_id"]),
+                evidence_record_digest=str(row["evidence_record_digest"]),
+                admission_digest=str(row["admission_digest"]),
+                currentness=evidence.currentness,
+            )
+            self._host_store._db.execute(
+                """
+                UPDATE evidence_records
+                SET currentness = ?, metadata_projection_digest = ?
+                WHERE evidence_id = ?
+                """,
+                (evidence.currentness, projection_digest, evidence.evidence_id),
+            )
 
     @staticmethod
     def _parse_time(value: str, *, field: str) -> datetime:
@@ -545,22 +641,37 @@ class EvidenceRepository:
                     {"evidence": evidence, "admission": admission},
                     evidence_id=evidence.evidence_id,
                 )
+                evidence_json = record_to_json(evidence)
+                evidence_record_digest = canonical_digest(evidence)
+                admission_json = record_to_json(admission)
+                admission_digest = canonical_digest(admission)
+                metadata_projection_digest = _evidence_metadata_projection_digest(
+                    evidence_id=evidence.evidence_id,
+                    artifact_digest=artifact_digest,
+                    admitted_event_id=event.event_id,
+                    evidence_record_digest=evidence_record_digest,
+                    admission_digest=admission_digest,
+                    currentness=evidence.currentness,
+                )
                 self._host_store._db.execute(
                     """
                     INSERT INTO evidence_records(
                         evidence_id, artifact_digest, admitted_event_id,
                         evidence_json, evidence_record_digest,
-                        admission_json, admission_digest
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        admission_json, admission_digest, currentness,
+                        metadata_projection_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         evidence.evidence_id,
                         artifact_digest,
                         event.event_id,
-                        record_to_json(evidence),
-                        canonical_digest(evidence),
-                        record_to_json(admission),
-                        canonical_digest(admission),
+                        evidence_json,
+                        evidence_record_digest,
+                        admission_json,
+                        admission_digest,
+                        evidence.currentness,
+                        metadata_projection_digest,
                     ),
                 )
         except sqlite3.IntegrityError as exc:
@@ -573,7 +684,8 @@ class EvidenceRepository:
         row = self._host_store._db.execute(
             """
             SELECT evidence_id, artifact_digest, admitted_event_id,
-                   evidence_record_digest, admission_digest,
+                   evidence_record_digest, admission_digest, currentness,
+                   metadata_projection_digest,
                    length(CAST(evidence_json AS BLOB)) AS evidence_json_bytes,
                    length(CAST(admission_json AS BLOB)) AS admission_json_bytes
             FROM evidence_records WHERE evidence_id = ?
@@ -587,8 +699,27 @@ class EvidenceRepository:
             admission_json_bytes = int(row["admission_json_bytes"])
         except (TypeError, ValueError) as exc:
             raise IntegrityViolation("Evidence metadata lengths are malformed") from exc
-        if evidence_json_bytes <= 0 or admission_json_bytes <= 0:
-            raise IntegrityViolation("Evidence metadata lengths are invalid")
+        currentness = row["currentness"]
+        projection_digest = row["metadata_projection_digest"]
+        if (
+            evidence_json_bytes <= 0
+            or admission_json_bytes <= 0
+            or type(currentness) is not str
+            or not currentness.strip()
+            or type(projection_digest) is not str
+            or not projection_digest.strip()
+        ):
+            raise IntegrityViolation("Evidence metadata projection is invalid")
+        expected_projection_digest = _evidence_metadata_projection_digest(
+            evidence_id=str(row["evidence_id"]),
+            artifact_digest=str(row["artifact_digest"]),
+            admitted_event_id=str(row["admitted_event_id"]),
+            evidence_record_digest=str(row["evidence_record_digest"]),
+            admission_digest=str(row["admission_digest"]),
+            currentness=currentness,
+        )
+        if projection_digest != expected_projection_digest:
+            raise IntegrityViolation("Evidence metadata projection digest mismatch")
         return row
 
     def _row(self, evidence_id: str) -> sqlite3.Row:

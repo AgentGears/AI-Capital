@@ -27,7 +27,7 @@ from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "bounded_context"
-_COMPONENT_SCHEMA_VERSION = 2
+_COMPONENT_SCHEMA_VERSION = 3
 _EVENT_REF_PREFIX = "event:"
 _EVIDENCE_REF_PREFIX = "evidence:"
 _CAPABILITY_REF_PREFIX = "capability_snapshot:"
@@ -107,6 +107,19 @@ class _PersistedSourcePreflight:
     priority: ContextPriority
     source_digest: str
     payload_units: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CurrentProgramPreflight:
+    program_id: str
+    program_revision: int
+    source_ref: str
+    projection_digest: str
+    projection_units: int
+    payload_units: int
+    last_sequence: int
+    event_type: str
+    event_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,7 +272,7 @@ class ContextRepository:
                     f"Context schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, 1, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, 2, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Context schema version {version}")
 
             self._host_store._db.execute(
@@ -307,6 +320,7 @@ class ContextRepository:
                     sequence INTEGER PRIMARY KEY,
                     event_id TEXT NOT NULL UNIQUE,
                     program_id TEXT,
+                    correlation_id TEXT,
                     event_type TEXT NOT NULL,
                     event_digest TEXT NOT NULL,
                     FOREIGN KEY(sequence) REFERENCES events(sequence)
@@ -359,6 +373,17 @@ class ContextRepository:
                     "persisted Context source schema lacks projection authentication"
                 )
 
+            recall_event_columns = {
+                str(column["name"])
+                for column in self._host_store._db.execute(
+                    "PRAGMA table_info(context_recall_event_index)"
+                ).fetchall()
+            }
+            if "correlation_id" not in recall_event_columns:
+                self._host_store._db.execute(
+                    "ALTER TABLE context_recall_event_index ADD COLUMN correlation_id TEXT"
+                )
+
             self._host_store._db.execute(
                 "DROP TRIGGER IF EXISTS context_recall_event_index_insert"
             )
@@ -368,7 +393,8 @@ class ContextRepository:
                 AFTER INSERT ON events
                 BEGIN
                     INSERT INTO context_recall_event_index(
-                        sequence, event_id, program_id, event_type, event_digest
+                        sequence, event_id, program_id, correlation_id,
+                        event_type, event_digest
                     ) VALUES (
                         NEW.sequence,
                         NEW.event_id,
@@ -381,6 +407,7 @@ class ContextRepository:
                             THEN json_extract(NEW.event_json, '$.correlation_id')
                             ELSE NULL
                         END,
+                        json_extract(NEW.event_json, '$.correlation_id'),
                         NEW.event_type,
                         NEW.event_digest
                     );
@@ -391,7 +418,8 @@ class ContextRepository:
             self._host_store._db.execute(
                 """
                 INSERT INTO context_recall_event_index(
-                    sequence, event_id, program_id, event_type, event_digest
+                    sequence, event_id, program_id, correlation_id,
+                    event_type, event_digest
                 )
                 SELECT
                     sequence,
@@ -405,6 +433,7 @@ class ContextRepository:
                         THEN json_extract(event_json, '$.correlation_id')
                         ELSE NULL
                     END,
+                    json_extract(event_json, '$.correlation_id'),
                     event_type,
                     event_digest
                 FROM events
@@ -418,7 +447,7 @@ class ContextRepository:
                     "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                     (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
                 )
-            elif version == 1:
+            elif version in {1, 2}:
                 self._host_store._db.execute(
                     "UPDATE component_schema SET version = ? WHERE component = ?",
                     (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
@@ -1039,29 +1068,106 @@ class ContextRepository:
             )
         return source
 
-    def current_program_source(self, program_id: str) -> ContextSource:
-        self._host_store.verify_integrity(program_id)
-        program = self._host_store.get(program_id)
+    def _current_program_preflight(self, program_id: str) -> _CurrentProgramPreflight:
         row = self._host_store._db.execute(
             """
-            SELECT last_sequence FROM program_projections WHERE program_id = ?
+            SELECT
+                program_projections.program_id AS projected_program_id,
+                program_projections.revision AS projected_revision,
+                program_projections.projection_digest AS projection_digest,
+                length(CAST(program_projections.projection_json AS BLOB)) AS projection_units,
+                program_projections.last_sequence AS last_sequence,
+                events.event_id AS event_id,
+                events.program_id AS event_program_id,
+                events.event_type AS event_type,
+                events.event_digest AS event_digest
+            FROM program_projections
+            JOIN events ON events.sequence = program_projections.last_sequence
+            WHERE program_projections.program_id = ?
             """,
             (program_id,),
         ).fetchone()
         if row is None:
             raise InvalidRequest(f"unknown Program: {program_id}")
+        try:
+            revision = int(row["projected_revision"])
+            projection_units = int(row["projection_units"])
+            last_sequence = int(row["last_sequence"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("current Program preflight metadata is malformed") from exc
+        projection_digest = row["projection_digest"]
+        event_id = row["event_id"]
+        event_type = row["event_type"]
+        event_digest = row["event_digest"]
+        if (
+            row["projected_program_id"] != program_id
+            or row["event_program_id"] != program_id
+            or revision < 0
+            or projection_units <= 0
+            or last_sequence <= 0
+            or type(projection_digest) is not str
+            or not projection_digest.strip()
+            or type(event_id) is not str
+            or not event_id.strip()
+            or type(event_type) is not str
+            or not event_type.startswith("program.")
+            or type(event_digest) is not str
+            or not event_digest.strip()
+        ):
+            raise IntegrityViolation("current Program preflight metadata is invalid")
+        payload_units = (
+            projection_units
+            + _canonical_units({"program": {}})
+            - _canonical_units({})
+        )
+        return _CurrentProgramPreflight(
+            program_id=program_id,
+            program_revision=revision,
+            source_ref=event_ref(event_id),
+            projection_digest=projection_digest,
+            projection_units=projection_units,
+            payload_units=payload_units,
+            last_sequence=last_sequence,
+            event_type=event_type,
+            event_digest=event_digest,
+        )
+
+    def current_program_source(
+        self,
+        program_id: str,
+        *,
+        preflight: _CurrentProgramPreflight | None = None,
+    ) -> ContextSource:
+        preflight = (
+            self._current_program_preflight(program_id)
+            if preflight is None
+            else preflight
+        )
+        if preflight.program_id != program_id:
+            raise InvalidRequest("current Program preflight belongs to a different Program")
+        program = self._host_store.get(program_id)
+        if (
+            program.revision != preflight.program_revision
+            or canonical_digest(program) != preflight.projection_digest
+        ):
+            raise StaleProgramRevision("Program changed during Context compilation")
         event_row = self._host_store._db.execute(
             """
             SELECT sequence, event_id, program_id, event_type, event_json, event_digest
             FROM events WHERE sequence = ?
             """,
-            (int(row["last_sequence"]),),
+            (preflight.last_sequence,),
         ).fetchone()
         if event_row is None:
             raise IntegrityViolation("current Program projection lacks semantic Event")
         event = self._decode_event_row(event_row)
-        if event.program_id != program_id:
-            raise IntegrityViolation("current Program Event has wrong Program identity")
+        if (
+            event.program_id != program_id
+            or event_ref(event.event_id) != preflight.source_ref
+            or event.event_type != preflight.event_type
+            or event.digest != preflight.event_digest
+        ):
+            raise IntegrityViolation("current Program Event diverges from preflight metadata")
         try:
             payload = event.payload["program"]
         except KeyError as exc:
@@ -1070,11 +1176,14 @@ class ContextRepository:
             raise IntegrityViolation("current Program Event snapshot is malformed")
         if canonical_json(payload) != canonical_json(to_canonical_data(program)):
             raise IntegrityViolation("current Program Event differs from Program projection")
-        return _make_source(
+        source = _make_source(
             source_ref=event_ref(event.event_id),
             priority=ContextPriority.CURRENT_PROGRAM,
             payload={"program": payload},
         )
+        if _canonical_units(source.payload) != preflight.payload_units:
+            raise IntegrityViolation("current Program materialization diverges from size preflight")
+        return source
 
     def _event_belongs_to_program(self, event: Event, program_id: str) -> bool:
         return event.program_id == program_id or (
@@ -1106,12 +1215,14 @@ class ContextRepository:
             raise InvalidRequest("Evidence recall requires the Host Evidence repository")
         evidence_id = source_ref[len(_EVIDENCE_REF_PREFIX) :]
         evidence = self._evidence.get(evidence_id)
+        admission = self._evidence.admission(evidence_id)
         artifact = self._evidence.artifact(evidence_id)
         return _make_source(
             source_ref=source_ref,
             priority=ContextPriority.RECALLED_HISTORY,
             payload={
                 "evidence": to_canonical_data(evidence),
+                "admission": to_canonical_data(admission),
                 "content_base64": base64.b64encode(artifact).decode("ascii"),
             },
         )
@@ -1141,6 +1252,7 @@ class ContextRepository:
                     events.event_digest,
                     context_recall_event_index.sequence AS indexed_sequence,
                     context_recall_event_index.program_id AS indexed_program_id,
+                    context_recall_event_index.correlation_id AS indexed_correlation_id,
                     context_recall_event_index.event_type AS indexed_event_type,
                     context_recall_event_index.event_digest AS indexed_event_digest
                 FROM events
@@ -1156,6 +1268,10 @@ class ContextRepository:
                 )
             if row["indexed_sequence"] is None:
                 raise IntegrityViolation("Event recall address lacks durable metadata index")
+            scoped_correlation = (
+                row["event_program_id"] is None
+                and _correlation_identifies_program(str(row["event_type"]))
+            )
             if (
                 int(row["indexed_sequence"]) != int(row["sequence"])
                 or row["indexed_event_type"] != row["event_type"]
@@ -1164,14 +1280,23 @@ class ContextRepository:
                     row["event_program_id"] is not None
                     and row["indexed_program_id"] != row["event_program_id"]
                 )
+                or (
+                    scoped_correlation
+                    and (
+                        row["indexed_correlation_id"] is None
+                        or row["indexed_program_id"] != row["indexed_correlation_id"]
+                    )
+                )
             ):
                 raise IntegrityViolation("Event recall metadata index diverges from Event row")
-            if (
-                row["event_program_id"] is None
-                and not _correlation_identifies_program(str(row["event_type"]))
-            ):
+            if row["event_program_id"] is None and not scoped_correlation:
                 raise InvalidRequest("historical Event has no Program ownership binding")
-            if row["indexed_program_id"] != program_id:
+            expected_program_id = (
+                row["event_program_id"]
+                if row["event_program_id"] is not None
+                else row["indexed_correlation_id"]
+            )
+            if expected_program_id != program_id:
                 raise InvalidRequest("historical Event belongs to a different Program")
             return
         if source_ref.startswith(_EVIDENCE_REF_PREFIX):
@@ -1548,6 +1673,10 @@ class ContextCompiler:
         if self._evidence is None:
             raise InvalidRequest("current Evidence Context requires the Evidence repository")
         row = self._evidence._metadata_row(evidence_id)
+        if row["currentness"] != "current":
+            raise ContextIncomplete(
+                f"Evidence is not current and cannot enter current-evidence Context: {evidence_id}"
+            )
         artifact = self._host_store._db.execute(
             """
             SELECT content_ref, byte_length
@@ -1620,6 +1749,7 @@ class ContextCompiler:
             or evidence.digest != row["artifact_digest"]
             or canonical_digest(evidence) != row["evidence_record_digest"]
             or canonical_digest(admission) != row["admission_digest"]
+            or evidence.currentness != metadata["currentness"]
             or admission.evidence_id != evidence.evidence_id
             or admission.artifact_digest != evidence.digest
         ):
@@ -1751,13 +1881,37 @@ class ContextCompiler:
         if len(set(source_refs)) != len(source_refs):
             raise InvalidRequest("Context compilation contains duplicate durable sources")
 
-        program = self._host_store.get(program_id)
-        program_source = self._contexts.current_program_source(program_id)
+        program_preflight = self._contexts._current_program_preflight(program_id)
+        empty_program_payload = freeze_json({})
+        assert isinstance(empty_program_payload, FrozenMap)
+        program_currentness, program_authority, program_historical = _PRIORITY_SEMANTICS[
+            ContextPriority.CURRENT_PROGRAM
+        ]
+        program_shell = ContextSource(
+            source_ref=program_preflight.source_ref,
+            priority=ContextPriority.CURRENT_PROGRAM,
+            payload=empty_program_payload,
+            source_digest=program_preflight.projection_digest,
+            currentness=program_currentness,
+            authority=program_authority,
+            historical=program_historical,
+        )
+        minimum_program_trial = self._build_context([program_shell], None)
+        minimum_program_units = (
+            _canonical_units(minimum_program_trial)
+            - _canonical_units(empty_program_payload)
+            + program_preflight.payload_units
+        )
+        if minimum_program_units > budget_units:
+            raise ContextBudgetExceeded(
+                "Context budget cannot fit mandatory Host control/current Program sources"
+            )
+
         evidence_source_refs = tuple(
             evidence_ref(evidence_id) for evidence_id in evidence_refs
         )
         requested_source_ids = (
-            [program_source.source_ref]
+            [program_preflight.source_ref]
             + list(source_refs)
             + list(evidence_source_refs)
             + list(recalled_refs)
@@ -1772,7 +1926,7 @@ class ContextCompiler:
         for preflight in persisted_preflights:
             if (
                 preflight.priority is ContextPriority.HOST_CONTROL
-                and preflight.program_revision != program.revision
+                and preflight.program_revision != program_preflight.program_revision
             ):
                 raise ContextIncomplete(
                     "Host control Context source is stale for current Program revision"
@@ -1790,7 +1944,7 @@ class ContextCompiler:
             recalled_sources = self._sort_sources(list(recall_result.items))
 
         source_ids = (
-            [program_source.source_ref]
+            [program_preflight.source_ref]
             + [preflight.source_ref for preflight in persisted_preflights]
             + [source.source_ref for source in recalled_sources]
             + list(evidence_source_refs)
@@ -1878,13 +2032,30 @@ class ContextCompiler:
         for preflight in host_controls:
             consider_persisted(preflight, mandatory=True)
 
+        program_shell_trial = self._build_context(
+            [*included_sources, program_shell],
+            capability_payload,
+        )
+        predicted_program_units = (
+            _canonical_units(program_shell_trial)
+            - _canonical_units(empty_program_payload)
+            + program_preflight.payload_units
+        )
+        if predicted_program_units > budget_units:
+            raise ContextBudgetExceeded(
+                "Context budget cannot fit mandatory Host control/current Program sources"
+            )
+        program_source = self._contexts.current_program_source(
+            program_id,
+            preflight=program_preflight,
+        )
         program_trial = self._build_context(
             [*included_sources, program_source],
             capability_payload,
         )
-        if _canonical_units(program_trial) > budget_units:
-            raise ContextBudgetExceeded(
-                "Context budget cannot fit mandatory Host control/current Program sources"
+        if _canonical_units(program_trial) != predicted_program_units:
+            raise IntegrityViolation(
+                "current Program size preflight diverges from materialization"
             )
         included_sources.append(program_source)
         included_refs.append(program_source.source_ref)
@@ -1973,8 +2144,8 @@ class ContextCompiler:
 
         receipt = ContextReceipt(
             context_receipt_id=f"{_CONTEXT_RECEIPT_PREFIX}{uuid4()}",
-            program_id=program.program_id,
-            program_revision=program.revision,
+            program_id=program_preflight.program_id,
+            program_revision=program_preflight.program_revision,
             included_refs=tuple(included_refs),
             excluded_refs=tuple(excluded_refs),
             completeness=completeness,
