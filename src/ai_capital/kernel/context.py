@@ -1311,7 +1311,12 @@ class ContextRepository:
             if self._evidence is None:
                 raise InvalidRequest("Evidence recall requires the Host Evidence repository")
             evidence_id = source_ref[len(_EVIDENCE_REF_PREFIX) :]
-            self._evidence._metadata_row(evidence_id)
+            metadata = self._evidence._metadata_row(evidence_id)
+            artifact_digest = str(metadata["artifact_digest"])
+            self._evidence._artifact_preflight(
+                artifact_digest,
+                expected_content_ref=self._evidence._content_ref(artifact_digest),
+            )
             return
         if source_ref.startswith(_CONTEXT_RECEIPT_PREFIX):
             row = self._host_store._db.execute(
@@ -1436,7 +1441,12 @@ class ContextRepository:
         max_items: int,
         max_units: int,
     ) -> RecallResult:
-        self._host_store.get(program_id)
+        program_row = self._host_store._db.execute(
+            "SELECT program_id FROM program_projections WHERE program_id = ?",
+            (program_id,),
+        ).fetchone()
+        if program_row is None or program_row["program_id"] != program_id:
+            raise InvalidRequest(f"unknown Program: {program_id}")
         if max_items <= 0 or max_units <= 0:
             raise InvalidRequest("bounded recall requires positive item and size limits")
         if len(set(source_refs)) != len(source_refs):
