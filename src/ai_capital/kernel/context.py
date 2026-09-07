@@ -58,6 +58,7 @@ _PROGRAM_CORRELATION_EVENT_PREFIXES = (
     "verification.",
 )
 _EVENT_STORAGE_OVERHEAD_LIMIT = 4096
+_EVIDENCE_ADMISSION_STORAGE_LIMIT = 4096
 
 
 def _correlation_identifies_program(event_type: str) -> bool:
@@ -506,7 +507,7 @@ class ContextRepository:
                     "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                     (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
                 )
-            elif version in {1, 2}:
+            elif version in {1, 2, 3}:
                 self._host_store._db.execute(
                     "UPDATE component_schema SET version = ? WHERE component = ?",
                     (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
@@ -1553,7 +1554,6 @@ class ContextRepository:
                 int(row["evidence_json_bytes"])
                 + int(row["admission_json_bytes"])
                 + 4 * ((byte_length + 2) // 3)
-                + self._event_storage_units(str(row["admitted_event_id"]))
             )
         if source_ref.startswith(_CONTEXT_RECEIPT_PREFIX):
             row = self._host_store._db.execute(
@@ -1578,12 +1578,7 @@ class ContextRepository:
                 raise IntegrityViolation("ContextReceipt size metadata is malformed") from exc
             if context_bytes <= 0 or receipt_bytes <= 0 or used_units < 0:
                 raise IntegrityViolation("ContextReceipt size metadata is invalid")
-            return (
-                context_bytes
-                + receipt_bytes
-                + len(str(used_units))
-                + self._event_storage_units(str(row["compiled_event_id"]))
-            )
+            return context_bytes + receipt_bytes + len(str(used_units))
         if source_ref.startswith(_EVENT_REF_PREFIX):
             event_id = source_ref[len(_EVENT_REF_PREFIX) :]
             persisted = self._host_store._db.execute(
@@ -1613,6 +1608,47 @@ class ContextRepository:
                 raise IntegrityViolation("Event size metadata is invalid")
             return event_bytes
         return 0
+
+    def _recall_storage_preflight(self, source_ref: str) -> bool:
+        if source_ref.startswith(_EVIDENCE_REF_PREFIX):
+            if self._evidence is None:
+                raise InvalidRequest("Evidence recall requires the Host Evidence repository")
+            evidence_id = source_ref[len(_EVIDENCE_REF_PREFIX) :]
+            row = self._evidence._metadata_row(evidence_id)
+            evidence_units = int(row["evidence_json_bytes"])
+            admission_units = int(row["admission_json_bytes"])
+            if admission_units > _EVIDENCE_ADMISSION_STORAGE_LIMIT:
+                return False
+            event_units = self._event_storage_units(str(row["admitted_event_id"]))
+            return (
+                event_units
+                <= evidence_units + admission_units + _EVENT_STORAGE_OVERHEAD_LIMIT
+            )
+        if source_ref.startswith(_CONTEXT_RECEIPT_PREFIX):
+            row = self._host_store._db.execute(
+                """
+                SELECT compiled_event_id,
+                       length(CAST(context_json AS BLOB)) AS context_bytes,
+                       length(CAST(receipt_json AS BLOB)) AS receipt_bytes,
+                       used_units
+                FROM context_receipts
+                WHERE context_receipt_id = ?
+                """,
+                (source_ref,),
+            ).fetchone()
+            if row is None:
+                raise InvalidRequest(f"unknown ContextReceipt: {source_ref}")
+            try:
+                semantic_units = (
+                    int(row["context_bytes"])
+                    + int(row["receipt_bytes"])
+                    + len(str(int(row["used_units"])))
+                )
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation("ContextReceipt size metadata is malformed") from exc
+            event_units = self._event_storage_units(str(row["compiled_event_id"]))
+            return event_units <= semantic_units + _EVENT_STORAGE_OVERHEAD_LIMIT
+        return True
 
     def recall(
         self,
@@ -1652,6 +1688,9 @@ class ContextRepository:
                 excluded.append(source_ref_value)
                 continue
             materialization_attempts += 1
+            if not self._recall_storage_preflight(source_ref_value):
+                excluded.append(source_ref_value)
+                continue
             lower_bound = self._recall_materialization_lower_bound(
                 program_id, source_ref_value
             )
@@ -2347,12 +2386,20 @@ class ContextCompiler:
             current_units = _canonical_units(
                 self._build_context(included_sources, capability_payload)
             )
-            metadata_lower_bound = (
-                int(metadata["evidence_json_bytes"])
-                + int(metadata["admission_json_bytes"])
-                + encoded_length
-                + event_units
-            )
+            evidence_storage_units = int(metadata["evidence_json_bytes"])
+            admission_storage_units = int(metadata["admission_json_bytes"])
+            if admission_storage_units > _EVIDENCE_ADMISSION_STORAGE_LIMIT:
+                excluded_refs.append(source_ref_value)
+                continue
+            if (
+                event_units
+                > evidence_storage_units
+                + admission_storage_units
+                + _EVENT_STORAGE_OVERHEAD_LIMIT
+            ):
+                excluded_refs.append(source_ref_value)
+                continue
+            metadata_lower_bound = evidence_storage_units + encoded_length
             if current_units + metadata_lower_bound > budget_units:
                 excluded_refs.append(source_ref_value)
                 continue
