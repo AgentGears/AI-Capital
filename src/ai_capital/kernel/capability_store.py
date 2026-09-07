@@ -20,7 +20,7 @@ from .structured_schema import validate_schema_definition
 
 
 _COMPONENT = "capability_registry"
-_COMPONENT_SCHEMA_VERSION = 1
+_COMPONENT_SCHEMA_VERSION = 2
 _BINDING_STORAGE_OVERHEAD_LIMIT = 4096
 
 
@@ -67,9 +67,14 @@ class CapabilityRepository:
                         f"Capability schema version {version} is newer than supported "
                         f"{_COMPONENT_SCHEMA_VERSION}"
                     )
-                if version != _COMPONENT_SCHEMA_VERSION:
+                if version not in {1, _COMPONENT_SCHEMA_VERSION}:
                     raise IntegrityViolation(
                         f"unsupported Capability schema version {version}"
+                    )
+                if version == 1:
+                    self._host_store._db.execute(
+                        "UPDATE component_schema SET version = ? WHERE component = ?",
+                        (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
                     )
                 return
 
@@ -117,6 +122,15 @@ class CapabilityRepository:
             raise InvalidRequest("Capability operation and resource type must be non-empty")
         if not capability.handler_binding.strip():
             raise InvalidRequest("Capability handler binding must be non-empty")
+        if capability.binding_revision < 0:
+            raise InvalidRequest("Capability binding revision cannot be negative")
+        if new and capability.binding_revision != 0:
+            raise InvalidRequest("new Capability must begin at binding revision 0")
+        validate_schema_definition(capability.input_schema, path="$input_schema")
+        validate_schema_definition(capability.output_schema, path="$output_schema")
+
+    @staticmethod
+    def _validate_binding_storage(capability: Capability) -> None:
         descriptor_units = len(
             canonical_json(capability_descriptor(capability)).encode("utf-8")
         )
@@ -125,12 +139,6 @@ class CapabilityRepository:
             raise InvalidRequest(
                 "Capability handler binding exceeds bounded storage envelope"
             )
-        if capability.binding_revision < 0:
-            raise InvalidRequest("Capability binding revision cannot be negative")
-        if new and capability.binding_revision != 0:
-            raise InvalidRequest("new Capability must begin at binding revision 0")
-        validate_schema_definition(capability.input_schema, path="$input_schema")
-        validate_schema_definition(capability.output_schema, path="$output_schema")
 
     def _capability_from_row(self, row: sqlite3.Row) -> Capability:
         try:
@@ -169,6 +177,7 @@ class CapabilityRepository:
 
     def register(self, capability: Capability) -> Capability:
         self._validate_capability(capability, new=True)
+        self._validate_binding_storage(capability)
         encoded = record_to_json(capability)
         digest = canonical_digest(capability)
         try:
@@ -248,6 +257,7 @@ class CapabilityRepository:
                 binding_revision=current.binding_revision + 1,
             )
             self._validate_capability(updated, new=False)
+            self._validate_binding_storage(updated)
             encoded = record_to_json(updated)
             digest = canonical_digest(updated)
             self._host_store._db.execute(

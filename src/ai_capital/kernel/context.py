@@ -317,6 +317,17 @@ def _make_source(
     )
 
 
+_MIN_HOST_CONTROL_SOURCE_UNITS = _canonical_units(
+    _source_entry(
+        _make_source(
+            source_ref=event_ref("0" * 36),
+            priority=ContextPriority.HOST_CONTROL,
+            payload={},
+        )
+    )
+)
+
+
 class ContextRepository:
     """Durable exact Context sources, receipts, and bounded historical recall."""
 
@@ -1205,8 +1216,12 @@ class ContextRepository:
         self,
         program_id: str,
         program_revision: int,
+        *,
+        max_refs: int | None = None,
     ) -> tuple[str, ...]:
-        semantic_rows = self._host_store._db.execute(
+        if max_refs is not None and max_refs < 0:
+            raise InvalidRequest("Host-control enumeration bound cannot be negative")
+        semantic_cursor = self._host_store._db.execute(
             """
             SELECT sequence, event_id, event_digest,
                    context_source_program_id, context_source_program_revision,
@@ -1219,22 +1234,8 @@ class ContextRepository:
             ORDER BY event_id
             """,
             (program_id, program_revision, ContextPriority.HOST_CONTROL.value),
-        ).fetchall()
-        for row in semantic_rows:
-            metadata_digest = row["context_source_metadata_digest"]
-            if type(metadata_digest) is not str or not metadata_digest.strip():
-                raise IntegrityViolation("Host-control Event metadata is incomplete")
-            expected_metadata_digest = _persisted_source_event_metadata_digest(
-                sequence=int(row["sequence"]),
-                event_id=str(row["event_id"]),
-                program_id=str(row["context_source_program_id"]),
-                program_revision=int(row["context_source_program_revision"]),
-                priority=str(row["context_source_priority"]),
-                event_digest=str(row["event_digest"]),
-            )
-            if metadata_digest != expected_metadata_digest:
-                raise IntegrityViolation("Host-control Event metadata authentication mismatch")
-        projected_rows = self._host_store._db.execute(
+        )
+        projected_cursor = self._host_store._db.execute(
             """
             SELECT event_id
             FROM context_persisted_source_index
@@ -1242,14 +1243,43 @@ class ContextRepository:
             ORDER BY event_id
             """,
             (program_id, program_revision, ContextPriority.HOST_CONTROL.value),
-        ).fetchall()
-        semantic_ids = tuple(str(row["event_id"]) for row in semantic_rows)
-        projected_ids = tuple(str(row["event_id"]) for row in projected_rows)
-        if semantic_ids != projected_ids:
-            raise IntegrityViolation(
-                "Host-control projection coverage diverges from semantic Events"
+        )
+        refs: list[str] = []
+        while True:
+            semantic_row = semantic_cursor.fetchone()
+            projected_row = projected_cursor.fetchone()
+            if semantic_row is None or projected_row is None:
+                if semantic_row is not None or projected_row is not None:
+                    raise IntegrityViolation(
+                        "Host-control projection coverage diverges from semantic Events"
+                    )
+                break
+            if max_refs is not None and len(refs) >= max_refs:
+                raise ContextBudgetExceeded(
+                    "Host-control set exceeds bounded enumeration capacity"
+                )
+            metadata_digest = semantic_row["context_source_metadata_digest"]
+            if type(metadata_digest) is not str or not metadata_digest.strip():
+                raise IntegrityViolation("Host-control Event metadata is incomplete")
+            expected_metadata_digest = _persisted_source_event_metadata_digest(
+                sequence=int(semantic_row["sequence"]),
+                event_id=str(semantic_row["event_id"]),
+                program_id=str(semantic_row["context_source_program_id"]),
+                program_revision=int(semantic_row["context_source_program_revision"]),
+                priority=str(semantic_row["context_source_priority"]),
+                event_digest=str(semantic_row["event_digest"]),
             )
-        return tuple(event_ref(event_id) for event_id in projected_ids)
+            if metadata_digest != expected_metadata_digest:
+                raise IntegrityViolation(
+                    "Host-control Event metadata authentication mismatch"
+                )
+            event_id = str(semantic_row["event_id"])
+            if event_id != str(projected_row["event_id"]):
+                raise IntegrityViolation(
+                    "Host-control projection coverage diverges from semantic Events"
+                )
+            refs.append(event_ref(event_id))
+        return tuple(refs)
 
     def _materialize_persisted_source(
         self,
@@ -2229,7 +2259,9 @@ class ContextCompiler:
             evidence_ref(evidence_id) for evidence_id in evidence_refs
         )
         required_host_control_refs = self._contexts._current_host_control_refs(
-            program_id, program_preflight.program_revision
+            program_id,
+            program_preflight.program_revision,
+            max_refs=max(0, budget_units // _MIN_HOST_CONTROL_SOURCE_UNITS),
         )
         effective_source_refs = tuple(sorted(set(source_refs) | set(required_host_control_refs)))
         requested_source_ids = (

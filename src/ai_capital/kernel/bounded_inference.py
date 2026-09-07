@@ -6,9 +6,9 @@ from .actor_store import ActorRepository
 from .capability_store import CapabilityRepository
 from .context import ContextRepository
 from .durable_program import ProgramRepository
-from .errors import IntegrityViolation, InvalidRequest
+from .errors import ContextBudgetExceeded, IntegrityViolation, InvalidRequest
 from .inference import InferenceHost, InferenceResult, ModelBindingRegistry
-from .models import CapabilitySnapshot, ContextReceipt
+from .models import CapabilitySnapshot, ContextReceipt, InferenceRequest
 from .serialization import canonical_json, to_canonical_data
 
 
@@ -37,6 +37,26 @@ class BoundedInferenceHost(InferenceHost):
         super().__init__(programs, actors, bindings, capabilities)
         self._contexts = contexts
 
+    def _validate_host_control_freshness(self, receipt: ContextReceipt) -> None:
+        included_refs = frozenset(receipt.included_refs)
+        try:
+            current_host_controls = self._contexts._current_host_control_refs(
+                receipt.program_id,
+                receipt.program_revision,
+                max_refs=len(included_refs),
+            )
+        except ContextBudgetExceeded as exc:
+            raise IntegrityViolation(
+                "compiled Context is stale relative to current Host controls"
+            ) from exc
+        if any(source_ref not in included_refs for source_ref in current_host_controls):
+            raise IntegrityViolation(
+                "compiled Context is stale relative to current Host controls"
+            )
+
+    def _validate_post_provider_freshness(self, request: InferenceRequest) -> None:
+        self._validate_host_control_freshness(request.context_receipt)
+
     def infer(
         self,
         *,
@@ -50,15 +70,7 @@ class BoundedInferenceHost(InferenceHost):
         if compiled.receipt.program_id != program_id:
             raise InvalidRequest("compiled Context references a different Program")
 
-        current_host_controls = self._contexts._current_host_control_refs(
-            program_id,
-            compiled.receipt.program_revision,
-        )
-        included_refs = frozenset(compiled.receipt.included_refs)
-        if any(source_ref not in included_refs for source_ref in current_host_controls):
-            raise IntegrityViolation(
-                "compiled Context is stale relative to current Host controls"
-            )
+        self._validate_host_control_freshness(compiled.receipt)
 
         effective_input = dict(compiled.context)
         prebound_snapshot = effective_input.pop(_CAPABILITY_CONTEXT_KEY, None)

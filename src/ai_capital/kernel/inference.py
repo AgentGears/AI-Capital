@@ -94,6 +94,10 @@ class InferenceHost:
         self._bindings = bindings
         self._capabilities = capabilities
 
+    def _validate_post_provider_freshness(self, request: InferenceRequest) -> None:
+        """Validate subclass-specific currentness immediately before success commit."""
+        return None
+
     def infer(
         self,
         *,
@@ -231,6 +235,30 @@ class InferenceHost:
             )
             self._actors.record_attempt(receipt, turn, request)
             raise StaleActorGeneration("model output is stale for current Actor generation")
+
+        try:
+            self._validate_post_provider_freshness(request)
+        except IntegrityViolation as exc:
+            receipt = ModelAttemptReceipt(
+                attempt_id=attempt_id,
+                actor_id=actor.actor_id,
+                actor_generation=actor.generation,
+                program_id=program.program_id,
+                program_revision=program.revision,
+                model_binding=actor.model_binding,
+                context_receipt_ref=context_receipt.context_receipt_id,
+                input_digest=input_digest,
+                effective_config_digest=configuration_digest,
+                outcome=ModelAttemptOutcome.STALE,
+                started_at=started_at,
+                finished_at=finished_at,
+                output_digest=output_digest,
+                error_code="stale_inference_context",
+            )
+            self._actors.record_attempt(receipt, turn, request)
+            raise IntegrityViolation(
+                "model output is stale for current inference Context"
+            ) from exc
 
         receipt = ModelAttemptReceipt(
             attempt_id=attempt_id,
