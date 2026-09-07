@@ -50,6 +50,16 @@ class BoundedInferenceHost(InferenceHost):
         if compiled.receipt.program_id != program_id:
             raise InvalidRequest("compiled Context references a different Program")
 
+        current_host_controls = self._contexts._current_host_control_refs(
+            program_id,
+            compiled.receipt.program_revision,
+        )
+        included_refs = frozenset(compiled.receipt.included_refs)
+        if any(source_ref not in included_refs for source_ref in current_host_controls):
+            raise IntegrityViolation(
+                "compiled Context is stale relative to current Host controls"
+            )
+
         effective_input = dict(compiled.context)
         prebound_snapshot = effective_input.pop(_CAPABILITY_CONTEXT_KEY, None)
         if prebound_snapshot is None:
