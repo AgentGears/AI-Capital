@@ -27,7 +27,7 @@ from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "bounded_context"
-_COMPONENT_SCHEMA_VERSION = 6
+_COMPONENT_SCHEMA_VERSION = 7
 _EVENT_REF_PREFIX = "event:"
 _EVIDENCE_REF_PREFIX = "evidence:"
 _CAPABILITY_REF_PREFIX = "capability_snapshot:"
@@ -362,7 +362,7 @@ class ContextRepository:
                     f"Context schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, 1, 2, 3, 4, 5, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, 2, 3, 4, 5, 6, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Context schema version {version}")
 
             event_columns = {
@@ -473,20 +473,60 @@ class ContextRepository:
                 """
             )
             self._host_store._db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS context_persisted_source_invalidations (
+                    sequence INTEGER PRIMARY KEY,
+                    event_id TEXT NOT NULL UNIQUE,
+                    program_id TEXT NOT NULL,
+                    program_revision INTEGER NOT NULL,
+                    priority TEXT NOT NULL,
+                    event_digest TEXT NOT NULL,
+                    metadata_digest TEXT NOT NULL
+                )
+                """
+            )
+            self._host_store._db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS context_persisted_source_invalidation_program
+                ON context_persisted_source_invalidations(
+                    program_id, program_revision, priority, sequence
+                )
+                """
+            )
+            self._host_store._db.execute(
                 "DROP TRIGGER IF EXISTS context_persisted_source_event_content_invalidate"
             )
             self._host_store._db.execute(
                 """
                 CREATE TRIGGER context_persisted_source_event_content_invalidate
-                AFTER UPDATE OF event_json, event_digest ON events
+                AFTER UPDATE OF event_type, event_json, event_digest ON events
                 WHEN OLD.event_type = 'context.source_persisted'
                   OR NEW.event_type = 'context.source_persisted'
                 BEGIN
+                    INSERT OR IGNORE INTO context_persisted_source_invalidations(
+                        sequence, event_id, program_id, program_revision, priority,
+                        event_digest, metadata_digest
+                    )
+                    SELECT
+                        OLD.sequence, OLD.event_id, OLD.context_source_program_id,
+                        OLD.context_source_program_revision, OLD.context_source_priority,
+                        OLD.event_digest, OLD.context_source_metadata_digest
+                    WHERE OLD.event_type = 'context.source_persisted'
+                      AND OLD.context_source_priority = 'host_control'
+                      AND OLD.context_source_program_id IS NOT NULL
+                      AND OLD.context_source_program_revision IS NOT NULL
+                      AND OLD.context_source_metadata_digest IS NOT NULL
+                      AND OLD.event_type IS NOT NEW.event_type;
+
                     DELETE FROM context_persisted_source_index
                     WHERE (sequence = OLD.sequence
                            OR event_id = OLD.event_id
                            OR sequence = NEW.sequence
                            OR event_id = NEW.event_id)
+                      AND (
+                          OLD.event_json IS NOT NEW.event_json
+                          OR OLD.event_digest IS NOT NEW.event_digest
+                      )
                       AND OLD.event_type IS NEW.event_type
                       AND OLD.context_source_program_id IS NEW.context_source_program_id
                       AND OLD.context_source_program_revision IS NEW.context_source_program_revision
@@ -588,6 +628,7 @@ class ContextRepository:
                 """
             )
 
+            self._migrate_host_control_invalidations()
             self._rebuild_persisted_source_projection()
 
             if version is None:
@@ -595,7 +636,7 @@ class ContextRepository:
                     "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                     (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
                 )
-            elif version in {1, 2, 3, 4, 5}:
+            elif version in {1, 2, 3, 4, 5, 6}:
                 self._host_store._db.execute(
                     "UPDATE component_schema SET version = ? WHERE component = ?",
                     (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
@@ -795,6 +836,107 @@ class ContextRepository:
         if used_units > receipt.budget_units:
             raise IntegrityViolation("compiled Context exceeds its receipted budget")
         return receipt, context, used_units
+
+    def _migrate_host_control_invalidations(self) -> None:
+        rows = self._host_store._db.execute(
+            """
+            SELECT
+                idx.sequence AS indexed_sequence,
+                idx.event_id AS indexed_event_id,
+                idx.program_id AS indexed_program_id,
+                idx.program_revision AS indexed_program_revision,
+                idx.priority AS indexed_priority,
+                idx.source_digest AS indexed_source_digest,
+                idx.payload_units AS indexed_payload_units,
+                idx.event_digest AS indexed_event_digest,
+                idx.projection_digest AS indexed_projection_digest,
+                events.sequence AS semantic_sequence,
+                events.event_type AS semantic_event_type,
+                events.context_source_program_id AS semantic_program_id,
+                events.context_source_program_revision AS semantic_program_revision,
+                events.context_source_priority AS semantic_priority,
+                events.event_digest AS semantic_event_digest
+            FROM context_persisted_source_index AS idx
+            LEFT JOIN events ON events.event_id = idx.event_id
+            WHERE idx.priority = ?
+            ORDER BY idx.sequence
+            """,
+            (ContextPriority.HOST_CONTROL.value,),
+        ).fetchall()
+        for row in rows:
+            try:
+                sequence = int(row["indexed_sequence"])
+                program_revision = int(row["indexed_program_revision"])
+                payload_units = int(row["indexed_payload_units"])
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation(
+                    "Host-control projection migration metadata is malformed"
+                ) from exc
+            event_id = row["indexed_event_id"]
+            program_id = row["indexed_program_id"]
+            priority = row["indexed_priority"]
+            source_digest = row["indexed_source_digest"]
+            event_digest = row["indexed_event_digest"]
+            projection_digest = row["indexed_projection_digest"]
+            if (
+                type(event_id) is not str
+                or not event_id.strip()
+                or type(program_id) is not str
+                or not program_id.strip()
+                or priority != ContextPriority.HOST_CONTROL.value
+                or type(source_digest) is not str
+                or not source_digest.strip()
+                or type(event_digest) is not str
+                or not event_digest.strip()
+                or type(projection_digest) is not str
+                or not projection_digest.strip()
+                or program_revision < 0
+                or payload_units < _canonical_units({})
+            ):
+                raise IntegrityViolation(
+                    "Host-control projection migration metadata is invalid"
+                )
+            expected_projection_digest = _persisted_source_projection_digest(
+                sequence=sequence,
+                event_id=event_id,
+                program_id=program_id,
+                program_revision=program_revision,
+                priority=priority,
+                source_digest=source_digest,
+                payload_units=payload_units,
+                event_digest=event_digest,
+            )
+            if projection_digest != expected_projection_digest:
+                raise IntegrityViolation(
+                    "Host-control projection migration authentication mismatch"
+                )
+            semantic_diverged = (
+                row["semantic_sequence"] is None
+                or int(row["semantic_sequence"]) != sequence
+                or row["semantic_event_type"] != "context.source_persisted"
+            )
+            if not semantic_diverged:
+                continue
+            metadata_digest = _persisted_source_event_metadata_digest(
+                sequence=sequence,
+                event_id=event_id,
+                program_id=program_id,
+                program_revision=program_revision,
+                priority=priority,
+                event_digest=event_digest,
+            )
+            self._host_store._db.execute(
+                """
+                INSERT OR IGNORE INTO context_persisted_source_invalidations(
+                    sequence, event_id, program_id, program_revision, priority,
+                    event_digest, metadata_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sequence, event_id, program_id, program_revision, priority,
+                    event_digest, metadata_digest,
+                ),
+            )
 
     def _rebuild_persisted_source_projection(self) -> None:
         self._host_store._db.execute("DELETE FROM context_persisted_source_index")
@@ -1260,6 +1402,59 @@ class ContextRepository:
     ) -> tuple[str, ...]:
         if max_refs is not None and max_refs < 0:
             raise InvalidRequest("Host-control enumeration bound cannot be negative")
+        invalidation = self._host_store._db.execute(
+            """
+            SELECT sequence, event_id, program_id, program_revision, priority,
+                   event_digest, metadata_digest
+            FROM context_persisted_source_invalidations
+            WHERE program_id = ? AND program_revision = ? AND priority = ?
+            ORDER BY sequence
+            LIMIT 1
+            """,
+            (program_id, program_revision, ContextPriority.HOST_CONTROL.value),
+        ).fetchone()
+        if invalidation is not None:
+            try:
+                invalidation_sequence = int(invalidation["sequence"])
+                invalidation_revision = int(invalidation["program_revision"])
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation(
+                    "Host-control invalidation evidence is malformed"
+                ) from exc
+            invalidation_event_id = invalidation["event_id"]
+            invalidation_program_id = invalidation["program_id"]
+            invalidation_priority = invalidation["priority"]
+            invalidation_event_digest = invalidation["event_digest"]
+            invalidation_metadata_digest = invalidation["metadata_digest"]
+            if (
+                type(invalidation_event_id) is not str
+                or not invalidation_event_id.strip()
+                or invalidation_program_id != program_id
+                or invalidation_revision != program_revision
+                or invalidation_priority != ContextPriority.HOST_CONTROL.value
+                or type(invalidation_event_digest) is not str
+                or not invalidation_event_digest.strip()
+                or type(invalidation_metadata_digest) is not str
+                or not invalidation_metadata_digest.strip()
+            ):
+                raise IntegrityViolation(
+                    "Host-control invalidation evidence is invalid"
+                )
+            expected_invalidation_digest = _persisted_source_event_metadata_digest(
+                sequence=invalidation_sequence,
+                event_id=invalidation_event_id,
+                program_id=program_id,
+                program_revision=program_revision,
+                priority=ContextPriority.HOST_CONTROL.value,
+                event_digest=invalidation_event_digest,
+            )
+            if invalidation_metadata_digest != expected_invalidation_digest:
+                raise IntegrityViolation(
+                    "Host-control invalidation evidence authentication mismatch"
+                )
+            raise IntegrityViolation(
+                "current Host-control source has durable invalidation evidence"
+            )
         semantic_cursor = self._host_store._db.execute(
             """
             SELECT sequence, event_id, event_digest,
