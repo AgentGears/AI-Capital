@@ -483,10 +483,14 @@ class ContextRepository:
                   OR NEW.event_type = 'context.source_persisted'
                 BEGIN
                     DELETE FROM context_persisted_source_index
-                    WHERE sequence = OLD.sequence
-                       OR event_id = OLD.event_id
-                       OR sequence = NEW.sequence
-                       OR event_id = NEW.event_id;
+                    WHERE (sequence = OLD.sequence
+                           OR event_id = OLD.event_id
+                           OR sequence = NEW.sequence
+                           OR event_id = NEW.event_id)
+                      AND OLD.event_type IS NEW.event_type
+                      AND OLD.context_source_program_id IS NEW.context_source_program_id
+                      AND OLD.context_source_program_revision IS NEW.context_source_program_revision
+                      AND OLD.context_source_priority IS NEW.context_source_priority;
                 END
                 """
             )
