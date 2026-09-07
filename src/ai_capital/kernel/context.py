@@ -27,7 +27,7 @@ from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "bounded_context"
-_COMPONENT_SCHEMA_VERSION = 3
+_COMPONENT_SCHEMA_VERSION = 4
 _EVENT_REF_PREFIX = "event:"
 _EVIDENCE_REF_PREFIX = "evidence:"
 _CAPABILITY_REF_PREFIX = "capability_snapshot:"
@@ -216,6 +216,28 @@ def _persisted_source_projection_digest(
     )
 
 
+def _persisted_source_event_metadata_digest(
+    *,
+    sequence: int,
+    event_id: str,
+    program_id: str,
+    program_revision: int,
+    priority: str,
+    event_digest: str,
+) -> str:
+    return canonical_digest(
+        {
+            "projection": "context.persisted_source_event_metadata",
+            "sequence": sequence,
+            "event_id": event_id,
+            "program_id": program_id,
+            "program_revision": program_revision,
+            "priority": priority,
+            "event_digest": event_digest,
+        }
+    )
+
+
 def _source_entry(source: ContextSource) -> dict[str, object]:
     return {
         "source_ref": source.source_ref,
@@ -283,8 +305,34 @@ class ContextRepository:
                     f"Context schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, 1, 2, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, 2, 3, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Context schema version {version}")
+
+            event_columns = {
+                str(column["name"])
+                for column in self._host_store._db.execute(
+                    "PRAGMA table_info(events)"
+                ).fetchall()
+            }
+            for column_name, declaration in (
+                ("context_source_program_id", "TEXT"),
+                ("context_source_program_revision", "INTEGER"),
+                ("context_source_priority", "TEXT"),
+                ("context_source_metadata_digest", "TEXT"),
+            ):
+                if column_name not in event_columns:
+                    self._host_store._db.execute(
+                        f"ALTER TABLE events ADD COLUMN {column_name} {declaration}"
+                    )
+            self._host_store._db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS events_context_source_authority
+                ON events(
+                    event_type, context_source_program_id,
+                    context_source_program_revision, context_source_priority, event_id
+                )
+                """
+            )
 
             self._host_store._db.execute(
                 """
@@ -686,6 +734,26 @@ class ContextRepository:
                 payload_units=payload_units,
                 event_digest=event.digest,
             )
+            event_metadata_digest = _persisted_source_event_metadata_digest(
+                sequence=event.sequence,
+                event_id=event.event_id,
+                program_id=persisted.program_id,
+                program_revision=persisted.program_revision,
+                priority=persisted.priority.value,
+                event_digest=event.digest,
+            )
+            self._host_store._db.execute(
+                """
+                UPDATE events
+                SET context_source_program_id = ?,
+                    context_source_program_revision = ?,
+                    context_source_priority = ?,
+                    context_source_metadata_digest = ?
+                WHERE sequence = ?
+                """,
+                (persisted.program_id, persisted.program_revision, persisted.priority.value,
+                 event_metadata_digest, event.sequence),
+            )
             try:
                 self._host_store._db.execute(
                     """
@@ -862,6 +930,26 @@ class ContextRepository:
                 source_digest=source.source_digest,
                 payload_units=payload_units,
                 event_digest=event.digest,
+            )
+            event_metadata_digest = _persisted_source_event_metadata_digest(
+                sequence=event.sequence,
+                event_id=event.event_id,
+                program_id=source.program_id,
+                program_revision=source.program_revision,
+                priority=source.priority.value,
+                event_digest=event.digest,
+            )
+            self._host_store._db.execute(
+                """
+                UPDATE events
+                SET context_source_program_id = ?,
+                    context_source_program_revision = ?,
+                    context_source_priority = ?,
+                    context_source_metadata_digest = ?
+                WHERE sequence = ?
+                """,
+                (source.program_id, source.program_revision, source.priority.value,
+                 event_metadata_digest, event.sequence),
             )
             try:
                 self._host_store._db.execute(
@@ -1072,19 +1160,32 @@ class ContextRepository:
     ) -> tuple[str, ...]:
         semantic_rows = self._host_store._db.execute(
             """
-            SELECT event_id
+            SELECT sequence, event_id, event_digest,
+                   context_source_program_id, context_source_program_revision,
+                   context_source_priority, context_source_metadata_digest
             FROM events
             WHERE event_type = 'context.source_persisted'
-              AND json_extract(event_json, '$.correlation_id') = ?
-              AND CAST(
-                  json_extract(event_json, '$.payload.source.program_revision')
-                  AS INTEGER
-              ) = ?
-              AND json_extract(event_json, '$.payload.source.priority') = ?
+              AND context_source_program_id = ?
+              AND context_source_program_revision = ?
+              AND context_source_priority = ?
             ORDER BY event_id
             """,
             (program_id, program_revision, ContextPriority.HOST_CONTROL.value),
         ).fetchall()
+        for row in semantic_rows:
+            metadata_digest = row["context_source_metadata_digest"]
+            if type(metadata_digest) is not str or not metadata_digest.strip():
+                raise IntegrityViolation("Host-control Event metadata is incomplete")
+            expected_metadata_digest = _persisted_source_event_metadata_digest(
+                sequence=int(row["sequence"]),
+                event_id=str(row["event_id"]),
+                program_id=str(row["context_source_program_id"]),
+                program_revision=int(row["context_source_program_revision"]),
+                priority=str(row["context_source_priority"]),
+                event_digest=str(row["event_digest"]),
+            )
+            if metadata_digest != expected_metadata_digest:
+                raise IntegrityViolation("Host-control Event metadata authentication mismatch")
         projected_rows = self._host_store._db.execute(
             """
             SELECT event_id
