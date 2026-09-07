@@ -117,6 +117,14 @@ class CapabilityRepository:
             raise InvalidRequest("Capability operation and resource type must be non-empty")
         if not capability.handler_binding.strip():
             raise InvalidRequest("Capability handler binding must be non-empty")
+        descriptor_units = len(
+            canonical_json(capability_descriptor(capability)).encode("utf-8")
+        )
+        binding_units = len(record_to_json(capability).encode("utf-8"))
+        if binding_units > descriptor_units + _BINDING_STORAGE_OVERHEAD_LIMIT:
+            raise InvalidRequest(
+                "Capability handler binding exceeds bounded storage envelope"
+            )
         if capability.binding_revision < 0:
             raise InvalidRequest("Capability binding revision cannot be negative")
         if new and capability.binding_revision != 0:
