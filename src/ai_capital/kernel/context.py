@@ -1070,7 +1070,22 @@ class ContextRepository:
         program_id: str,
         program_revision: int,
     ) -> tuple[str, ...]:
-        rows = self._host_store._db.execute(
+        semantic_rows = self._host_store._db.execute(
+            """
+            SELECT event_id
+            FROM events
+            WHERE event_type = 'context.source_persisted'
+              AND json_extract(event_json, '$.correlation_id') = ?
+              AND CAST(
+                  json_extract(event_json, '$.payload.source.program_revision')
+                  AS INTEGER
+              ) = ?
+              AND json_extract(event_json, '$.payload.source.priority') = ?
+            ORDER BY event_id
+            """,
+            (program_id, program_revision, ContextPriority.HOST_CONTROL.value),
+        ).fetchall()
+        projected_rows = self._host_store._db.execute(
             """
             SELECT event_id
             FROM context_persisted_source_index
@@ -1079,7 +1094,13 @@ class ContextRepository:
             """,
             (program_id, program_revision, ContextPriority.HOST_CONTROL.value),
         ).fetchall()
-        return tuple(event_ref(str(row["event_id"])) for row in rows)
+        semantic_ids = tuple(str(row["event_id"]) for row in semantic_rows)
+        projected_ids = tuple(str(row["event_id"]) for row in projected_rows)
+        if semantic_ids != projected_ids:
+            raise IntegrityViolation(
+                "Host-control projection coverage diverges from semantic Events"
+            )
+        return tuple(event_ref(event_id) for event_id in projected_ids)
 
     def _materialize_persisted_source(
         self,
