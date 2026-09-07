@@ -1393,6 +1393,25 @@ class ContextRepository:
             return source
         raise InvalidRequest(f"unsupported durable recall address: {source_ref}")
 
+    def _event_storage_units(self, event_id: str) -> int:
+        row = self._host_store._db.execute(
+            """
+            SELECT length(CAST(event_json AS BLOB)) AS event_units
+            FROM events
+            WHERE event_id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise InvalidRequest(f"unknown durable Event: {event_id}")
+        try:
+            event_units = int(row["event_units"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("Event storage size metadata is malformed") from exc
+        if event_units <= 0:
+            raise IntegrityViolation("Event storage size metadata is invalid")
+        return event_units
+
     def _recall_materialization_lower_bound(
         self,
         program_id: str,
@@ -1412,11 +1431,13 @@ class ContextRepository:
                 int(row["evidence_json_bytes"])
                 + int(row["admission_json_bytes"])
                 + 4 * ((byte_length + 2) // 3)
+                + self._event_storage_units(str(row["admitted_event_id"]))
             )
         if source_ref.startswith(_CONTEXT_RECEIPT_PREFIX):
             row = self._host_store._db.execute(
                 """
                 SELECT
+                    compiled_event_id,
                     length(CAST(context_json AS BLOB)) AS context_bytes,
                     length(CAST(receipt_json AS BLOB)) AS receipt_bytes,
                     used_units
@@ -1435,7 +1456,12 @@ class ContextRepository:
                 raise IntegrityViolation("ContextReceipt size metadata is malformed") from exc
             if context_bytes <= 0 or receipt_bytes <= 0 or used_units < 0:
                 raise IntegrityViolation("ContextReceipt size metadata is invalid")
-            return context_bytes + receipt_bytes + len(str(used_units))
+            return (
+                context_bytes
+                + receipt_bytes
+                + len(str(used_units))
+                + self._event_storage_units(str(row["compiled_event_id"]))
+            )
         if source_ref.startswith(_EVENT_REF_PREFIX):
             event_id = source_ref[len(_EVENT_REF_PREFIX) :]
             persisted = self._host_store._db.execute(
@@ -1716,7 +1742,7 @@ class ContextCompiler:
 
     def _current_evidence_metadata_preflight(
         self, evidence_id: str
-    ) -> tuple[sqlite3.Row, int]:
+    ) -> tuple[sqlite3.Row, int, int]:
         if self._evidence is None:
             raise InvalidRequest("current Evidence Context requires the Evidence repository")
         row = self._evidence._metadata_row(evidence_id)
@@ -1754,12 +1780,15 @@ class ContextCompiler:
             or indexed["semantic_event_type"] != "evidence.admitted"
         ):
             raise IntegrityViolation("Evidence preflight Event binding mismatch")
-        return row, byte_length
+        event_units = self._contexts._event_storage_units(str(row["admitted_event_id"]))
+        return row, byte_length, event_units
 
     def _current_evidence_preflight(self, evidence_id: str) -> tuple[Evidence, int]:
         if self._evidence is None:
             raise InvalidRequest("current Evidence Context requires the Evidence repository")
-        metadata, byte_length = self._current_evidence_metadata_preflight(evidence_id)
+        metadata, byte_length, _event_units = self._current_evidence_metadata_preflight(
+            evidence_id
+        )
         row = self._evidence._row(evidence_id)
         if (
             row["evidence_id"] != metadata["evidence_id"]
@@ -2188,7 +2217,9 @@ class ContextCompiler:
         included_refs.append(program_source.source_ref)
 
         for evidence_id in sorted(evidence_refs):
-            metadata, byte_length = self._current_evidence_metadata_preflight(evidence_id)
+            metadata, byte_length, event_units = (
+                self._current_evidence_metadata_preflight(evidence_id)
+            )
             source_ref_value = evidence_ref(evidence_id)
             encoded_length = 4 * ((byte_length + 2) // 3)
             current_units = _canonical_units(
@@ -2198,6 +2229,7 @@ class ContextCompiler:
                 int(metadata["evidence_json_bytes"])
                 + int(metadata["admission_json_bytes"])
                 + encoded_length
+                + event_units
             )
             if current_units + metadata_lower_bound > budget_units:
                 excluded_refs.append(source_ref_value)
