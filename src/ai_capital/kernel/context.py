@@ -61,6 +61,14 @@ _EVENT_STORAGE_OVERHEAD_LIMIT = 4096
 _EVIDENCE_ADMISSION_STORAGE_LIMIT = 4096
 
 
+def _program_event_storage_limit(program_id: str, payload_units: int) -> int:
+    identity_units = (
+        _canonical_units({"program_id": program_id})
+        - _canonical_units({"program_id": ""})
+    )
+    return payload_units + _EVENT_STORAGE_OVERHEAD_LIMIT + identity_units
+
+
 def _correlation_identifies_program(event_type: str) -> bool:
     return event_type.startswith(_PROGRAM_CORRELATION_EVENT_PREFIXES)
 
@@ -2206,9 +2214,10 @@ class ContextCompiler:
                 )
 
         if recalled_refs:
-            effective_recall_units = (
+            requested_recall_units = (
                 budget_units if recall_max_units is None else recall_max_units
             )
+            effective_recall_units = min(budget_units, requested_recall_units)
             if recall_max_items <= 0 or effective_recall_units <= 0:
                 raise InvalidRequest(
                     "bounded recall requires positive item and size limits"
@@ -2221,7 +2230,10 @@ class ContextCompiler:
             for recalled_ref in sorted(recalled_refs):
                 self._contexts._validate_recall_address(program_id, recalled_ref)
 
-        if program_preflight.event_units > program_preflight.payload_units + _EVENT_STORAGE_OVERHEAD_LIMIT:
+        if program_preflight.event_units > _program_event_storage_limit(
+            program_preflight.program_id,
+            program_preflight.payload_units,
+        ):
             raise IntegrityViolation(
                 "current Program Event storage exceeds bounded semantic envelope"
             )
@@ -2259,7 +2271,7 @@ class ContextCompiler:
                 program_id,
                 recalled_refs,
                 max_items=recall_max_items,
-                max_units=budget_units if recall_max_units is None else recall_max_units,
+                max_units=effective_recall_units,
             )
             recalled_sources = self._sort_sources(list(recall_result.items))
 
