@@ -61,12 +61,49 @@ _EVENT_STORAGE_OVERHEAD_LIMIT = 4096
 _EVIDENCE_ADMISSION_STORAGE_LIMIT = 4096
 
 
-def _program_event_storage_limit(program_id: str, payload_units: int) -> int:
-    identity_units = (
-        _canonical_units({"program_id": program_id})
-        - _canonical_units({"program_id": ""})
+def _identity_units(field_name: str, identity: str) -> int:
+    return (
+        _canonical_units({field_name: identity})
+        - _canonical_units({field_name: ""})
     )
-    return payload_units + _EVENT_STORAGE_OVERHEAD_LIMIT + identity_units
+
+
+def _program_event_storage_limit(program_id: str, payload_units: int) -> int:
+    return (
+        payload_units
+        + _EVENT_STORAGE_OVERHEAD_LIMIT
+        + _identity_units("program_id", program_id)
+    )
+
+
+def _persisted_source_event_storage_limit(program_id: str, payload_units: int) -> int:
+    identity_units = _identity_units("program_id", program_id)
+    return payload_units + _EVENT_STORAGE_OVERHEAD_LIMIT + (2 * identity_units)
+
+
+def _compiled_context_event_storage_limit(program_id: str, semantic_units: int) -> int:
+    return (
+        semantic_units
+        + _EVENT_STORAGE_OVERHEAD_LIMIT
+        + _identity_units("program_id", program_id)
+    )
+
+
+def _evidence_admission_storage_limit(evidence_id: str) -> int:
+    return _EVIDENCE_ADMISSION_STORAGE_LIMIT + _identity_units("evidence_id", evidence_id)
+
+
+def _evidence_event_storage_limit(
+    evidence_id: str,
+    evidence_units: int,
+    admission_units: int,
+) -> int:
+    return (
+        evidence_units
+        + admission_units
+        + _EVENT_STORAGE_OVERHEAD_LIMIT
+        + _identity_units("evidence_id", evidence_id)
+    )
 
 
 def _correlation_identifies_program(event_type: str) -> bool:
@@ -1123,7 +1160,9 @@ class ContextRepository:
             or semantic_event_units <= 0
         ):
             raise IntegrityViolation("persisted Context source metadata is invalid")
-        if semantic_event_units > indexed_payload_units + _EVENT_STORAGE_OVERHEAD_LIMIT:
+        if semantic_event_units > _persisted_source_event_storage_limit(
+            indexed_program_id, indexed_payload_units
+        ):
             raise IntegrityViolation(
                 "persisted Context source Event storage exceeds bounded semantic envelope"
             )
@@ -1625,17 +1664,17 @@ class ContextRepository:
             row = self._evidence._metadata_row(evidence_id)
             evidence_units = int(row["evidence_json_bytes"])
             admission_units = int(row["admission_json_bytes"])
-            if admission_units > _EVIDENCE_ADMISSION_STORAGE_LIMIT:
+            evidence_id = str(row["evidence_id"])
+            if admission_units > _evidence_admission_storage_limit(evidence_id):
                 return False
             event_units = self._event_storage_units(str(row["admitted_event_id"]))
-            return (
-                event_units
-                <= evidence_units + admission_units + _EVENT_STORAGE_OVERHEAD_LIMIT
+            return event_units <= _evidence_event_storage_limit(
+                evidence_id, evidence_units, admission_units
             )
         if source_ref.startswith(_CONTEXT_RECEIPT_PREFIX):
             row = self._host_store._db.execute(
                 """
-                SELECT compiled_event_id,
+                SELECT compiled_event_id, program_id,
                        length(CAST(context_json AS BLOB)) AS context_bytes,
                        length(CAST(receipt_json AS BLOB)) AS receipt_bytes,
                        used_units
@@ -1655,7 +1694,9 @@ class ContextRepository:
             except (TypeError, ValueError) as exc:
                 raise IntegrityViolation("ContextReceipt size metadata is malformed") from exc
             event_units = self._event_storage_units(str(row["compiled_event_id"]))
-            return event_units <= semantic_units + _EVENT_STORAGE_OVERHEAD_LIMIT
+            return event_units <= _compiled_context_event_storage_limit(
+                str(row["program_id"]), semantic_units
+            )
         return True
 
     def recall(
@@ -2400,19 +2441,32 @@ class ContextCompiler:
             )
             evidence_storage_units = int(metadata["evidence_json_bytes"])
             admission_storage_units = int(metadata["admission_json_bytes"])
-            if admission_storage_units > _EVIDENCE_ADMISSION_STORAGE_LIMIT:
+            if admission_storage_units > _evidence_admission_storage_limit(evidence_id):
                 excluded_refs.append(source_ref_value)
                 continue
-            if (
-                event_units
-                > evidence_storage_units
-                + admission_storage_units
-                + _EVENT_STORAGE_OVERHEAD_LIMIT
+            if event_units > _evidence_event_storage_limit(
+                evidence_id, evidence_storage_units, admission_storage_units
             ):
                 excluded_refs.append(source_ref_value)
                 continue
-            metadata_lower_bound = evidence_storage_units + encoded_length
-            if current_units + metadata_lower_bound > budget_units:
+            empty_evidence = freeze_json({})
+            assert isinstance(empty_evidence, FrozenMap)
+            metadata_shell = _make_source(
+                source_ref=source_ref_value,
+                priority=ContextPriority.CURRENT_EVIDENCE,
+                payload={"evidence": {}, "content_base64": ""},
+            )
+            metadata_shell_trial = self._build_context(
+                [*included_sources, metadata_shell],
+                capability_payload,
+            )
+            metadata_predicted_units = (
+                _canonical_units(metadata_shell_trial)
+                - _canonical_units(empty_evidence)
+                + evidence_storage_units
+                + encoded_length
+            )
+            if metadata_predicted_units > budget_units:
                 excluded_refs.append(source_ref_value)
                 continue
             evidence, verified_byte_length = self._current_evidence_preflight(evidence_id)
