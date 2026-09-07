@@ -25,7 +25,7 @@ class K8ReviewRound9Tests(unittest.TestCase):
                     priority=ContextPriority.HOST_CONTROL,
                     payload={"control": "x" * 131072},
                 )
-                baseline = compiler.compile(program.program_id, budget_units=100_000)
+                baseline = compiler.compile(program.program_id, budget_units=200_000)
                 event_id = ref.removeprefix("event:")
                 programs._db.execute(
                     "UPDATE context_persisted_source_index "

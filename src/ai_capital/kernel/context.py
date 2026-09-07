@@ -57,6 +57,7 @@ _PROGRAM_CORRELATION_EVENT_PREFIXES = (
     "completion.",
     "verification.",
 )
+_EVENT_STORAGE_OVERHEAD_LIMIT = 4096
 
 
 def _correlation_identifies_program(event_type: str) -> bool:
@@ -107,6 +108,7 @@ class _PersistedSourcePreflight:
     priority: ContextPriority
     source_digest: str
     payload_units: int
+    event_units: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +119,7 @@ class _CurrentProgramPreflight:
     projection_digest: str
     projection_units: int
     payload_units: int
+    event_units: int
     last_sequence: int
     event_type: str
     event_digest: str
@@ -958,6 +961,7 @@ class ContextRepository:
                 events.sequence AS event_sequence,
                 events.event_type AS event_type,
                 events.event_digest AS semantic_event_digest,
+                length(CAST(events.event_json AS BLOB)) AS semantic_event_units,
                 context_persisted_source_index.sequence AS indexed_sequence,
                 context_persisted_source_index.event_id AS indexed_event_id,
                 context_persisted_source_index.program_id AS indexed_program_id,
@@ -989,6 +993,7 @@ class ContextRepository:
             event_sequence = int(row["event_sequence"])
             indexed_program_revision = int(row["indexed_program_revision"])
             indexed_payload_units = int(row["indexed_payload_units"])
+            semantic_event_units = int(row["semantic_event_units"])
         except (TypeError, ValueError) as exc:
             raise IntegrityViolation("persisted Context source metadata is malformed") from exc
         indexed_event_id = row["indexed_event_id"]
@@ -1018,8 +1023,13 @@ class ContextRepository:
             or not indexed_projection_digest.strip()
             or indexed_program_revision < 0
             or indexed_payload_units < _canonical_units({})
+            or semantic_event_units <= 0
         ):
             raise IntegrityViolation("persisted Context source metadata is invalid")
+        if semantic_event_units > indexed_payload_units + _EVENT_STORAGE_OVERHEAD_LIMIT:
+            raise IntegrityViolation(
+                "persisted Context source Event storage exceeds bounded semantic envelope"
+            )
         expected_projection_digest = _persisted_source_projection_digest(
             sequence=indexed_sequence,
             event_id=indexed_event_id,
@@ -1052,7 +1062,24 @@ class ContextRepository:
             priority=priority,
             source_digest=source_digest,
             payload_units=payload_units,
+            event_units=semantic_event_units,
         )
+
+    def _current_host_control_refs(
+        self,
+        program_id: str,
+        program_revision: int,
+    ) -> tuple[str, ...]:
+        rows = self._host_store._db.execute(
+            """
+            SELECT event_id
+            FROM context_persisted_source_index
+            WHERE program_id = ? AND program_revision = ? AND priority = ?
+            ORDER BY event_id
+            """,
+            (program_id, program_revision, ContextPriority.HOST_CONTROL.value),
+        ).fetchall()
+        return tuple(event_ref(str(row["event_id"])) for row in rows)
 
     def _materialize_persisted_source(
         self,
@@ -1088,7 +1115,8 @@ class ContextRepository:
                 events.event_id AS event_id,
                 events.program_id AS event_program_id,
                 events.event_type AS event_type,
-                events.event_digest AS event_digest
+                events.event_digest AS event_digest,
+                length(CAST(events.event_json AS BLOB)) AS event_units
             FROM program_projections
             JOIN events ON events.sequence = program_projections.last_sequence
             WHERE program_projections.program_id = ?
@@ -1101,6 +1129,7 @@ class ContextRepository:
             revision = int(row["projected_revision"])
             projection_units = int(row["projection_units"])
             last_sequence = int(row["last_sequence"])
+            event_units = int(row["event_units"])
         except (TypeError, ValueError) as exc:
             raise IntegrityViolation("current Program preflight metadata is malformed") from exc
         projection_digest = row["projection_digest"]
@@ -1112,6 +1141,7 @@ class ContextRepository:
             or row["event_program_id"] != program_id
             or revision < 0
             or projection_units <= 0
+            or event_units <= 0
             or last_sequence <= 0
             or type(projection_digest) is not str
             or not projection_digest.strip()
@@ -1135,6 +1165,7 @@ class ContextRepository:
             projection_digest=projection_digest,
             projection_units=projection_units,
             payload_units=payload_units,
+            event_units=event_units,
             last_sequence=last_sequence,
             event_type=event_type,
             event_digest=event_digest,
@@ -1306,6 +1337,8 @@ class ContextRepository:
             )
             if expected_program_id != program_id:
                 raise InvalidRequest("historical Event belongs to a different Program")
+            if row["event_type"] == "context.source_persisted":
+                self._persisted_source_preflight(program_id, source_ref)
             return
         if source_ref.startswith(_EVIDENCE_REF_PREFIX):
             if self._evidence is None:
@@ -1845,6 +1878,7 @@ class ContextCompiler:
             raise IntegrityViolation(
                 "Capability snapshot metadata differs from supplied Context source"
             )
+        self._capabilities._snapshot_binding_units(capability_snapshot.capabilities)
         return _CapabilitySnapshotPreflight(
             source_ref=f"{_CAPABILITY_REF_PREFIX}{capability_snapshot.snapshot_id}",
             snapshot_id=capability_snapshot.snapshot_id,
@@ -1955,9 +1989,13 @@ class ContextCompiler:
         evidence_source_refs = tuple(
             evidence_ref(evidence_id) for evidence_id in evidence_refs
         )
+        required_host_control_refs = self._contexts._current_host_control_refs(
+            program_id, program_preflight.program_revision
+        )
+        effective_source_refs = tuple(sorted(set(source_refs) | set(required_host_control_refs)))
         requested_source_ids = (
             [program_preflight.source_ref]
-            + list(source_refs)
+            + list(effective_source_refs)
             + list(evidence_source_refs)
             + list(recalled_refs)
         )
@@ -1966,7 +2004,7 @@ class ContextCompiler:
 
         persisted_preflights = tuple(
             self._contexts._persisted_source_preflight(program_id, source_ref_value)
-            for source_ref_value in source_refs
+            for source_ref_value in effective_source_refs
         )
         for preflight in persisted_preflights:
             if (
@@ -1992,6 +2030,11 @@ class ContextCompiler:
                 )
             for recalled_ref in sorted(recalled_refs):
                 self._contexts._validate_recall_address(program_id, recalled_ref)
+
+        if program_preflight.event_units > program_preflight.payload_units + _EVENT_STORAGE_OVERHEAD_LIMIT:
+            raise IntegrityViolation(
+                "current Program Event storage exceeds bounded semantic envelope"
+            )
 
         capability_preflight = self._capability_preflight(capability_snapshot)
         if capability_preflight is not None:

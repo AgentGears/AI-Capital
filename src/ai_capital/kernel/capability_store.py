@@ -15,12 +15,13 @@ from .errors import (
 from .events import utc_now
 from .models import Capability, CapabilityDescriptor, CapabilitySnapshot
 from .schema_codec import record_from_json, record_to_json
-from .serialization import canonical_digest
+from .serialization import canonical_digest, canonical_json
 from .structured_schema import validate_schema_definition
 
 
 _COMPONENT = "capability_registry"
 _COMPONENT_SCHEMA_VERSION = 1
+_BINDING_STORAGE_OVERHEAD_LIMIT = 4096
 
 
 def capability_descriptor(capability: Capability) -> CapabilityDescriptor:
@@ -343,6 +344,44 @@ class CapabilityRepository:
         if type(digest) is not str or not digest.strip() or units <= 0:
             raise IntegrityViolation("Capability snapshot metadata is invalid")
         return digest, units
+
+    def _snapshot_binding_units(
+        self,
+        descriptors: tuple[CapabilityDescriptor, ...],
+    ) -> int:
+        total_units = 0
+        for descriptor in descriptors:
+            row = self._host_store._db.execute(
+                """
+                SELECT capability_digest,
+                       length(CAST(capability_json AS BLOB)) AS binding_units
+                FROM capability_bindings
+                WHERE capability_id = ? AND binding_revision = ?
+                """,
+                (descriptor.capability_id, descriptor.binding_revision),
+            ).fetchone()
+            if row is None:
+                raise IntegrityViolation(
+                    f"Capability snapshot references missing binding: "
+                    f"{descriptor.capability_id}@{descriptor.binding_revision}"
+                )
+            try:
+                binding_units = int(row["binding_units"])
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation("Capability binding size metadata is malformed") from exc
+            digest = row["capability_digest"]
+            descriptor_units = len(canonical_json(descriptor).encode("utf-8"))
+            if (
+                binding_units <= 0
+                or type(digest) is not str
+                or not digest.strip()
+                or binding_units > descriptor_units + _BINDING_STORAGE_OVERHEAD_LIMIT
+            ):
+                raise IntegrityViolation(
+                    "Capability binding storage exceeds bounded descriptor envelope"
+                )
+            total_units += binding_units
+        return total_units
 
     def get_snapshot(self, snapshot_id: str) -> CapabilitySnapshot:
         row = self._host_store._db.execute(
