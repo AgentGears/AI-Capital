@@ -27,8 +27,16 @@ class K8ReviewRound18Tests(unittest.TestCase):
                     risk_class=RiskClass.LOW,
                     input_schema={"type":"object","properties":{},"required":(),"additional_properties":False},
                     output_schema={"type":"object","properties":{},"required":(),"additional_properties":False},
-                    binding_revision=0, handler_binding="h" * 131072))
+                    binding_revision=0, handler_binding="handler.binding"))
                 snapshot = capabilities.create_snapshot((capability_descriptor(capability),))
+                programs._db.execute(
+                    """
+                    UPDATE capability_bindings
+                    SET capability_json = capability_json || ?
+                    WHERE capability_id = ? AND binding_revision = ?
+                    """,
+                    (" " * 131072, capability.capability_id, capability.binding_revision),
+                )
                 contexts = ContextRepository(programs)
                 compiler = ContextCompiler(contexts, capabilities=capabilities)
                 with patch.object(capabilities, "get_snapshot", side_effect=AssertionError("binding decoded")) as get_snapshot:
