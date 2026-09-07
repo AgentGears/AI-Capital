@@ -136,7 +136,7 @@ class K8ReviewRound9Tests(unittest.TestCase):
                 version = programs._db.execute(
                     "SELECT version FROM component_schema WHERE component = 'bounded_context'"
                 ).fetchone()
-                self.assertEqual(int(version["version"]), 4)
+                self.assertEqual(int(version["version"]), 5)
                 compiler = ContextCompiler(contexts)
                 compiled = compiler.compile(
                     program.program_id,

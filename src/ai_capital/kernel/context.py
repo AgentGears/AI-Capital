@@ -27,7 +27,7 @@ from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "bounded_context"
-_COMPONENT_SCHEMA_VERSION = 4
+_COMPONENT_SCHEMA_VERSION = 5
 _EVENT_REF_PREFIX = "event:"
 _EVIDENCE_REF_PREFIX = "evidence:"
 _CAPABILITY_REF_PREFIX = "capability_snapshot:"
@@ -362,7 +362,7 @@ class ContextRepository:
                     f"Context schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, 1, 2, 3, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, 2, 3, 4, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Context schema version {version}")
 
             event_columns = {
@@ -459,6 +459,7 @@ class ContextRepository:
                     priority TEXT NOT NULL,
                     source_digest TEXT NOT NULL,
                     payload_units INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
                     event_digest TEXT NOT NULL,
                     projection_digest TEXT NOT NULL,
                     FOREIGN KEY(sequence) REFERENCES events(sequence)
@@ -487,6 +488,15 @@ class ContextRepository:
             if "projection_digest" not in persisted_source_columns:
                 raise IntegrityViolation(
                     "persisted Context source schema lacks projection authentication"
+                )
+            if "payload_json" not in persisted_source_columns:
+                self._host_store._db.execute(
+                    "ALTER TABLE context_persisted_source_index ADD COLUMN payload_json TEXT"
+                )
+                persisted_source_columns.add("payload_json")
+            if "payload_json" not in persisted_source_columns:
+                raise IntegrityViolation(
+                    "persisted Context source schema lacks bounded payload projection"
                 )
 
             recall_event_columns = {
@@ -563,7 +573,7 @@ class ContextRepository:
                     "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                     (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
                 )
-            elif version in {1, 2, 3}:
+            elif version in {1, 2, 3, 4}:
                 self._host_store._db.execute(
                     "UPDATE component_schema SET version = ? WHERE component = ?",
                     (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
@@ -780,7 +790,8 @@ class ContextRepository:
                 event,
                 expected_program_id=event.correlation_id,
             )
-            payload_units = _canonical_units(persisted.payload)
+            payload_json = canonical_json(persisted.payload)
+            payload_units = len(payload_json.encode("utf-8"))
             projection_digest = _persisted_source_projection_digest(
                 sequence=event.sequence,
                 event_id=event.event_id,
@@ -816,8 +827,8 @@ class ContextRepository:
                     """
                     INSERT INTO context_persisted_source_index(
                         sequence, event_id, program_id, program_revision, priority,
-                        source_digest, payload_units, event_digest, projection_digest
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source_digest, payload_units, payload_json, event_digest, projection_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.sequence,
@@ -827,6 +838,7 @@ class ContextRepository:
                         persisted.priority.value,
                         persisted.source_digest,
                         payload_units,
+                        payload_json,
                         event.digest,
                         projection_digest,
                     ),
@@ -977,7 +989,8 @@ class ContextRepository:
                 {"source": source},
                 program_id=program_id,
             )
-            payload_units = _canonical_units(source.payload)
+            payload_json = canonical_json(source.payload)
+            payload_units = len(payload_json.encode("utf-8"))
             projection_digest = _persisted_source_projection_digest(
                 sequence=event.sequence,
                 event_id=event.event_id,
@@ -1013,8 +1026,8 @@ class ContextRepository:
                     """
                     INSERT INTO context_persisted_source_index(
                         sequence, event_id, program_id, program_revision, priority,
-                        source_digest, payload_units, event_digest, projection_digest
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        source_digest, payload_units, payload_json, event_digest, projection_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.sequence,
@@ -1024,6 +1037,7 @@ class ContextRepository:
                         source.priority.value,
                         source.source_digest,
                         payload_units,
+                        payload_json,
                         event.digest,
                         projection_digest,
                     ),
@@ -1114,6 +1128,7 @@ class ContextRepository:
                 context_persisted_source_index.priority AS indexed_priority,
                 context_persisted_source_index.source_digest AS indexed_source_digest,
                 context_persisted_source_index.payload_units AS indexed_payload_units,
+                length(CAST(context_persisted_source_index.payload_json AS BLOB)) AS indexed_payload_json_units,
                 context_persisted_source_index.event_digest AS indexed_event_digest,
                 context_persisted_source_index.projection_digest AS indexed_projection_digest
             FROM events
@@ -1138,6 +1153,7 @@ class ContextRepository:
             event_sequence = int(row["event_sequence"])
             indexed_program_revision = int(row["indexed_program_revision"])
             indexed_payload_units = int(row["indexed_payload_units"])
+            indexed_payload_json_units = int(row["indexed_payload_json_units"])
             semantic_event_units = int(row["semantic_event_units"])
         except (TypeError, ValueError) as exc:
             raise IntegrityViolation("persisted Context source metadata is malformed") from exc
@@ -1168,6 +1184,7 @@ class ContextRepository:
             or not indexed_projection_digest.strip()
             or indexed_program_revision < 0
             or indexed_payload_units < _canonical_units({})
+            or indexed_payload_json_units != indexed_payload_units
             or semantic_event_units <= 0
         ):
             raise IntegrityViolation("persisted Context source metadata is invalid")
@@ -1286,22 +1303,50 @@ class ContextRepository:
         program_id: str,
         preflight: _PersistedSourcePreflight,
     ) -> ContextSource:
-        event = self._event_by_id(preflight.source_ref[len(_EVENT_REF_PREFIX) :])
-        persisted, source = self._source_from_persisted_event(
-            event,
-            expected_program_id=program_id,
-        )
+        event_id = preflight.source_ref[len(_EVENT_REF_PREFIX) :]
+        row = self._host_store._db.execute(
+            """
+            SELECT program_id, program_revision, priority, source_digest,
+                   payload_units, payload_json
+            FROM context_persisted_source_index
+            WHERE event_id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise IntegrityViolation(
+                "persisted Context source payload projection is missing"
+            )
+        try:
+            program_revision = int(row["program_revision"])
+            payload_units = int(row["payload_units"])
+            payload = freeze_json(json.loads(row["payload_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise IntegrityViolation(
+                "persisted Context source payload projection is malformed"
+            ) from exc
+        if not isinstance(payload, FrozenMap):
+            raise IntegrityViolation(
+                "persisted Context source payload projection is not an object"
+            )
         if (
-            persisted.program_id != preflight.program_id
-            or persisted.program_revision != preflight.program_revision
-            or persisted.priority is not preflight.priority
-            or persisted.source_digest != preflight.source_digest
-            or _canonical_units(persisted.payload) != preflight.payload_units
+            row["program_id"] != program_id
+            or row["program_id"] != preflight.program_id
+            or program_revision != preflight.program_revision
+            or row["priority"] != preflight.priority.value
+            or row["source_digest"] != preflight.source_digest
+            or payload_units != preflight.payload_units
+            or _canonical_units(payload) != preflight.payload_units
+            or canonical_digest(payload) != preflight.source_digest
         ):
             raise IntegrityViolation(
-                "persisted Context source materialization diverges from preflight"
+                "persisted Context source payload projection diverges from preflight"
             )
-        return source
+        return _make_source(
+            source_ref=preflight.source_ref,
+            priority=preflight.priority,
+            payload=payload,
+        )
 
     def _current_program_preflight(self, program_id: str) -> _CurrentProgramPreflight:
         row = self._host_store._db.execute(
@@ -1581,7 +1626,20 @@ class ContextRepository:
 
     def _resolve_recall(self, program_id: str, source_ref: str) -> ContextSource:
         if source_ref.startswith(_EVENT_REF_PREFIX):
-            event = self._event_by_id(source_ref[len(_EVENT_REF_PREFIX) :])
+            event_id = source_ref[len(_EVENT_REF_PREFIX) :]
+            persisted = self._host_store._db.execute(
+                "SELECT event_id FROM context_persisted_source_index WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if persisted is not None:
+                preflight = self._persisted_source_preflight(program_id, source_ref)
+                projected = self._materialize_persisted_source(program_id, preflight)
+                return _make_source(
+                    source_ref=source_ref,
+                    priority=ContextPriority.RECALLED_HISTORY,
+                    payload=projected.payload,
+                )
+            event = self._event_by_id(event_id)
             return self._historical_event_source(event, program_id)
         if source_ref.startswith(_EVIDENCE_REF_PREFIX):
             return self._historical_evidence_source(source_ref)
@@ -2147,7 +2205,6 @@ class ContextCompiler:
             raise IntegrityViolation(
                 "Capability snapshot metadata differs from supplied Context source"
             )
-        self._capabilities._snapshot_binding_units(capability_snapshot.capabilities)
         return _CapabilitySnapshotPreflight(
             source_ref=f"{_CAPABILITY_REF_PREFIX}{capability_snapshot.snapshot_id}",
             snapshot_id=capability_snapshot.snapshot_id,
@@ -2331,6 +2388,10 @@ class ContextCompiler:
             raise ContextBudgetExceeded(
                 "Context budget cannot fit mandatory Host control/current Program sources"
             )
+
+        if capability_preflight is not None:
+            assert capability_snapshot is not None
+            self._capabilities._snapshot_binding_units(capability_snapshot.capabilities)
 
         capability_ref_value, capability_payload = self._capability_context(
             capability_snapshot,

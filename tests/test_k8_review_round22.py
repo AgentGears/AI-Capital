@@ -44,7 +44,7 @@ class K8ReviewRound22Tests(unittest.TestCase):
             finally:
                 programs.close()
 
-    def test_v3_context_schema_advances_to_v4(self):
+    def test_v3_context_schema_advances_to_current_version(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "host.db"
             programs = ProgramRepository(path)
@@ -57,7 +57,7 @@ class K8ReviewRound22Tests(unittest.TestCase):
             try:
                 ContextRepository(programs)
                 row = programs._db.execute("SELECT version FROM component_schema WHERE component = 'bounded_context'").fetchone()
-                self.assertEqual(int(row["version"]), 4)
+                self.assertEqual(int(row["version"]), 5)
             finally:
                 programs.close()
 

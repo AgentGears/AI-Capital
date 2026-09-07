@@ -46,8 +46,8 @@ class K8ReviewRound6Tests(unittest.TestCase):
                         max_units=500_000,
                     )
 
-                self.assertEqual(event_by_id.call_count, 1)
-                self.assertEqual(decode_event_row.call_count, 1)
+                self.assertEqual(event_by_id.call_count, 0)
+                self.assertEqual(decode_event_row.call_count, 0)
                 self.assertEqual(len(result.included_refs), 1)
                 self.assertEqual(len(result.excluded_refs), 2)
                 self.assertIs(
