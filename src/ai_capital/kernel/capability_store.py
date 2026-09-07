@@ -22,6 +22,7 @@ from .structured_schema import validate_schema_definition
 _COMPONENT = "capability_registry"
 _COMPONENT_SCHEMA_VERSION = 1
 _BINDING_STORAGE_OVERHEAD_LIMIT = 4096
+_BINDING_STORAGE_HANDLER_EXPANSION_LIMIT = 6
 
 
 def capability_descriptor(capability: Capability) -> CapabilityDescriptor:
@@ -354,7 +355,11 @@ class CapabilityRepository:
             row = self._host_store._db.execute(
                 """
                 SELECT capability_digest,
-                       length(CAST(capability_json AS BLOB)) AS binding_units
+                       length(CAST(capability_json AS BLOB)) AS binding_units,
+                       json_type(capability_json, '$.handler_binding') AS handler_binding_type,
+                       length(
+                           CAST(json_extract(capability_json, '$.handler_binding') AS BLOB)
+                       ) AS handler_binding_units
                 FROM capability_bindings
                 WHERE capability_id = ? AND binding_revision = ?
                 """,
@@ -367,15 +372,23 @@ class CapabilityRepository:
                 )
             try:
                 binding_units = int(row["binding_units"])
+                handler_binding_units = int(row["handler_binding_units"])
             except (TypeError, ValueError) as exc:
                 raise IntegrityViolation("Capability binding size metadata is malformed") from exc
             digest = row["capability_digest"]
             descriptor_units = len(canonical_json(descriptor).encode("utf-8"))
+            storage_envelope = (
+                descriptor_units
+                + handler_binding_units * _BINDING_STORAGE_HANDLER_EXPANSION_LIMIT
+                + _BINDING_STORAGE_OVERHEAD_LIMIT
+            )
             if (
                 binding_units <= 0
+                or handler_binding_units <= 0
+                or row["handler_binding_type"] != "text"
                 or type(digest) is not str
                 or not digest.strip()
-                or binding_units > descriptor_units + _BINDING_STORAGE_OVERHEAD_LIMIT
+                or binding_units > storage_envelope
             ):
                 raise IntegrityViolation(
                     "Capability binding storage exceeds bounded descriptor envelope"
