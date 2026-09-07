@@ -113,7 +113,7 @@ class K8ReviewRound28Tests(unittest.TestCase):
                     "SELECT length(CAST(payload_json AS BLOB)) FROM context_persisted_source_index WHERE event_id = ?",
                     (source_ref.removeprefix("event:"),),
                 ).fetchone()[0]
-                self.assertEqual(int(version), 5)
+                self.assertEqual(int(version), 6)
                 self.assertGreater(int(payload_units), 0)
 
                 with patch.object(

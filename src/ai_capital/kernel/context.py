@@ -27,7 +27,7 @@ from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "bounded_context"
-_COMPONENT_SCHEMA_VERSION = 5
+_COMPONENT_SCHEMA_VERSION = 6
 _EVENT_REF_PREFIX = "event:"
 _EVIDENCE_REF_PREFIX = "evidence:"
 _CAPABILITY_REF_PREFIX = "capability_snapshot:"
@@ -362,7 +362,7 @@ class ContextRepository:
                     f"Context schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, 1, 2, 3, 4, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, 2, 3, 4, 5, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Context schema version {version}")
 
             event_columns = {
@@ -472,6 +472,24 @@ class ContextRepository:
                 ON context_persisted_source_index(program_id, priority, event_id)
                 """
             )
+            self._host_store._db.execute(
+                "DROP TRIGGER IF EXISTS context_persisted_source_event_content_invalidate"
+            )
+            self._host_store._db.execute(
+                """
+                CREATE TRIGGER context_persisted_source_event_content_invalidate
+                AFTER UPDATE OF event_json, event_digest ON events
+                WHEN OLD.event_type = 'context.source_persisted'
+                  OR NEW.event_type = 'context.source_persisted'
+                BEGIN
+                    DELETE FROM context_persisted_source_index
+                    WHERE sequence = OLD.sequence
+                       OR event_id = OLD.event_id
+                       OR sequence = NEW.sequence
+                       OR event_id = NEW.event_id;
+                END
+                """
+            )
 
             persisted_source_columns = {
                 str(column["name"])
@@ -573,7 +591,7 @@ class ContextRepository:
                     "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                     (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
                 )
-            elif version in {1, 2, 3, 4}:
+            elif version in {1, 2, 3, 4, 5}:
                 self._host_store._db.execute(
                     "UPDATE component_schema SET version = ? WHERE component = ?",
                     (_COMPONENT_SCHEMA_VERSION, _COMPONENT),

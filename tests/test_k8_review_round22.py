@@ -57,7 +57,7 @@ class K8ReviewRound22Tests(unittest.TestCase):
             try:
                 ContextRepository(programs)
                 row = programs._db.execute("SELECT version FROM component_schema WHERE component = 'bounded_context'").fetchone()
-                self.assertEqual(int(row["version"]), 5)
+                self.assertEqual(int(row["version"]), 6)
             finally:
                 programs.close()
 
