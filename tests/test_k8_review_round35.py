@@ -131,7 +131,7 @@ class K8ReviewRound35Tests(unittest.TestCase):
                     "WHERE component = 'bounded_context'"
                 ).fetchone()[0]
                 self.assertIsNotNone(marker)
-                self.assertEqual(int(version), 8)
+                self.assertEqual(int(version), 9)
             finally:
                 reopened._connection = original_connection
                 reopened.close()
@@ -159,7 +159,7 @@ class K8ReviewRound35Tests(unittest.TestCase):
                     "SELECT version FROM component_schema "
                     "WHERE component = 'bounded_context'"
                 ).fetchone()[0]
-                self.assertEqual(int(version), 8)
+                self.assertEqual(int(version), 9)
             finally:
                 reopened._connection = original_connection
                 reopened.close()

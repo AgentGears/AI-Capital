@@ -27,7 +27,7 @@ from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "bounded_context"
-_COMPONENT_SCHEMA_VERSION = 8
+_COMPONENT_SCHEMA_VERSION = 9
 _EVENT_REF_PREFIX = "event:"
 _EVIDENCE_REF_PREFIX = "evidence:"
 _CAPABILITY_REF_PREFIX = "capability_snapshot:"
@@ -362,7 +362,7 @@ class ContextRepository:
                     f"Context schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, 1, 2, 3, 4, 5, 6, 7, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, 2, 3, 4, 5, 6, 7, 8, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Context schema version {version}")
 
             event_columns = {
@@ -428,6 +428,15 @@ class ContextRepository:
                 """
                 CREATE INDEX IF NOT EXISTS context_receipt_event_program_sequence
                 ON context_receipt_event_index(program_id, sequence)
+                """
+            )
+            self._host_store._db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS context_compiled_event_invalidations (
+                    sequence INTEGER PRIMARY KEY,
+                    event_id TEXT NOT NULL UNIQUE,
+                    event_digest TEXT NOT NULL
+                )
                 """
             )
             self._host_store._db.execute(
@@ -688,6 +697,12 @@ class ContextRepository:
                   OR OLD.event_type IS NOT NEW.event_type
                   OR OLD.program_id IS NOT NEW.program_id
                 BEGIN
+                    INSERT OR IGNORE INTO context_compiled_event_invalidations(
+                        sequence, event_id, event_digest
+                    )
+                    SELECT OLD.sequence, OLD.event_id, OLD.event_digest
+                    WHERE OLD.event_type = 'context.compiled';
+
                     UPDATE events
                     SET context_recall_invalidated = 1
                     WHERE sequence = OLD.sequence;
@@ -724,6 +739,8 @@ class ContextRepository:
 
             if version == 6:
                 self._migrate_host_control_invalidations()
+            if version == 8:
+                self._migrate_compiled_event_invalidations()
             self._rebuild_persisted_source_projection()
 
             if version is None:
@@ -731,7 +748,7 @@ class ContextRepository:
                     "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                     (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
                 )
-            elif version in {1, 2, 3, 4, 5, 6, 7}:
+            elif version in {1, 2, 3, 4, 5, 6, 7, 8}:
                 self._host_store._db.execute(
                     "UPDATE component_schema SET version = ? WHERE component = ?",
                     (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
@@ -1042,6 +1059,62 @@ class ContextRepository:
                 ),
             )
 
+    def _migrate_compiled_event_invalidations(self) -> None:
+        last_sequence = 0
+        while True:
+            row = self._host_store._db.execute(
+                """
+                SELECT events.sequence, events.event_id, events.event_digest,
+                       events.context_recall_invalidated
+                FROM events
+                WHERE events.sequence > ?
+                  AND events.context_recall_invalidated != 0
+                  AND (
+                      EXISTS (
+                          SELECT 1 FROM context_receipts AS receipt
+                          WHERE receipt.compiled_event_id = events.event_id
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM context_receipt_event_index AS receipt_index
+                          WHERE receipt_index.event_id = events.event_id
+                      )
+                  )
+                ORDER BY events.sequence
+                LIMIT 1
+                """,
+                (last_sequence,),
+            ).fetchone()
+            if row is None:
+                break
+            try:
+                sequence = int(row["sequence"])
+                invalidated = int(row["context_recall_invalidated"])
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation(
+                    "compiled Context Event migration metadata is malformed"
+                ) from exc
+            last_sequence = sequence
+            event_id = row["event_id"]
+            event_digest = row["event_digest"]
+            if (
+                invalidated == 0
+                or type(event_id) is not str
+                or not event_id.strip()
+                or type(event_digest) is not str
+                or not event_digest.strip()
+            ):
+                raise IntegrityViolation(
+                    "compiled Context Event migration metadata is invalid"
+                )
+            self._host_store._db.execute(
+                """
+                INSERT OR IGNORE INTO context_compiled_event_invalidations(
+                    sequence, event_id, event_digest
+                ) VALUES (?, ?, ?)
+                """,
+                (sequence, event_id, event_digest),
+            )
+
     def _rebuild_persisted_source_projection(self) -> None:
         self._host_store._db.execute("DELETE FROM context_persisted_source_index")
         last_sequence = 0
@@ -1158,6 +1231,16 @@ class ContextRepository:
         return self._iter_semantic_receipts()
 
     def _reject_invalidated_compiled_receipt_events(self) -> None:
+        invalidated = self._host_store._db.execute(
+            """
+            SELECT event_id
+            FROM context_compiled_event_invalidations
+            ORDER BY sequence
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalidated is not None:
+            raise IntegrityViolation("compiled Context Event was invalidated")
         invalidated = self._host_store._db.execute(
             """
             SELECT event.event_id
