@@ -389,15 +389,23 @@ class EvidenceRepository:
                 )
 
     def _rebuild_metadata_projection(self) -> None:
-        rows = self._host_store._db.execute(
-            """
-            SELECT evidence_id, artifact_digest, admitted_event_id,
-                   evidence_json, evidence_record_digest,
-                   admission_json, admission_digest
-            FROM evidence_records
-            """
-        ).fetchall()
-        for row in rows:
+        last_evidence_id = ""
+        while True:
+            row = self._host_store._db.execute(
+                """
+                SELECT evidence_id, artifact_digest, admitted_event_id,
+                       evidence_json, evidence_record_digest,
+                       admission_json, admission_digest
+                FROM evidence_records
+                WHERE evidence_id > ?
+                ORDER BY evidence_id
+                LIMIT 1
+                """,
+                (last_evidence_id,),
+            ).fetchone()
+            if row is None:
+                break
+            last_evidence_id = str(row["evidence_id"])
             try:
                 evidence = record_from_json(Evidence, row["evidence_json"])
                 admission = record_from_json(

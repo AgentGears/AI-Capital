@@ -111,7 +111,7 @@ class K8ReviewRound31Tests(unittest.TestCase):
                     "SELECT event_id FROM context_persisted_source_invalidations WHERE event_id = ?",
                     (event_id,),
                 ).fetchone()
-                self.assertEqual(int(version), 7)
+                self.assertEqual(int(version), 8)
                 self.assertIsNotNone(marker)
                 with self.assertRaises(IntegrityViolation):
                     ContextCompiler(contexts).compile(program.program_id, budget_units=100_000)

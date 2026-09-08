@@ -26,7 +26,7 @@ class K8ReviewRound19Tests(unittest.TestCase):
         metadata = evidence._metadata_row(item.evidence_id)
         return evidence, item, str(metadata["admitted_event_id"])
 
-    def test_oversized_evidence_event_is_excluded_before_historical_materialization(self):
+    def test_mutated_evidence_event_fails_before_historical_materialization(self):
         with tempfile.TemporaryDirectory() as directory:
             programs = ProgramRepository(Path(directory) / "host.db")
             try:
@@ -37,16 +37,21 @@ class K8ReviewRound19Tests(unittest.TestCase):
                     (" " * 131072, event_id),
                 )
                 contexts = ContextRepository(programs, evidence)
-                with patch.object(contexts, "_resolve_recall", side_effect=AssertionError("oversized Evidence Event reached materialization")) as resolve:
-                    result = contexts.recall(
-                        program.program_id,
-                        (f"evidence:{item.evidence_id}",),
-                        max_items=1,
-                        max_units=100000,
-                    )
+                with patch.object(
+                    contexts,
+                    "_resolve_recall",
+                    side_effect=AssertionError("corrupt Evidence Event reached materialization"),
+                ) as resolve:
+                    with self.assertRaisesRegex(
+                        IntegrityViolation, "Evidence recall Event binding mismatch"
+                    ):
+                        contexts.recall(
+                            program.program_id,
+                            (f"evidence:{item.evidence_id}",),
+                            max_items=1,
+                            max_units=100000,
+                        )
                 resolve.assert_not_called()
-                self.assertEqual(result.included_refs, ())
-                self.assertEqual(result.excluded_refs, (f"evidence:{item.evidence_id}",))
             finally:
                 programs.close()
 
@@ -75,7 +80,7 @@ class K8ReviewRound19Tests(unittest.TestCase):
             finally:
                 programs.close()
 
-    def test_oversized_compiled_context_event_is_excluded_before_receipt_decode(self):
+    def test_mutated_compiled_context_event_fails_before_receipt_decode(self):
         with tempfile.TemporaryDirectory() as directory:
             programs = ProgramRepository(Path(directory) / "host.db")
             try:
@@ -90,16 +95,21 @@ class K8ReviewRound19Tests(unittest.TestCase):
                     "UPDATE events SET event_json = event_json || ? WHERE event_id = ?",
                     (" " * 131072, str(row["compiled_event_id"])),
                 )
-                with patch.object(contexts, "get", side_effect=AssertionError("oversized compiled Context Event was decoded")) as get_context:
-                    result = contexts.recall(
-                        program.program_id,
-                        (compiled.receipt.context_receipt_id,),
-                        max_items=1,
-                        max_units=100000,
-                    )
+                with patch.object(
+                    contexts,
+                    "get",
+                    side_effect=AssertionError("corrupt compiled Context Event was decoded"),
+                ) as get_context:
+                    with self.assertRaisesRegex(
+                        IntegrityViolation, "ContextReceipt semantic Event was invalidated"
+                    ):
+                        contexts.recall(
+                            program.program_id,
+                            (compiled.receipt.context_receipt_id,),
+                            max_items=1,
+                            max_units=100000,
+                        )
                 get_context.assert_not_called()
-                self.assertEqual(result.included_refs, ())
-                self.assertEqual(result.excluded_refs, (compiled.receipt.context_receipt_id,))
             finally:
                 programs.close()
 

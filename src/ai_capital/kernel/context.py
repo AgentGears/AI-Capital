@@ -27,7 +27,7 @@ from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "bounded_context"
-_COMPONENT_SCHEMA_VERSION = 7
+_COMPONENT_SCHEMA_VERSION = 8
 _EVENT_REF_PREFIX = "event:"
 _EVIDENCE_REF_PREFIX = "evidence:"
 _CAPABILITY_REF_PREFIX = "capability_snapshot:"
@@ -362,7 +362,7 @@ class ContextRepository:
                     f"Context schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, 1, 2, 3, 4, 5, 6, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, 2, 3, 4, 5, 6, 7, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Context schema version {version}")
 
             event_columns = {
@@ -376,6 +376,7 @@ class ContextRepository:
                 ("context_source_program_revision", "INTEGER"),
                 ("context_source_priority", "TEXT"),
                 ("context_source_metadata_digest", "TEXT"),
+                ("context_recall_invalidated", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if column_name not in event_columns:
                     self._host_store._db.execute(
@@ -427,6 +428,30 @@ class ContextRepository:
                 """
                 CREATE INDEX IF NOT EXISTS context_receipt_event_program_sequence
                 ON context_receipt_event_index(program_id, sequence)
+                """
+            )
+            self._host_store._db.execute(
+                "DROP TRIGGER IF EXISTS context_receipt_projection_integrity_invalidate"
+            )
+            self._host_store._db.execute(
+                """
+                CREATE TRIGGER context_receipt_projection_integrity_invalidate
+                AFTER UPDATE OF program_id, program_revision, compiled_event_id,
+                                receipt_json, receipt_digest, context_json,
+                                context_digest, used_units
+                ON context_receipts
+                WHEN OLD.program_id IS NOT NEW.program_id
+                  OR OLD.program_revision IS NOT NEW.program_revision
+                  OR OLD.compiled_event_id IS NOT NEW.compiled_event_id
+                  OR OLD.receipt_json IS NOT NEW.receipt_json
+                  OR OLD.receipt_digest IS NOT NEW.receipt_digest
+                  OR OLD.context_json IS NOT NEW.context_json
+                  OR OLD.context_digest IS NOT NEW.context_digest
+                  OR OLD.used_units IS NOT NEW.used_units
+                BEGIN
+                    DELETE FROM context_receipt_event_index
+                    WHERE context_receipt_id = OLD.context_receipt_id;
+                END
                 """
             )
 
@@ -602,6 +627,26 @@ class ContextRepository:
                 END
                 """
             )
+            self._host_store._db.execute(
+                "DROP TRIGGER IF EXISTS context_recall_event_integrity_invalidate"
+            )
+            self._host_store._db.execute(
+                """
+                CREATE TRIGGER context_recall_event_integrity_invalidate
+                AFTER UPDATE OF event_json, event_digest, event_type, program_id ON events
+                WHEN OLD.event_json IS NOT NEW.event_json
+                  OR OLD.event_digest IS NOT NEW.event_digest
+                  OR OLD.event_type IS NOT NEW.event_type
+                  OR OLD.program_id IS NOT NEW.program_id
+                BEGIN
+                    UPDATE events
+                    SET context_recall_invalidated = 1
+                    WHERE sequence = OLD.sequence;
+                    DELETE FROM context_recall_event_index
+                    WHERE event_id = OLD.event_id;
+                END
+                """
+            )
             self._host_store._db.execute("DELETE FROM context_recall_event_index")
             self._host_store._db.execute(
                 """
@@ -636,7 +681,7 @@ class ContextRepository:
                     "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                     (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
                 )
-            elif version in {1, 2, 3, 4, 5, 6}:
+            elif version in {1, 2, 3, 4, 5, 6, 7}:
                 self._host_store._db.execute(
                     "UPDATE component_schema SET version = ? WHERE component = ?",
                     (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
@@ -940,14 +985,22 @@ class ContextRepository:
 
     def _rebuild_persisted_source_projection(self) -> None:
         self._host_store._db.execute("DELETE FROM context_persisted_source_index")
-        rows = self._host_store._db.execute(
-            """
-            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
-            FROM events WHERE event_type = 'context.source_persisted' ORDER BY sequence
-            """
-        ).fetchall()
-        for row in rows:
+        last_sequence = 0
+        while True:
+            row = self._host_store._db.execute(
+                """
+                SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+                FROM events
+                WHERE event_type = 'context.source_persisted' AND sequence > ?
+                ORDER BY sequence
+                LIMIT 1
+                """,
+                (last_sequence,),
+            ).fetchone()
+            if row is None:
+                break
             event = self._decode_event_row(row)
+            last_sequence = event.sequence
             if not event.correlation_id:
                 raise IntegrityViolation("persisted Context source Event lacks Program binding")
             persisted, _ = self._source_from_persisted_event(
@@ -1012,27 +1065,34 @@ class ContextRepository:
                     "persisted Context source projection rebuild collided"
                 ) from exc
 
-    def _semantic_receipts(self) -> dict[str, tuple[Event, ContextReceipt, FrozenMap, int]]:
-        rows = self._host_store._db.execute(
-            """
-            SELECT sequence, event_id, program_id, event_type, event_json, event_digest
-            FROM events WHERE event_type = 'context.compiled' ORDER BY sequence
-            """
-        ).fetchall()
-        semantic: dict[str, tuple[Event, ContextReceipt, FrozenMap, int]] = {}
-        for row in rows:
+    def _iter_semantic_receipts(self):
+        last_sequence = 0
+        while True:
+            row = self._host_store._db.execute(
+                """
+                SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+                FROM events
+                WHERE event_type = 'context.compiled' AND sequence > ?
+                ORDER BY sequence
+                LIMIT 1
+                """,
+                (last_sequence,),
+            ).fetchone()
+            if row is None:
+                break
             event = self._decode_event_row(row)
             receipt, context, used_units = self._decode_compiled_event(event)
-            if receipt.context_receipt_id in semantic:
-                raise IntegrityViolation("duplicate ContextReceipt semantic identity")
-            semantic[receipt.context_receipt_id] = (event, receipt, context, used_units)
-        return semantic
+            last_sequence = event.sequence
+            yield event, receipt, context, used_units
+
+    def _semantic_receipts(self):
+        """Compatibility hook exposing the bounded semantic receipt iterator."""
+        return self._iter_semantic_receipts()
 
     def _rebuild_receipt_projection(self) -> None:
-        semantic = self._semantic_receipts()
         self._host_store._db.execute("DELETE FROM context_receipt_event_index")
         self._host_store._db.execute("DELETE FROM context_receipts")
-        for event, receipt, context, used_units in semantic.values():
+        for event, receipt, context, used_units in self._iter_semantic_receipts():
             try:
                 self._host_store._db.execute(
                     """
@@ -1071,45 +1131,66 @@ class ContextRepository:
                 raise IntegrityViolation("Context receipt projection rebuild collided") from exc
 
     def _validate_receipt_alignment(self) -> None:
-        semantic = self._semantic_receipts()
-        receipt_rows = self._host_store._db.execute(
-            """
-            SELECT context_receipt_id, program_id, compiled_event_id
-            FROM context_receipts
-            """
-        ).fetchall()
-        index_rows = self._host_store._db.execute(
-            """
-            SELECT context_receipt_id, program_id, event_id
-            FROM context_receipt_event_index
-            """
-        ).fetchall()
-        receipts = {
-            (
-                str(row["context_receipt_id"]),
-                str(row["program_id"]),
-                str(row["compiled_event_id"]),
-            )
-            for row in receipt_rows
-        }
-        indexed = {
-            (
-                str(row["context_receipt_id"]),
-                str(row["program_id"]),
-                str(row["event_id"]),
-            )
-            for row in index_rows
-        }
-        semantic_ids = {
-            (receipt_id, record[1].program_id, record[0].event_id)
-            for receipt_id, record in semantic.items()
-        }
-        if not (receipts == indexed == semantic_ids):
+        semantic_count = int(
+            self._host_store._db.execute(
+                "SELECT COUNT(*) AS count FROM events WHERE event_type = 'context.compiled'"
+            ).fetchone()["count"]
+        )
+        receipt_count = int(
+            self._host_store._db.execute(
+                "SELECT COUNT(*) AS count FROM context_receipts"
+            ).fetchone()["count"]
+        )
+        index_count = int(
+            self._host_store._db.execute(
+                "SELECT COUNT(*) AS count FROM context_receipt_event_index"
+            ).fetchone()["count"]
+        )
+        if semantic_count != receipt_count or semantic_count != index_count:
             raise IntegrityViolation(
                 "Context receipt records/index diverge from semantic Events"
             )
-        for row in receipt_rows:
-            self.get(str(row["context_receipt_id"]))
+
+        seen = 0
+        for event, receipt, context, used_units in self._iter_semantic_receipts():
+            seen += 1
+            receipt_row = self._host_store._db.execute(
+                """
+                SELECT program_id, compiled_event_id
+                FROM context_receipts WHERE context_receipt_id = ?
+                """,
+                (receipt.context_receipt_id,),
+            ).fetchone()
+            index_row = self._host_store._db.execute(
+                """
+                SELECT sequence, program_id, event_id
+                FROM context_receipt_event_index WHERE context_receipt_id = ?
+                """,
+                (receipt.context_receipt_id,),
+            ).fetchone()
+            if (
+                receipt_row is None
+                or index_row is None
+                or receipt_row["program_id"] != receipt.program_id
+                or receipt_row["compiled_event_id"] != event.event_id
+                or int(index_row["sequence"]) != event.sequence
+                or index_row["program_id"] != receipt.program_id
+                or index_row["event_id"] != event.event_id
+            ):
+                raise IntegrityViolation(
+                    "Context receipt records/index diverge from semantic Events"
+                )
+            durable = self.get(receipt.context_receipt_id)
+            if (
+                durable.receipt != receipt
+                or durable.context != context
+                or durable.used_units != used_units
+            ):
+                raise IntegrityViolation("ContextReceipt diverges from semantic Event")
+        if seen != semantic_count:
+            raise IntegrityViolation(
+                "Context receipt records/index diverge from semantic Events"
+            )
 
     def audit_integrity(self) -> None:
         """Run the full Host-wide Context receipt alignment audit explicitly."""
@@ -1751,6 +1832,7 @@ class ContextRepository:
                     events.program_id AS event_program_id,
                     events.event_type,
                     events.event_digest,
+                    events.context_recall_invalidated AS event_invalidated,
                     context_recall_event_index.sequence AS indexed_sequence,
                     context_recall_event_index.program_id AS indexed_program_id,
                     context_recall_event_index.correlation_id AS indexed_correlation_id,
@@ -1767,6 +1849,12 @@ class ContextRepository:
                 raise InvalidRequest(
                     f"unknown durable Context address: {event_ref(event_id)}"
                 )
+            try:
+                invalidated = int(row["event_invalidated"])
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation("Event recall invalidation metadata is malformed") from exc
+            if invalidated != 0:
+                raise IntegrityViolation("Event recall source was invalidated")
             if row["indexed_sequence"] is None:
                 raise IntegrityViolation("Event recall address lacks durable metadata index")
             scoped_correlation = (
@@ -1807,6 +1895,30 @@ class ContextRepository:
                 raise InvalidRequest("Evidence recall requires the Host Evidence repository")
             evidence_id = source_ref[len(_EVIDENCE_REF_PREFIX) :]
             metadata = self._evidence._metadata_row(evidence_id)
+            indexed = self._host_store._db.execute(
+                """
+                SELECT
+                    evidence_event_index.sequence AS indexed_sequence,
+                    evidence_event_index.evidence_id AS indexed_evidence_id,
+                    evidence_event_index.event_type AS indexed_event_type,
+                    events.sequence AS event_sequence,
+                    events.event_id AS semantic_event_id,
+                    events.event_type AS semantic_event_type
+                FROM evidence_event_index
+                JOIN events ON events.event_id = evidence_event_index.event_id
+                WHERE evidence_event_index.event_id = ?
+                """,
+                (metadata["admitted_event_id"],),
+            ).fetchone()
+            if (
+                indexed is None
+                or int(indexed["indexed_sequence"]) != int(indexed["event_sequence"])
+                or indexed["indexed_evidence_id"] != metadata["evidence_id"]
+                or indexed["indexed_event_type"] != "evidence.admitted"
+                or indexed["semantic_event_id"] != metadata["admitted_event_id"]
+                or indexed["semantic_event_type"] != "evidence.admitted"
+            ):
+                raise IntegrityViolation("Evidence recall Event binding mismatch")
             artifact_digest = str(metadata["artifact_digest"])
             self._evidence._artifact_preflight(
                 artifact_digest,
@@ -1830,12 +1942,29 @@ class ContextRepository:
                 """,
                 (source_ref,),
             ).fetchone()
+            semantic = self._host_store._db.execute(
+                """
+                SELECT event_type, context_recall_invalidated
+                FROM events WHERE event_id = ?
+                """,
+                (row["compiled_event_id"],),
+            ).fetchone()
             if (
                 index is None
                 or index["program_id"] != row["program_id"]
                 or index["event_id"] != row["compiled_event_id"]
+                or semantic is None
+                or semantic["event_type"] != "context.compiled"
             ):
                 raise IntegrityViolation("ContextReceipt lacks valid semantic Event binding")
+            try:
+                semantic_invalidated = int(semantic["context_recall_invalidated"])
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation(
+                    "ContextReceipt semantic Event invalidation metadata is malformed"
+                ) from exc
+            if semantic_invalidated != 0:
+                raise IntegrityViolation("ContextReceipt semantic Event was invalidated")
             if row["program_id"] != program_id:
                 raise InvalidRequest("historical Context belongs to a different Program")
             return
