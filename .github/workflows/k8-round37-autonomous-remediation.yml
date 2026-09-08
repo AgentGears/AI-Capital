@@ -41,11 +41,14 @@ jobs:
         env:
           PYTHONPATH: src
         run: pytest -q
-      - name: Publish proved implementation commit
+      - name: Publish clean proved implementation commit
         shell: bash
         run: |
           rm .github/workflows/k8-round37-autonomous-remediation.yml
           rm .github/k8-round37-remediate.py
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+          rm -rf .pytest_cache
           git config user.name "AI Capital automation"
           git config user.email "actions@users.noreply.github.com"
           git add -A
