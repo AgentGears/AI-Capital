@@ -673,7 +673,8 @@ class ContextRepository:
                 """
             )
 
-            self._migrate_host_control_invalidations()
+            if version == 6:
+                self._migrate_host_control_invalidations()
             self._rebuild_persisted_source_projection()
 
             if version is None:
@@ -883,32 +884,36 @@ class ContextRepository:
         return receipt, context, used_units
 
     def _migrate_host_control_invalidations(self) -> None:
-        rows = self._host_store._db.execute(
-            """
-            SELECT
-                idx.sequence AS indexed_sequence,
-                idx.event_id AS indexed_event_id,
-                idx.program_id AS indexed_program_id,
-                idx.program_revision AS indexed_program_revision,
-                idx.priority AS indexed_priority,
-                idx.source_digest AS indexed_source_digest,
-                idx.payload_units AS indexed_payload_units,
-                idx.event_digest AS indexed_event_digest,
-                idx.projection_digest AS indexed_projection_digest,
-                events.sequence AS semantic_sequence,
-                events.event_type AS semantic_event_type,
-                events.context_source_program_id AS semantic_program_id,
-                events.context_source_program_revision AS semantic_program_revision,
-                events.context_source_priority AS semantic_priority,
-                events.event_digest AS semantic_event_digest
-            FROM context_persisted_source_index AS idx
-            LEFT JOIN events ON events.event_id = idx.event_id
-            WHERE idx.priority = ?
-            ORDER BY idx.sequence
-            """,
-            (ContextPriority.HOST_CONTROL.value,),
-        ).fetchall()
-        for row in rows:
+        last_sequence = 0
+        while True:
+            row = self._host_store._db.execute(
+                """
+                SELECT
+                    idx.sequence AS indexed_sequence,
+                    idx.event_id AS indexed_event_id,
+                    idx.program_id AS indexed_program_id,
+                    idx.program_revision AS indexed_program_revision,
+                    idx.priority AS indexed_priority,
+                    idx.source_digest AS indexed_source_digest,
+                    idx.payload_units AS indexed_payload_units,
+                    idx.event_digest AS indexed_event_digest,
+                    idx.projection_digest AS indexed_projection_digest,
+                    events.sequence AS semantic_sequence,
+                    events.event_type AS semantic_event_type,
+                    events.context_source_program_id AS semantic_program_id,
+                    events.context_source_program_revision AS semantic_program_revision,
+                    events.context_source_priority AS semantic_priority,
+                    events.event_digest AS semantic_event_digest
+                FROM context_persisted_source_index AS idx
+                LEFT JOIN events ON events.event_id = idx.event_id
+                WHERE idx.priority = ? AND idx.sequence > ?
+                ORDER BY idx.sequence
+                LIMIT 1
+                """,
+                (ContextPriority.HOST_CONTROL.value, last_sequence),
+            ).fetchone()
+            if row is None:
+                break
             try:
                 sequence = int(row["indexed_sequence"])
                 program_revision = int(row["indexed_program_revision"])
@@ -917,6 +922,7 @@ class ContextRepository:
                 raise IntegrityViolation(
                     "Host-control projection migration metadata is malformed"
                 ) from exc
+            last_sequence = sequence
             event_id = row["indexed_event_id"]
             program_id = row["indexed_program_id"]
             priority = row["indexed_priority"]
