@@ -285,7 +285,7 @@ class EvidenceRepository:
                         "ALTER TABLE evidence_records ADD COLUMN metadata_projection_digest TEXT"
                     )
 
-            if version in {None, 1, 3}:
+            if version in {None, 1, 2, 3}:
                 self._rebuild_event_index()
             if version in {1, 2}:
                 self._rebuild_metadata_projection()
@@ -349,13 +349,15 @@ class EvidenceRepository:
         rows = self._host_store._db.execute(
             """
             SELECT sequence, event_id, program_id, event_type, event_json, event_digest
-            FROM events ORDER BY sequence
+            FROM events
+            WHERE event_type = 'evidence.admitted'
+            ORDER BY sequence
             """
-        ).fetchall()
+        )
         for row in rows:
             event = self._decode_event_row(row)
             if event.event_type != "evidence.admitted":
-                continue
+                raise IntegrityViolation("Evidence Event type projection mismatch")
             if not event.correlation_id:
                 raise IntegrityViolation("Evidence admission Event lacks Evidence identity")
             self._host_store._db.execute(
@@ -368,7 +370,7 @@ class EvidenceRepository:
 
         record_rows = self._host_store._db.execute(
             "SELECT evidence_id, admitted_event_id FROM evidence_records"
-        ).fetchall()
+        )
         for record in record_rows:
             indexed = self._host_store._db.execute(
                 """

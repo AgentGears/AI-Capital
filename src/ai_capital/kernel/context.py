@@ -2754,6 +2754,7 @@ class ContextCompiler:
             )
             evidence_storage_units = int(metadata["evidence_json_bytes"])
             admission_storage_units = int(metadata["admission_json_bytes"])
+            self._validate_current_evidence_event_binding(metadata)
             if admission_storage_units > _evidence_admission_storage_limit(evidence_id):
                 excluded_refs.append(source_ref_value)
                 continue
@@ -2762,7 +2763,6 @@ class ContextCompiler:
             ):
                 excluded_refs.append(source_ref_value)
                 continue
-            self._validate_current_evidence_event_binding(metadata)
             empty_evidence = freeze_json({})
             assert isinstance(empty_evidence, FrozenMap)
             metadata_shell = _make_source(

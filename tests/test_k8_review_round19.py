@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from ai_capital.kernel.context import ContextCompiler, ContextRepository
 from ai_capital.kernel.durable_program import ProgramRepository
+from ai_capital.kernel.errors import IntegrityViolation
 from ai_capital.kernel.evidence_store import EvidenceRepository
 from ai_capital.kernel.models import Program
 
@@ -62,13 +63,15 @@ class K8ReviewRound19Tests(unittest.TestCase):
                 contexts = ContextRepository(programs, evidence)
                 compiler = ContextCompiler(contexts, evidence=evidence)
                 with patch.object(evidence, "_row", side_effect=AssertionError("oversized Evidence Event allowed record decode")) as full_row:
-                    compiled = compiler.compile(
-                        program.program_id,
-                        budget_units=100000,
-                        evidence_refs=(item.evidence_id,),
-                    )
+                    with self.assertRaisesRegex(
+                        IntegrityViolation, "Evidence preflight Event binding mismatch"
+                    ):
+                        compiler.compile(
+                            program.program_id,
+                            budget_units=100000,
+                            evidence_refs=(item.evidence_id,),
+                        )
                 full_row.assert_not_called()
-                self.assertIn(f"evidence:{item.evidence_id}", compiled.receipt.excluded_refs)
             finally:
                 programs.close()
 
