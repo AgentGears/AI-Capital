@@ -965,6 +965,10 @@ class ContextRepository:
                 row["semantic_sequence"] is None
                 or int(row["semantic_sequence"]) != sequence
                 or row["semantic_event_type"] != "context.source_persisted"
+                or row["semantic_program_id"] != program_id
+                or row["semantic_program_revision"] != program_revision
+                or row["semantic_priority"] != priority
+                or row["semantic_event_digest"] != event_digest
             )
             if not semantic_diverged:
                 continue
