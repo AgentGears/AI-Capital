@@ -1,100 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
-
-CONTEXT = Path("src/ai_capital/kernel/context.py")
-EVIDENCE = Path("src/ai_capital/kernel/evidence_store.py")
-TEST = Path("tests/test_k8_review_round38.py")
-
-
-context = CONTEXT.read_text(encoding="utf-8")
-
-old_trigger_header = """                CREATE TRIGGER context_persisted_source_event_content_invalidate
-                AFTER UPDATE OF event_type, event_json, event_digest ON events
-                WHEN OLD.event_type = 'context.source_persisted'
-"""
-new_trigger_header = """                CREATE TRIGGER context_persisted_source_event_content_invalidate
-                AFTER UPDATE OF event_type, event_json, event_digest,
-                                context_source_program_id,
-                                context_source_program_revision,
-                                context_source_priority,
-                                context_source_metadata_digest ON events
-                WHEN OLD.event_type = 'context.source_persisted'
-"""
-if context.count(old_trigger_header) != 1:
-    raise RuntimeError("Round 38 trigger header target not found exactly once")
-context = context.replace(old_trigger_header, new_trigger_header, 1)
-
-old_trigger_change_set = """                      AND (
-                          OLD.event_type IS NOT NEW.event_type
-                          OR OLD.event_json IS NOT NEW.event_json
-                          OR OLD.event_digest IS NOT NEW.event_digest
-                      );
-"""
-new_trigger_change_set = """                      AND (
-                          OLD.event_type IS NOT NEW.event_type
-                          OR OLD.event_json IS NOT NEW.event_json
-                          OR OLD.event_digest IS NOT NEW.event_digest
-                          OR OLD.context_source_program_id IS NOT NEW.context_source_program_id
-                          OR OLD.context_source_program_revision IS NOT NEW.context_source_program_revision
-                          OR OLD.context_source_priority IS NOT NEW.context_source_priority
-                          OR OLD.context_source_metadata_digest IS NOT NEW.context_source_metadata_digest
-                      );
-"""
-if context.count(old_trigger_change_set) != 1:
-    raise RuntimeError("Round 38 trigger mutation-set target not found exactly once")
-context = context.replace(old_trigger_change_set, new_trigger_change_set, 1)
-
-old_rebuild = """    def _rebuild_receipt_projection(self) -> None:
-        self._host_store._db.execute(\"DELETE FROM context_receipt_event_index\")
-        self._host_store._db.execute(\"DELETE FROM context_receipts\")
-"""
-new_rebuild = """    def _reject_invalidated_compiled_receipt_events(self) -> None:
-        invalidated = self._host_store._db.execute(
-            \"\"\"
-            SELECT event.event_id
-            FROM context_receipt_event_index AS receipt_index
-            JOIN events AS event ON event.event_id = receipt_index.event_id
-            WHERE event.context_recall_invalidated != 0
-            ORDER BY receipt_index.sequence
-            LIMIT 1
-            \"\"\"
-        ).fetchone()
-        if invalidated is not None:
-            raise IntegrityViolation(\"compiled Context Event was invalidated\")
-
-    def _rebuild_receipt_projection(self) -> None:
-        self._reject_invalidated_compiled_receipt_events()
-        self._host_store._db.execute(\"DELETE FROM context_receipt_event_index\")
-        self._host_store._db.execute(\"DELETE FROM context_receipts\")
-"""
-if context.count(old_rebuild) != 1:
-    raise RuntimeError("Round 38 receipt rebuild target not found exactly once")
-context = context.replace(old_rebuild, new_rebuild, 1)
-CONTEXT.write_text(context, encoding="utf-8")
-
-
-evidence = EVIDENCE.read_text(encoding="utf-8")
-old_evidence_binding = """        self._validate_evidence(evidence)
-        expected_payload = to_canonical_data(
-"""
-new_evidence_binding = """        if event.program_id is not None:
-            raise IntegrityViolation(
-                \"Evidence admission Event must remain Host-scoped during migration\"
-            )
-        self._validate_evidence(evidence)
-        expected_payload = to_canonical_data(
-"""
-if evidence.count(old_evidence_binding) != 1:
-    raise RuntimeError("Round 38 Evidence binding target not found exactly once")
-evidence = evidence.replace(old_evidence_binding, new_evidence_binding, 1)
-EVIDENCE.write_text(evidence, encoding="utf-8")
-
-
-TEST.write_text(
-    '''from __future__ import annotations
-
 from dataclasses import replace
 from pathlib import Path
 import tempfile
@@ -171,6 +76,8 @@ class K8ReviewRound38Tests(unittest.TestCase):
             payload = to_canonical_data(event.payload)
             source = payload["source"]
             source["priority"] = ContextPriority.ADVISORY_MEMORY.value
+            source["currentness"] = "advisory"
+            source["authority"] = "advisory"
             source["payload"] = {"rule": "forged"}
             source["source_digest"] = canonical_digest(source["payload"])
             digest = self._digest_for(event, payload=payload, program_id=event.program_id)
@@ -306,6 +213,3 @@ class K8ReviewRound38Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-''',
-    encoding="utf-8",
-)

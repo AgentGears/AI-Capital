@@ -386,6 +386,10 @@ class EvidenceRepository:
             raise IntegrityViolation(
                 "Evidence migration record binding is inconsistent"
             )
+        if event.program_id is not None:
+            raise IntegrityViolation(
+                "Evidence admission Event must remain Host-scoped during migration"
+            )
         self._validate_evidence(evidence)
         expected_payload = to_canonical_data(
             {"evidence": evidence, "admission": admission}

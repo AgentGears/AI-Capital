@@ -524,7 +524,11 @@ class ContextRepository:
             self._host_store._db.execute(
                 """
                 CREATE TRIGGER context_persisted_source_event_content_invalidate
-                AFTER UPDATE OF event_type, event_json, event_digest ON events
+                AFTER UPDATE OF event_type, event_json, event_digest,
+                                context_source_program_id,
+                                context_source_program_revision,
+                                context_source_priority,
+                                context_source_metadata_digest ON events
                 WHEN OLD.event_type = 'context.source_persisted'
                   OR NEW.event_type = 'context.source_persisted'
                 BEGIN
@@ -541,10 +545,51 @@ class ContextRepository:
                       AND OLD.context_source_program_id IS NOT NULL
                       AND OLD.context_source_program_revision IS NOT NULL
                       AND OLD.context_source_metadata_digest IS NOT NULL
+                      AND NOT (
+                          OLD.event_type IS NEW.event_type
+                          AND OLD.event_json IS NEW.event_json
+                          AND OLD.event_digest IS NEW.event_digest
+                          AND NEW.context_source_program_id IS NULL
+                          AND NEW.context_source_program_revision IS NULL
+                          AND NEW.context_source_priority IS NULL
+                          AND NEW.context_source_metadata_digest IS NULL
+                      )
                       AND (
                           OLD.event_type IS NOT NEW.event_type
                           OR OLD.event_json IS NOT NEW.event_json
                           OR OLD.event_digest IS NOT NEW.event_digest
+                          OR OLD.context_source_program_id IS NOT NEW.context_source_program_id
+                          OR OLD.context_source_program_revision IS NOT NEW.context_source_program_revision
+                          OR OLD.context_source_priority IS NOT NEW.context_source_priority
+                          OR OLD.context_source_metadata_digest IS NOT NEW.context_source_metadata_digest
+                      );
+
+                    UPDATE events
+                    SET context_source_program_id = (
+                            SELECT program_id FROM context_persisted_source_index
+                            WHERE event_id = OLD.event_id
+                        ),
+                        context_source_program_revision = (
+                            SELECT program_revision FROM context_persisted_source_index
+                            WHERE event_id = OLD.event_id
+                        ),
+                        context_source_priority = (
+                            SELECT priority FROM context_persisted_source_index
+                            WHERE event_id = OLD.event_id
+                        ),
+                        context_source_metadata_digest = OLD.context_source_metadata_digest
+                    WHERE sequence = OLD.sequence
+                      AND OLD.event_type = 'context.source_persisted'
+                      AND NEW.event_type = 'context.source_persisted'
+                      AND OLD.event_json IS NEW.event_json
+                      AND OLD.event_digest IS NEW.event_digest
+                      AND NEW.context_source_program_id IS NULL
+                      AND NEW.context_source_program_revision IS NULL
+                      AND NEW.context_source_priority IS NULL
+                      AND NEW.context_source_metadata_digest IS NULL
+                      AND EXISTS (
+                          SELECT 1 FROM context_persisted_source_index
+                          WHERE event_id = OLD.event_id
                       );
 
                     DELETE FROM context_persisted_source_index
@@ -1112,7 +1157,22 @@ class ContextRepository:
         """Compatibility hook exposing the bounded semantic receipt iterator."""
         return self._iter_semantic_receipts()
 
+    def _reject_invalidated_compiled_receipt_events(self) -> None:
+        invalidated = self._host_store._db.execute(
+            """
+            SELECT event.event_id
+            FROM context_receipt_event_index AS receipt_index
+            JOIN events AS event ON event.event_id = receipt_index.event_id
+            WHERE event.context_recall_invalidated != 0
+            ORDER BY receipt_index.sequence
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalidated is not None:
+            raise IntegrityViolation("compiled Context Event was invalidated")
+
     def _rebuild_receipt_projection(self) -> None:
+        self._reject_invalidated_compiled_receipt_events()
         self._host_store._db.execute("DELETE FROM context_receipt_event_index")
         self._host_store._db.execute("DELETE FROM context_receipts")
         for event, receipt, context, used_units in self._iter_semantic_receipts():
