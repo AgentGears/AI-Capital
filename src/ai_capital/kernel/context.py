@@ -2271,6 +2271,10 @@ class ContextCompiler:
             expected_content_ref=self._evidence._content_ref(artifact_digest),
         )
 
+        event_units = self._contexts._event_storage_units(str(row["admitted_event_id"]))
+        return row, byte_length, event_units
+
+    def _validate_current_evidence_event_binding(self, row: sqlite3.Row) -> None:
         indexed = self._host_store._db.execute(
             """
             SELECT
@@ -2295,8 +2299,6 @@ class ContextCompiler:
             or indexed["semantic_event_type"] != "evidence.admitted"
         ):
             raise IntegrityViolation("Evidence preflight Event binding mismatch")
-        event_units = self._contexts._event_storage_units(str(row["admitted_event_id"]))
-        return row, byte_length, event_units
 
     def _current_evidence_preflight(self, evidence_id: str) -> tuple[Evidence, int]:
         if self._evidence is None:
@@ -2304,6 +2306,7 @@ class ContextCompiler:
         metadata, byte_length, _event_units = self._current_evidence_metadata_preflight(
             evidence_id
         )
+        self._validate_current_evidence_event_binding(metadata)
         row = self._evidence._row(evidence_id)
         if (
             row["evidence_id"] != metadata["evidence_id"]
@@ -2759,6 +2762,7 @@ class ContextCompiler:
             ):
                 excluded_refs.append(source_ref_value)
                 continue
+            self._validate_current_evidence_event_binding(metadata)
             empty_evidence = freeze_json({})
             assert isinstance(empty_evidence, FrozenMap)
             metadata_shell = _make_source(

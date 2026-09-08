@@ -17,7 +17,7 @@ from .serialization import canonical_digest, to_canonical_data
 
 
 _COMPONENT = "evidence_store"
-_COMPONENT_SCHEMA_VERSION = 3
+_COMPONENT_SCHEMA_VERSION = 4
 _ARTIFACT_PREFIX = "evidence-artifact:"
 
 
@@ -220,7 +220,7 @@ class EvidenceRepository:
                     f"Evidence schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, 1, 2, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, 2, 3, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Evidence schema version {version}")
 
             if version is None:
@@ -285,21 +285,46 @@ class EvidenceRepository:
                         "ALTER TABLE evidence_records ADD COLUMN metadata_projection_digest TEXT"
                     )
 
-            if version in {None, 1}:
+            if version in {None, 1, 3}:
                 self._rebuild_event_index()
             if version in {1, 2}:
                 self._rebuild_metadata_projection()
+
+            self._install_event_integrity_guard()
 
             if version is None:
                 self._host_store._db.execute(
                     "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                     (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
                 )
-            elif version in {1, 2}:
+            elif version in {1, 2, 3}:
                 self._host_store._db.execute(
                     "UPDATE component_schema SET version = ? WHERE component = ?",
                     (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
                 )
+
+    def _install_event_integrity_guard(self) -> None:
+        self._host_store._db.execute(
+            "DROP TRIGGER IF EXISTS evidence_admission_event_integrity_invalidate"
+        )
+        self._host_store._db.execute(
+            """
+            CREATE TRIGGER evidence_admission_event_integrity_invalidate
+            AFTER UPDATE OF event_json, event_digest, event_type, program_id ON events
+            WHEN EXISTS (
+                SELECT 1 FROM evidence_event_index
+                WHERE event_id = OLD.event_id
+            ) AND (
+                OLD.event_json IS NOT NEW.event_json
+                OR OLD.event_digest IS NOT NEW.event_digest
+                OR OLD.event_type IS NOT NEW.event_type
+                OR OLD.program_id IS NOT NEW.program_id
+            )
+            BEGIN
+                DELETE FROM evidence_event_index WHERE event_id = OLD.event_id;
+            END
+            """
+        )
 
     def _decode_event_row(self, row: sqlite3.Row) -> Event:
         try:
