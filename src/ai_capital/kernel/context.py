@@ -541,7 +541,11 @@ class ContextRepository:
                       AND OLD.context_source_program_id IS NOT NULL
                       AND OLD.context_source_program_revision IS NOT NULL
                       AND OLD.context_source_metadata_digest IS NOT NULL
-                      AND OLD.event_type IS NOT NEW.event_type;
+                      AND (
+                          OLD.event_type IS NOT NEW.event_type
+                          OR OLD.event_json IS NOT NEW.event_json
+                          OR OLD.event_digest IS NOT NEW.event_digest
+                      );
 
                     DELETE FROM context_persisted_source_index
                     WHERE (sequence = OLD.sequence
@@ -1080,7 +1084,8 @@ class ContextRepository:
         while True:
             row = self._host_store._db.execute(
                 """
-                SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+                SELECT sequence, event_id, program_id, event_type, event_json, event_digest,
+                       context_recall_invalidated
                 FROM events
                 WHERE event_type = 'context.compiled' AND sequence > ?
                 ORDER BY sequence
@@ -1090,6 +1095,14 @@ class ContextRepository:
             ).fetchone()
             if row is None:
                 break
+            try:
+                invalidated = int(row["context_recall_invalidated"])
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation(
+                    "compiled Context Event invalidation marker is malformed"
+                ) from exc
+            if invalidated != 0:
+                raise IntegrityViolation("compiled Context Event was invalidated")
             event = self._decode_event_row(row)
             receipt, context, used_units = self._decode_compiled_event(event)
             last_sequence = event.sequence

@@ -344,6 +344,60 @@ class EvidenceRepository:
             raise IntegrityViolation("Evidence Event integrity mismatch")
         return event
 
+    def _validate_rebuilt_event_record_binding(self, event: Event) -> None:
+        row = self._host_store._db.execute(
+            """
+            SELECT evidence_id, artifact_digest, admitted_event_id,
+                   evidence_json, evidence_record_digest,
+                   admission_json, admission_digest
+            FROM evidence_records WHERE admitted_event_id = ?
+            """,
+            (event.event_id,),
+        ).fetchone()
+        if row is None:
+            raise IntegrityViolation(
+                "Evidence admission Event lacks its durable Evidence record"
+            )
+        try:
+            evidence = record_from_json(Evidence, row["evidence_json"])
+            admission = record_from_json(
+                EvidenceAdmissionReceipt,
+                row["admission_json"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation(
+                "Evidence migration record binding cannot be decoded"
+            ) from exc
+        if not isinstance(evidence, Evidence) or not isinstance(
+            admission, EvidenceAdmissionReceipt
+        ):
+            raise IntegrityViolation(
+                "Evidence migration record binding decoded wrong type"
+            )
+        if (
+            evidence.evidence_id != row["evidence_id"]
+            or evidence.digest != row["artifact_digest"]
+            or canonical_digest(evidence) != row["evidence_record_digest"]
+            or canonical_digest(admission) != row["admission_digest"]
+            or admission.evidence_id != evidence.evidence_id
+            or admission.artifact_digest != evidence.digest
+            or row["admitted_event_id"] != event.event_id
+        ):
+            raise IntegrityViolation(
+                "Evidence migration record binding is inconsistent"
+            )
+        self._validate_evidence(evidence)
+        expected_payload = to_canonical_data(
+            {"evidence": evidence, "admission": admission}
+        )
+        if (
+            event.correlation_id != evidence.evidence_id
+            or to_canonical_data(event.payload) != expected_payload
+        ):
+            raise IntegrityViolation(
+                "Evidence record diverges from admission Event during migration"
+            )
+
     def _rebuild_event_index(self) -> None:
         self._host_store._db.execute("DELETE FROM evidence_event_index")
         rows = self._host_store._db.execute(
@@ -360,6 +414,7 @@ class EvidenceRepository:
                 raise IntegrityViolation("Evidence Event type projection mismatch")
             if not event.correlation_id:
                 raise IntegrityViolation("Evidence admission Event lacks Evidence identity")
+            self._validate_rebuilt_event_record_binding(event)
             self._host_store._db.execute(
                 """
                 INSERT INTO evidence_event_index(sequence, evidence_id, event_id, event_type)

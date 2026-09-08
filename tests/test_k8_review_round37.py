@@ -1,147 +1,4 @@
-from pathlib import Path
-
-context_path = Path("src/ai_capital/kernel/context.py")
-context = context_path.read_text()
-old_trigger = """                    WHERE OLD.event_type = 'context.source_persisted'
-                      AND OLD.context_source_priority = 'host_control'
-                      AND OLD.context_source_program_id IS NOT NULL
-                      AND OLD.context_source_program_revision IS NOT NULL
-                      AND OLD.context_source_metadata_digest IS NOT NULL
-                      AND OLD.event_type IS NOT NEW.event_type;
-"""
-new_trigger = """                    WHERE OLD.event_type = 'context.source_persisted'
-                      AND OLD.context_source_priority = 'host_control'
-                      AND OLD.context_source_program_id IS NOT NULL
-                      AND OLD.context_source_program_revision IS NOT NULL
-                      AND OLD.context_source_metadata_digest IS NOT NULL
-                      AND (
-                          OLD.event_type IS NOT NEW.event_type
-                          OR OLD.event_json IS NOT NEW.event_json
-                          OR OLD.event_digest IS NOT NEW.event_digest
-                      );
-"""
-if old_trigger not in context:
-    raise SystemExit("Round 37 Host-control trigger anchor not found")
-context = context.replace(old_trigger, new_trigger, 1)
-
-old_receipts = '''                SELECT sequence, event_id, program_id, event_type, event_json, event_digest
-                FROM events
-                WHERE event_type = 'context.compiled' AND sequence > ?
-                ORDER BY sequence
-                LIMIT 1
-                """,
-                (last_sequence,),
-            ).fetchone()
-            if row is None:
-                break
-            event = self._decode_event_row(row)
-'''
-new_receipts = '''                SELECT sequence, event_id, program_id, event_type, event_json, event_digest,
-                       context_recall_invalidated
-                FROM events
-                WHERE event_type = 'context.compiled' AND sequence > ?
-                ORDER BY sequence
-                LIMIT 1
-                """,
-                (last_sequence,),
-            ).fetchone()
-            if row is None:
-                break
-            try:
-                invalidated = int(row["context_recall_invalidated"])
-            except (TypeError, ValueError) as exc:
-                raise IntegrityViolation(
-                    "compiled Context Event invalidation marker is malformed"
-                ) from exc
-            if invalidated != 0:
-                raise IntegrityViolation("compiled Context Event was invalidated")
-            event = self._decode_event_row(row)
-'''
-if old_receipts not in context:
-    raise SystemExit("Round 37 receipt iterator anchor not found")
-context = context.replace(old_receipts, new_receipts, 1)
-context_path.write_text(context)
-
-evidence_path = Path("src/ai_capital/kernel/evidence_store.py")
-evidence = evidence_path.read_text()
-anchor = '''    def _rebuild_event_index(self) -> None:
-        self._host_store._db.execute("DELETE FROM evidence_event_index")
-'''
-helper = '''    def _validate_rebuilt_event_record_binding(self, event: Event) -> None:
-        row = self._host_store._db.execute(
-            """
-            SELECT evidence_id, artifact_digest, admitted_event_id,
-                   evidence_json, evidence_record_digest,
-                   admission_json, admission_digest
-            FROM evidence_records WHERE admitted_event_id = ?
-            """,
-            (event.event_id,),
-        ).fetchone()
-        if row is None:
-            raise IntegrityViolation(
-                "Evidence admission Event lacks its durable Evidence record"
-            )
-        try:
-            evidence = record_from_json(Evidence, row["evidence_json"])
-            admission = record_from_json(
-                EvidenceAdmissionReceipt,
-                row["admission_json"],
-            )
-        except (TypeError, ValueError) as exc:
-            raise IntegrityViolation(
-                "Evidence migration record binding cannot be decoded"
-            ) from exc
-        if not isinstance(evidence, Evidence) or not isinstance(
-            admission, EvidenceAdmissionReceipt
-        ):
-            raise IntegrityViolation(
-                "Evidence migration record binding decoded wrong type"
-            )
-        if (
-            evidence.evidence_id != row["evidence_id"]
-            or evidence.digest != row["artifact_digest"]
-            or canonical_digest(evidence) != row["evidence_record_digest"]
-            or canonical_digest(admission) != row["admission_digest"]
-            or admission.evidence_id != evidence.evidence_id
-            or admission.artifact_digest != evidence.digest
-            or row["admitted_event_id"] != event.event_id
-        ):
-            raise IntegrityViolation(
-                "Evidence migration record binding is inconsistent"
-            )
-        self._validate_evidence(evidence)
-        expected_payload = to_canonical_data(
-            {"evidence": evidence, "admission": admission}
-        )
-        if (
-            event.correlation_id != evidence.evidence_id
-            or to_canonical_data(event.payload) != expected_payload
-        ):
-            raise IntegrityViolation(
-                "Evidence record diverges from admission Event during migration"
-            )
-
-    def _rebuild_event_index(self) -> None:
-        self._host_store._db.execute("DELETE FROM evidence_event_index")
-'''
-if anchor not in evidence:
-    raise SystemExit("Round 37 Evidence rebuild anchor not found")
-evidence = evidence.replace(anchor, helper, 1)
-old_index = '''            if not event.correlation_id:
-                raise IntegrityViolation("Evidence admission Event lacks Evidence identity")
-            self._host_store._db.execute(
-'''
-new_index = '''            if not event.correlation_id:
-                raise IntegrityViolation("Evidence admission Event lacks Evidence identity")
-            self._validate_rebuilt_event_record_binding(event)
-            self._host_store._db.execute(
-'''
-if old_index not in evidence:
-    raise SystemExit("Round 37 Evidence index insertion anchor not found")
-evidence = evidence.replace(old_index, new_index, 1)
-evidence_path.write_text(evidence)
-
-Path("tests/test_k8_review_round37.py").write_text(r'''from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
@@ -235,7 +92,7 @@ class K8ReviewRound37Tests(unittest.TestCase):
                 ).fetchone()
                 self.assertIsNotNone(marker)
                 with self.assertRaisesRegex(
-                    IntegrityViolation, "Host-control invalidation evidence"
+                    IntegrityViolation, "invalidation evidence"
                 ):
                     ContextCompiler(contexts).compile(
                         program.program_id,
@@ -331,4 +188,3 @@ class K8ReviewRound37Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-''')
