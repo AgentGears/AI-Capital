@@ -2515,6 +2515,24 @@ class ContextRepository:
                 raise StaleProgramRevision(
                     "Program changed before compiled Context could be receipted"
                 )
+            included_refs = frozenset(receipt.included_refs)
+            try:
+                current_host_controls = self._current_host_control_refs(
+                    receipt.program_id,
+                    receipt.program_revision,
+                    max_refs=len(included_refs),
+                )
+            except ContextBudgetExceeded as exc:
+                raise IntegrityViolation(
+                    "compiled Context is stale relative to current Host controls"
+                ) from exc
+            if any(
+                source_ref not in included_refs
+                for source_ref in current_host_controls
+            ):
+                raise IntegrityViolation(
+                    "compiled Context is stale relative to current Host controls"
+                )
             event = self._append_event(
                 "context.compiled",
                 {
