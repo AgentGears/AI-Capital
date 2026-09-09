@@ -711,34 +711,11 @@ class ContextRepository:
                 END
                 """
             )
-            self._host_store._db.execute("DELETE FROM context_recall_event_index")
-            self._host_store._db.execute(
-                """
-                INSERT INTO context_recall_event_index(
-                    sequence, event_id, program_id, correlation_id,
-                    event_type, event_digest
-                )
-                SELECT
-                    sequence,
-                    event_id,
-                    CASE
-                        WHEN program_id IS NOT NULL THEN program_id
-                        WHEN event_type LIKE 'context.%'
-                          OR event_type LIKE 'operation.%'
-                          OR event_type LIKE 'completion.%'
-                          OR event_type LIKE 'verification.%'
-                        THEN json_extract(event_json, '$.correlation_id')
-                        ELSE NULL
-                    END,
-                    json_extract(event_json, '$.correlation_id'),
-                    event_type,
-                    event_digest
-                FROM events
-                """
-            )
-
             if version == 6:
                 self._migrate_host_control_invalidations()
+            self._rebuild_recall_event_index(
+                authenticate_events=version is None or version < 8,
+            )
             if version == 8:
                 self._migrate_compiled_event_invalidations()
             self._rebuild_persisted_source_projection()
@@ -814,6 +791,114 @@ class ContextRepository:
         ):
             raise IntegrityViolation("Context Event integrity mismatch")
         return event
+
+    def _rebuild_recall_event_index(self, *, authenticate_events: bool) -> None:
+        self._host_store._db.execute("DELETE FROM context_recall_event_index")
+        last_sequence = 0
+        while True:
+            if authenticate_events:
+                row = self._host_store._db.execute(
+                    """
+                    SELECT events.sequence, events.event_id, events.program_id,
+                           events.event_type, events.event_json, events.event_digest,
+                           events.context_recall_invalidated,
+                           EXISTS (
+                               SELECT 1
+                               FROM context_persisted_source_invalidations AS invalidation
+                               WHERE invalidation.event_id = events.event_id
+                           ) AS persisted_source_invalidated
+                    FROM events
+                    WHERE events.sequence > ?
+                    ORDER BY events.sequence
+                    LIMIT 1
+                    """,
+                    (last_sequence,),
+                ).fetchone()
+            else:
+                row = self._host_store._db.execute(
+                    """
+                    SELECT sequence, event_id, program_id, event_type, event_digest,
+                           json_extract(event_json, '$.correlation_id')
+                               AS semantic_correlation_id
+                    FROM events
+                    WHERE sequence > ?
+                    ORDER BY sequence
+                    LIMIT 1
+                    """,
+                    (last_sequence,),
+                ).fetchone()
+            if row is None:
+                break
+
+            if authenticate_events:
+                try:
+                    sequence = int(row["sequence"])
+                    invalidated = int(row["context_recall_invalidated"])
+                    persisted_source_invalidated = int(row["persisted_source_invalidated"])
+                except (TypeError, ValueError) as exc:
+                    raise IntegrityViolation(
+                        "Context Event recall-index migration metadata is malformed"
+                    ) from exc
+                last_sequence = sequence
+                if invalidated != 0 or persisted_source_invalidated != 0:
+                    continue
+                event = self._decode_event_row(row)
+                event_id = event.event_id
+                program_id = event.program_id
+                correlation_id = event.correlation_id
+                event_type = event.event_type
+                event_digest = event.digest
+            else:
+                try:
+                    sequence = int(row["sequence"])
+                except (TypeError, ValueError) as exc:
+                    raise IntegrityViolation(
+                        "Context Event recall-index metadata is malformed"
+                    ) from exc
+                event_id = row["event_id"]
+                program_id = row["program_id"]
+                correlation_id = row["semantic_correlation_id"]
+                event_type = row["event_type"]
+                event_digest = row["event_digest"]
+                if (
+                    type(event_id) is not str
+                    or not event_id.strip()
+                    or (program_id is not None and type(program_id) is not str)
+                    or (correlation_id is not None and type(correlation_id) is not str)
+                    or type(event_type) is not str
+                    or not event_type.strip()
+                    or type(event_digest) is not str
+                    or not event_digest.strip()
+                ):
+                    raise IntegrityViolation(
+                        "Context Event recall-index metadata is invalid"
+                    )
+                last_sequence = sequence
+
+            semantic_program_id = program_id
+            if semantic_program_id is None and _correlation_identifies_program(event_type):
+                semantic_program_id = correlation_id
+            try:
+                self._host_store._db.execute(
+                    """
+                    INSERT INTO context_recall_event_index(
+                        sequence, event_id, program_id, correlation_id,
+                        event_type, event_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sequence,
+                        event_id,
+                        semantic_program_id,
+                        correlation_id,
+                        event_type,
+                        event_digest,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise IntegrityViolation(
+                    "Context Event recall-index rebuild collided"
+                ) from exc
 
     def _event_by_id(self, event_id: str) -> Event:
         row = self._host_store._db.execute(
@@ -1065,20 +1150,18 @@ class ContextRepository:
             row = self._host_store._db.execute(
                 """
                 SELECT events.sequence, events.event_id, events.event_digest,
-                       events.context_recall_invalidated
+                       events.context_recall_invalidated,
+                       EXISTS (
+                           SELECT 1 FROM context_receipts AS receipt
+                           WHERE receipt.compiled_event_id = events.event_id
+                       ) AS has_receipt,
+                       EXISTS (
+                           SELECT 1 FROM context_receipt_event_index AS receipt_index
+                           WHERE receipt_index.event_id = events.event_id
+                       ) AS has_receipt_index
                 FROM events
                 WHERE events.sequence > ?
                   AND events.context_recall_invalidated != 0
-                  AND (
-                      EXISTS (
-                          SELECT 1 FROM context_receipts AS receipt
-                          WHERE receipt.compiled_event_id = events.event_id
-                      )
-                      OR EXISTS (
-                          SELECT 1 FROM context_receipt_event_index AS receipt_index
-                          WHERE receipt_index.event_id = events.event_id
-                      )
-                  )
                 ORDER BY events.sequence
                 LIMIT 1
                 """,
@@ -1089,6 +1172,8 @@ class ContextRepository:
             try:
                 sequence = int(row["sequence"])
                 invalidated = int(row["context_recall_invalidated"])
+                has_receipt = int(row["has_receipt"])
+                has_receipt_index = int(row["has_receipt_index"])
             except (TypeError, ValueError) as exc:
                 raise IntegrityViolation(
                     "compiled Context Event migration metadata is malformed"
@@ -1098,6 +1183,8 @@ class ContextRepository:
             event_digest = row["event_digest"]
             if (
                 invalidated == 0
+                or has_receipt not in {0, 1}
+                or has_receipt_index not in {0, 1}
                 or type(event_id) is not str
                 or not event_id.strip()
                 or type(event_digest) is not str
@@ -1106,6 +1193,40 @@ class ContextRepository:
                 raise IntegrityViolation(
                     "compiled Context Event migration metadata is invalid"
                 )
+
+            if not has_receipt and not has_receipt_index:
+                envelope_row = self._host_store._db.execute(
+                    "SELECT event_json FROM events WHERE sequence = ?",
+                    (sequence,),
+                ).fetchone()
+                if envelope_row is None:
+                    raise IntegrityViolation(
+                        "legacy invalidated Event envelope is missing"
+                    )
+                try:
+                    legacy_event = record_from_json(Event, envelope_row["event_json"])
+                except (TypeError, ValueError) as exc:
+                    raise IntegrityViolation(
+                        "legacy invalidated Event envelope cannot be decoded"
+                    ) from exc
+                if not isinstance(legacy_event, Event):
+                    raise IntegrityViolation(
+                        "legacy invalidated Event envelope decoded wrong type"
+                    )
+                if (
+                    legacy_event.sequence != sequence
+                    or legacy_event.event_id != event_id
+                    or legacy_event.digest != event_digest
+                    or not verify_event_digest(legacy_event)
+                ):
+                    raise IntegrityViolation(
+                        "legacy invalidated Event envelope authentication mismatch"
+                    )
+                if legacy_event.event_type != "context.compiled":
+                    raise IntegrityViolation(
+                        "legacy invalidated Event cannot be classified safely"
+                    )
+
             self._host_store._db.execute(
                 """
                 INSERT OR IGNORE INTO context_compiled_event_invalidations(
