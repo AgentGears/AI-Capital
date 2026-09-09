@@ -27,7 +27,7 @@ from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "bounded_context"
-_COMPONENT_SCHEMA_VERSION = 9
+_COMPONENT_SCHEMA_VERSION = 10
 _EVENT_REF_PREFIX = "event:"
 _EVIDENCE_REF_PREFIX = "evidence:"
 _CAPABILITY_REF_PREFIX = "capability_snapshot:"
@@ -362,7 +362,7 @@ class ContextRepository:
                     f"Context schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, 1, 2, 3, 4, 5, 6, 7, 8, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, 2, 3, 4, 5, 6, 7, 8, 9, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Context schema version {version}")
 
             event_columns = {
@@ -714,9 +714,9 @@ class ContextRepository:
             if version == 6:
                 self._migrate_host_control_invalidations()
             self._rebuild_recall_event_index(
-                authenticate_events=version is None or version < 8,
+                authenticate_events=version is None or version < 8 or version == 9,
             )
-            if version == 8:
+            if version in {8, 9}:
                 self._migrate_compiled_event_invalidations()
             self._rebuild_persisted_source_projection()
 
@@ -725,7 +725,7 @@ class ContextRepository:
                     "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                     (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
                 )
-            elif version in {1, 2, 3, 4, 5, 6, 7, 8}:
+            elif version in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
                 self._host_store._db.execute(
                     "UPDATE component_schema SET version = ? WHERE component = ?",
                     (_COMPONENT_SCHEMA_VERSION, _COMPONENT),

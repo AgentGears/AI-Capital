@@ -105,7 +105,7 @@ class K8ReviewRound34Tests(unittest.TestCase):
                 version = reopened._db.execute(
                     "SELECT version FROM component_schema WHERE component = 'bounded_context'"
                 ).fetchone()[0]
-                self.assertEqual(int(version), 9)
+                self.assertEqual(int(version), 10)
             finally:
                 reopened.close()
 

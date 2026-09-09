@@ -111,7 +111,7 @@ class K8ReviewRound29Tests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = ?",
                     ("context_persisted_source_event_content_invalidate",),
                 ).fetchone()
-                self.assertEqual(int(version), 9)
+                self.assertEqual(int(version), 10)
                 self.assertIsNotNone(trigger)
 
                 with programs._transaction():
