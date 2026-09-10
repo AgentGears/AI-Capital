@@ -1250,7 +1250,8 @@ class ContextRepository:
         while True:
             row = self._host_store._db.execute(
                 """
-                SELECT sequence, event_id, program_id, event_type, event_json, event_digest
+                SELECT sequence, event_id, program_id, event_type, event_json, event_digest,
+                       context_recall_invalidated
                 FROM events
                 WHERE event_type = 'context.source_persisted' AND sequence > ?
                 ORDER BY sequence
@@ -1260,6 +1261,24 @@ class ContextRepository:
             ).fetchone()
             if row is None:
                 break
+            try:
+                invalidated = int(row["context_recall_invalidated"])
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation(
+                    "persisted Context source invalidation marker is malformed"
+                ) from exc
+            if invalidated != 0:
+                host_control_invalidation = self._host_store._db.execute(
+                    "SELECT 1 FROM context_persisted_source_invalidations "
+                    "WHERE event_id = ? LIMIT 1",
+                    (str(row["event_id"]),),
+                ).fetchone()
+                if host_control_invalidation is not None:
+                    last_sequence = int(row["sequence"])
+                    continue
+                raise IntegrityViolation(
+                    "persisted Context source Event was invalidated"
+                )
             event = self._decode_event_row(row)
             last_sequence = event.sequence
             if not event.correlation_id:
@@ -1660,6 +1679,7 @@ class ContextRepository:
                 events.sequence AS event_sequence,
                 events.event_type AS event_type,
                 events.event_digest AS semantic_event_digest,
+                events.context_recall_invalidated AS semantic_event_invalidated,
                 length(CAST(events.event_json AS BLOB)) AS semantic_event_units,
                 context_persisted_source_index.sequence AS indexed_sequence,
                 context_persisted_source_index.event_id AS indexed_event_id,
@@ -1680,6 +1700,16 @@ class ContextRepository:
         ).fetchone()
         if row is None:
             raise InvalidRequest(f"unknown durable Context address: {source_ref}")
+        try:
+            semantic_event_invalidated = int(row["semantic_event_invalidated"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation(
+                "persisted Context source invalidation marker is malformed"
+            ) from exc
+        if semantic_event_invalidated != 0:
+            raise IntegrityViolation(
+                "persisted Context source Event was invalidated"
+            )
         if row["indexed_event_id"] is None:
             if row["event_type"] == "context.source_persisted":
                 raise IntegrityViolation(
