@@ -17,7 +17,7 @@ from .serialization import canonical_digest, to_canonical_data
 
 
 _COMPONENT = "evidence_store"
-_COMPONENT_SCHEMA_VERSION = 4
+_COMPONENT_SCHEMA_VERSION = 5
 _ARTIFACT_PREFIX = "evidence-artifact:"
 _ARTIFACT_VERIFY_CHUNK_BYTES = 64 * 1024
 
@@ -221,7 +221,7 @@ class EvidenceRepository:
                     f"Evidence schema version {version} is newer than supported "
                     f"{_COMPONENT_SCHEMA_VERSION}"
                 )
-            if version not in {None, 1, 2, 3, _COMPONENT_SCHEMA_VERSION}:
+            if version not in {None, 1, 2, 3, 4, _COMPONENT_SCHEMA_VERSION}:
                 raise IntegrityViolation(f"unsupported Evidence schema version {version}")
 
             if version is None:
@@ -286,7 +286,7 @@ class EvidenceRepository:
                         "ALTER TABLE evidence_records ADD COLUMN metadata_projection_digest TEXT"
                     )
 
-            if version in {None, 1, 2, 3}:
+            if version in {None, 1, 2, 3, 4}:
                 self._rebuild_event_index()
             if version in {1, 2}:
                 self._rebuild_metadata_projection()
@@ -298,7 +298,7 @@ class EvidenceRepository:
                     "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                     (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
                 )
-            elif version in {1, 2, 3}:
+            elif version in {1, 2, 3, 4}:
                 self._host_store._db.execute(
                     "UPDATE component_schema SET version = ? WHERE component = ?",
                     (_COMPONENT_SCHEMA_VERSION, _COMPONENT),

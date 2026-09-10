@@ -158,7 +158,7 @@ class K8ReviewRound33Tests(unittest.TestCase):
                 version = original_connection.execute(
                     "SELECT version FROM component_schema WHERE component = 'evidence_store'"
                 ).fetchone()[0]
-                self.assertEqual(int(version), 4)
+                self.assertEqual(int(version), 5)
                 self.assertIsNotNone(migrated)
             finally:
                 reopened._connection = original_connection
