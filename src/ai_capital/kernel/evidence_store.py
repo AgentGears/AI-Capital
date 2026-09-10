@@ -19,6 +19,7 @@ from .serialization import canonical_digest, to_canonical_data
 _COMPONENT = "evidence_store"
 _COMPONENT_SCHEMA_VERSION = 4
 _ARTIFACT_PREFIX = "evidence-artifact:"
+_ARTIFACT_VERIFY_CHUNK_BYTES = 64 * 1024
 
 
 def _evidence_metadata_projection_digest(
@@ -566,6 +567,30 @@ class EvidenceRepository:
             raise IntegrityViolation("Evidence artifact byte length is invalid")
         return stored_length
 
+    def _authenticate_artifact_content(
+        self,
+        artifact_digest: str,
+        *,
+        expected_length: int,
+    ) -> None:
+        path = self._artifact_path(artifact_digest)
+        remaining = expected_length
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                while remaining > 0:
+                    chunk = handle.read(min(_ARTIFACT_VERIFY_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        raise IntegrityViolation("Evidence artifact byte length mismatch")
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                if handle.read(1):
+                    raise IntegrityViolation("Evidence artifact byte length mismatch")
+        except OSError as exc:
+            raise IntegrityViolation("Evidence artifact cannot be read") from exc
+        if digest.hexdigest() != artifact_digest:
+            raise IntegrityViolation("Evidence artifact digest mismatch")
+
     def _artifact_preflight(
         self,
         artifact_digest: str,
@@ -594,6 +619,10 @@ class EvidenceRepository:
             raise IntegrityViolation("Evidence artifact content reference mismatch")
         if self._artifact_stored_length(artifact_digest) != expected_length:
             raise IntegrityViolation("Evidence artifact byte length mismatch")
+        self._authenticate_artifact_content(
+            artifact_digest,
+            expected_length=expected_length,
+        )
         return expected_length
 
     def _read_artifact(self, artifact_digest: str, *, expected_length: int) -> bytes:

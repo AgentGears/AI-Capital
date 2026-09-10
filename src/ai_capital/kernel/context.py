@@ -508,6 +508,14 @@ class ContextRepository:
             )
             self._host_store._db.execute(
                 """
+                CREATE INDEX IF NOT EXISTS context_persisted_source_program_revision_priority
+                ON context_persisted_source_index(
+                    program_id, program_revision, priority, event_id
+                )
+                """
+            )
+            self._host_store._db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS context_persisted_source_invalidations (
                     sequence INTEGER PRIMARY KEY,
                     event_id TEXT NOT NULL UNIQUE,
