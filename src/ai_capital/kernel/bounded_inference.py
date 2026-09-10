@@ -55,6 +55,7 @@ class BoundedInferenceHost(InferenceHost):
             )
 
     def _validate_post_provider_freshness(self, request: InferenceRequest) -> None:
+        self._contexts.validate(request.context_receipt, request.context)
         self._validate_host_control_freshness(request.context_receipt)
 
     def infer(
