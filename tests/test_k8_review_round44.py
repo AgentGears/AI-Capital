@@ -80,7 +80,7 @@ class K8ReviewRound44Tests(unittest.TestCase):
                                 programs._db.execute(
                                     """
                                     UPDATE events
-                                    SET event_json = event_json || ' '
+                                    SET event_json = '{}'
                                     WHERE event_id = ?
                                     """,
                                     (compiled_event_id,),
