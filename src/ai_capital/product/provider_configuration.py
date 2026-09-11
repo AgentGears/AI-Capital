@@ -91,6 +91,12 @@ def _require_text(value: str, *, field: str) -> str:
     return value
 
 
+def _stored_int(value: object, *, field: str) -> int:
+    if type(value) is not int:
+        raise IntegrityViolation(f"{field} is malformed")
+    return value
+
+
 def _runtime_model_binding(binding_id: str, revision: int) -> str:
     return "provider-binding:" + canonical_digest(
         {"binding_id": binding_id, "revision": revision}
@@ -239,7 +245,7 @@ class ProviderConfigurationRepository:
                     f"provider configuration unique-key mismatch: {table_name}"
                 )
 
-    def _install_history_guards(self) -> None:
+    def _install_integrity_guards(self) -> None:
         self._host_store._db.execute(
             """
             CREATE TRIGGER IF NOT EXISTS provider_configuration_history_no_update
@@ -255,6 +261,15 @@ class ProviderConfigurationRepository:
             BEFORE DELETE ON provider_configuration_revisions
             BEGIN
                 SELECT RAISE(ABORT, 'provider configuration history is immutable');
+            END
+            """
+        )
+        self._host_store._db.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS provider_configuration_projection_no_delete
+            BEFORE DELETE ON provider_configuration_projections
+            BEGIN
+                SELECT RAISE(ABORT, 'provider configuration projection cannot be deleted');
             END
             """
         )
@@ -274,12 +289,10 @@ class ProviderConfigurationRepository:
                 (_COMPONENT,),
             ).fetchone()
             if row is not None:
-                try:
-                    version = int(row["version"])
-                except (TypeError, ValueError) as exc:
-                    raise IntegrityViolation(
-                        "provider configuration schema version is malformed"
-                    ) from exc
+                version = _stored_int(
+                    row["version"],
+                    field="provider configuration schema version",
+                )
                 if version > _COMPONENT_SCHEMA_VERSION:
                     raise IntegrityViolation(
                         f"provider configuration schema version {version} is newer than supported "
@@ -290,7 +303,7 @@ class ProviderConfigurationRepository:
                         f"unsupported provider configuration schema version {version}"
                     )
                 self._verify_schema_shape()
-                self._install_history_guards()
+                self._install_integrity_guards()
                 return
 
             if any(self._table_exists(table_name) for table_name in _EXPECTED_COLUMNS):
@@ -321,7 +334,7 @@ class ProviderConfigurationRepository:
                 """
             )
             self._verify_schema_shape()
-            self._install_history_guards()
+            self._install_integrity_guards()
             self._host_store._db.execute(
                 "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                 (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
@@ -342,10 +355,10 @@ class ProviderConfigurationRepository:
             validate_provider_configuration(configuration)
         except InvalidRequest as exc:
             raise IntegrityViolation("provider configuration is invalid") from exc
-        try:
-            row_revision = int(row["revision"])
-        except (TypeError, ValueError) as exc:
-            raise IntegrityViolation("provider configuration row revision is malformed") from exc
+        row_revision = _stored_int(
+            row["revision"],
+            field="provider configuration row revision",
+        )
         if (
             configuration.binding_id != row["binding_id"]
             or configuration.revision != row_revision
@@ -355,8 +368,8 @@ class ProviderConfigurationRepository:
             raise IntegrityViolation("provider configuration row/digest binding mismatch")
         return configuration
 
-    def _projection_row(self, binding_id: str) -> sqlite3.Row:
-        row = self._host_store._db.execute(
+    def _projection_row(self, binding_id: str) -> sqlite3.Row | None:
+        return self._host_store._db.execute(
             """
             SELECT binding_id, revision, model_binding,
                    configuration_json, configuration_digest
@@ -364,13 +377,8 @@ class ProviderConfigurationRepository:
             """,
             (binding_id,),
         ).fetchone()
-        if row is None:
-            raise InvalidRequest(f"unknown provider binding: {binding_id}")
-        return row
 
     def _validated_history(self, binding_id: str) -> tuple[ProviderConfiguration, ...]:
-        projection_row = self._projection_row(binding_id)
-        projection = self._configuration_from_row(projection_row)
         rows = self._host_store._db.execute(
             """
             SELECT binding_id, revision, model_binding,
@@ -380,8 +388,16 @@ class ProviderConfigurationRepository:
             """,
             (binding_id,),
         ).fetchall()
+        projection_row = self._projection_row(binding_id)
+        if projection_row is None:
+            if rows:
+                raise IntegrityViolation(
+                    "provider configuration history lacks its current projection"
+                )
+            raise InvalidRequest(f"unknown provider binding: {binding_id}")
         if not rows:
             raise IntegrityViolation("provider configuration projection lacks history")
+        projection = self._configuration_from_row(projection_row)
         history = tuple(self._configuration_from_row(row) for row in rows)
         for expected_revision, configuration in enumerate(history):
             if configuration.revision != expected_revision:
@@ -493,10 +509,26 @@ class ProviderConfigurationRepository:
         return self._validated_history(binding_id)[-1]
 
     def list(self) -> tuple[ProviderConfiguration, ...]:
-        rows = self._host_store._db.execute(
-            "SELECT binding_id FROM provider_configuration_projections ORDER BY binding_id"
-        ).fetchall()
-        return tuple(self.get(str(row["binding_id"])) for row in rows)
+        projection_ids = tuple(
+            str(row["binding_id"])
+            for row in self._host_store._db.execute(
+                "SELECT binding_id FROM provider_configuration_projections ORDER BY binding_id"
+            ).fetchall()
+        )
+        history_ids = tuple(
+            str(row["binding_id"])
+            for row in self._host_store._db.execute(
+                """
+                SELECT DISTINCT binding_id FROM provider_configuration_revisions
+                ORDER BY binding_id
+                """
+            ).fetchall()
+        )
+        if projection_ids != history_ids:
+            raise IntegrityViolation(
+                "provider configuration projection/history identity set mismatch"
+            )
+        return tuple(self.get(binding_id) for binding_id in projection_ids)
 
     def history(self, binding_id: str) -> tuple[ProviderConfiguration, ...]:
         _require_text(binding_id, field="binding_id")
