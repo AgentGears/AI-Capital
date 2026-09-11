@@ -63,6 +63,7 @@ class H2ProviderCliTests(unittest.TestCase):
             registered_json = json.loads(registered.stdout)
             self.assertEqual(registered_json["binding_id"], "binding-a")
             self.assertEqual(registered_json["revision"], 0)
+            self.assertEqual(registered_json["model_binding"], "binding-a")
 
             listed = _run(database, "providers")
             self.assertEqual(listed.returncode, 0, listed.stderr)
@@ -84,6 +85,10 @@ class H2ProviderCliTests(unittest.TestCase):
             self.assertEqual(updated.returncode, 0, updated.stderr)
             updated_json = json.loads(updated.stdout)
             self.assertEqual(updated_json["revision"], 1)
+            self.assertNotEqual(
+                updated_json["model_binding"],
+                registered_json["model_binding"],
+            )
 
             history = _run(database, "provider-history", "binding-a")
             self.assertEqual(history.returncode, 0, history.stderr)
@@ -110,8 +115,89 @@ class H2ProviderCliTests(unittest.TestCase):
             rebound_json = json.loads(rebound.stdout)
             self.assertEqual(rebound_json["actor"]["actor_id"], "a-1")
             self.assertEqual(rebound_json["actor"]["generation"], 1)
-            self.assertEqual(rebound_json["actor"]["model_binding"], "binding-a")
+            self.assertEqual(
+                rebound_json["actor"]["model_binding"],
+                updated_json["model_binding"],
+            )
             self.assertEqual(rebound_json["provider"], updated_json)
+
+    def test_provider_update_does_not_silently_change_bound_actor_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "capital.db"
+            with ProgramRepository(database) as programs:
+                ActorRepository(programs).register(
+                    Actor("a-1", 0, "worker", "legacy-binding")
+                )
+
+            registered = _run(
+                database,
+                "provider-register",
+                "--binding-id",
+                "binding-a",
+                "--adapter",
+                "adapter-a",
+                "--model",
+                "model-a",
+            )
+            self.assertEqual(registered.returncode, 0, registered.stderr)
+            revision_zero = json.loads(registered.stdout)
+            rebound_zero = _run(
+                database,
+                "actor-rebind",
+                "a-1",
+                "binding-a",
+                "--expected-generation",
+                "0",
+                "--expected-provider-revision",
+                "0",
+            )
+            self.assertEqual(rebound_zero.returncode, 0, rebound_zero.stderr)
+            actor_zero = json.loads(rebound_zero.stdout)
+            self.assertEqual(actor_zero["actor"]["generation"], 1)
+            self.assertEqual(actor_zero["provider"], revision_zero)
+
+            updated = _run(
+                database,
+                "provider-update",
+                "binding-a",
+                "--expected-revision",
+                "0",
+                "--adapter",
+                "adapter-b",
+                "--model",
+                "model-b",
+            )
+            self.assertEqual(updated.returncode, 0, updated.stderr)
+            revision_one = json.loads(updated.stdout)
+
+            still_zero = _run(database, "actor-provider", "a-1")
+            self.assertEqual(still_zero.returncode, 0, still_zero.stderr)
+            still_zero_json = json.loads(still_zero.stdout)
+            self.assertEqual(still_zero_json["actor"]["generation"], 1)
+            self.assertEqual(
+                still_zero_json["actor"]["model_binding"],
+                revision_zero["model_binding"],
+            )
+            self.assertEqual(still_zero_json["provider"], revision_zero)
+
+            rebound_one = _run(
+                database,
+                "actor-rebind",
+                "a-1",
+                "binding-a",
+                "--expected-generation",
+                "1",
+                "--expected-provider-revision",
+                "1",
+            )
+            self.assertEqual(rebound_one.returncode, 0, rebound_one.stderr)
+            actor_one = json.loads(rebound_one.stdout)
+            self.assertEqual(actor_one["actor"]["generation"], 2)
+            self.assertEqual(
+                actor_one["actor"]["model_binding"],
+                revision_one["model_binding"],
+            )
+            self.assertEqual(actor_one["provider"], revision_one)
 
     def test_cli_rejects_malformed_or_non_object_provider_settings(self):
         with tempfile.TemporaryDirectory() as directory:
