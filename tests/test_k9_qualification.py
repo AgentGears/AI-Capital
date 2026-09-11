@@ -14,7 +14,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ai_capital.kernel.actor_store import ActorRepository
 from ai_capital.kernel.authority import AuthorityEngine, PolicySnapshot
 from ai_capital.kernel.authority_store import AuthorityRepository
-from ai_capital.kernel.bounded_inference import BoundedInferenceHost
 from ai_capital.kernel.builtin_capabilities import install_builtin_capabilities
 from ai_capital.kernel.capability_broker import CapabilityBroker, CapabilityHandlerRegistry
 from ai_capital.kernel.capability_store import CapabilityRepository
@@ -41,7 +40,6 @@ from ai_capital.kernel.evidence_store import EvidenceRepository
 from ai_capital.kernel.inference import InferenceHost, ModelBindingRegistry
 from ai_capital.kernel.models import Actor, CapabilityRequest, ContextReceipt, Grant, Program, WorkItem
 from ai_capital.kernel.operation_journal import (
-    ExecutionObservation,
     OperationHost,
     OperationJournal,
     ReconciliationObservation,
@@ -519,7 +517,11 @@ OperationHost(journal, authority).execute_authorized(
                 traced_claim = claims.get(traced_contract.required_claim_refs[0])
                 self.assertEqual(traced_claim.claim_id, claim.claim_id)
                 support_refs = claims.verification_evidence(traced_claim.claim_id)
-                self.assertEqual(tuple(ref.evidence_id for ref in support_refs), (admitted.evidence_id,))
+                self.assertEqual(traced_verification.evidence_refs, (admitted.evidence_id,))
+                self.assertEqual(
+                    tuple(ref.evidence_id for ref in support_refs),
+                    traced_verification.evidence_refs,
+                )
                 traced_evidence = evidence.get(support_refs[0].evidence_id)
                 artifact = evidence.artifact(traced_evidence.evidence_id)
                 admission = evidence.admission(traced_evidence.evidence_id)
