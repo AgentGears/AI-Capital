@@ -283,6 +283,15 @@ class ProgramRepository:
     def get(self, program_id: str) -> Program:
         return self._program_from_row(self._read_projection_row(program_id))
 
+    def list_programs(self) -> tuple[Program, ...]:
+        rows = self._db.execute(
+            """
+            SELECT program_id, revision, projection_json, projection_digest, last_sequence
+            FROM program_projections ORDER BY program_id
+            """
+        ).fetchall()
+        return tuple(self._program_from_row(row) for row in rows)
+
     def _commit_change(
         self,
         *,
