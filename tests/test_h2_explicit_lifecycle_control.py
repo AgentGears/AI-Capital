@@ -79,6 +79,8 @@ class H2ExplicitLifecycleControlTests(unittest.TestCase):
                 self.assertTrue(paused["control"]["paused"])
                 self.assertEqual(paused["lifecycle"]["execution_state"], "paused")
                 self.assertEqual(paused["lifecycle"]["reason_code"], "user_paused")
+                with self.assertRaises(InvalidStateTransition):
+                    operator._controls.require_runnable("p-1")
 
             with LocalProgramOperator.open(database) as restarted:
                 self.assertEqual(restarted.show("p-1"), paused)
@@ -94,6 +96,7 @@ class H2ExplicitLifecycleControlTests(unittest.TestCase):
                 self.assertEqual(resumed["control"]["program_revision"], 1)
                 self.assertFalse(resumed["control"]["paused"])
                 self.assertEqual(resumed["lifecycle"]["execution_state"], "running")
+                restarted._controls.require_runnable("p-1")
                 history = restarted._controls.history("p-1")
                 self.assertEqual([item.revision for item in history], [1, 2])
                 self.assertEqual([item.paused for item in history], [True, False])
@@ -221,6 +224,8 @@ class H2ExplicitLifecycleControlTests(unittest.TestCase):
                 connection.close()
             with self.assertRaises(IntegrityViolation):
                 LocalProgramOperator.open(database)
+            with ProgramRepository(database) as programs:
+                self.assertEqual(programs.get("p-1").program_id, "p-1")
 
     def test_coherent_control_anchor_to_non_active_program_revision_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
