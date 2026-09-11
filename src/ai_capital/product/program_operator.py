@@ -50,7 +50,11 @@ class LocalProgramOperator:
         return value
 
     def _lifecycle(self, program: Program, control: ProgramControl) -> dict[str, Any]:
-        pending = self._operations.pending_reconciliation_for_program(program.program_id)
+        pending = tuple(
+            operation
+            for operation in self._operations.pending_reconciliation()
+            if operation.program_id == program.program_id
+        )
         pending_refs = tuple(operation.operation_id for operation in pending)
 
         if pending_refs:
