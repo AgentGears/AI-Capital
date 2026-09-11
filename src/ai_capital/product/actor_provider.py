@@ -5,9 +5,19 @@ from typing import Any
 
 from ..kernel.actor_store import ActorRepository
 from ..kernel.durable_program import ProgramRepository
-from ..kernel.errors import InvalidRequest, StaleProviderConfigurationRevision
+from ..kernel.errors import (
+    IntegrityViolation,
+    InvalidRequest,
+    StaleProviderConfigurationRevision,
+)
 from ..kernel.serialization import to_canonical_data
 from .provider_configuration import ProviderConfigurationRepository
+
+
+_PROVIDER_TABLES = (
+    "provider_configuration_revisions",
+    "provider_configuration_projections",
+)
 
 
 class LocalActorProviderOperator:
@@ -62,7 +72,23 @@ class LocalActorProviderOperator:
             "SELECT version FROM component_schema WHERE component = ?",
             (component,),
         ).fetchone()
-        return None if row is None else int(row["version"])
+        if row is None:
+            return None
+        try:
+            return int(row["version"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation(f"{component} schema version is malformed") from exc
+
+    def _provider_tables_exist(self) -> bool:
+        placeholders = ",".join("?" for _ in _PROVIDER_TABLES)
+        row = self._programs._db.execute(
+            f"""
+            SELECT COUNT(*) AS count FROM sqlite_master
+            WHERE type = 'table' AND name IN ({placeholders})
+            """,
+            _PROVIDER_TABLES,
+        ).fetchone()
+        return int(row["count"]) != 0
 
     def _actor_repository(self) -> ActorRepository:
         self._ensure_open()
@@ -72,9 +98,17 @@ class LocalActorProviderOperator:
             self._actors = ActorRepository(self._programs)
         return self._actors
 
-    def _provider_repository(self, *, required: bool) -> ProviderConfigurationRepository | None:
+    def _provider_repository(
+        self,
+        *,
+        required: bool,
+    ) -> ProviderConfigurationRepository | None:
         self._ensure_open()
-        if self._component_version("product_provider_configuration") is None:
+        version = self._component_version("product_provider_configuration")
+        if version is None:
+            if self._provider_tables_exist():
+                # Let repository admission diagnose marker/table divergence.
+                return ProviderConfigurationRepository(self._programs)
             if required:
                 raise InvalidRequest("provider configuration is not initialized")
             return None
@@ -88,15 +122,9 @@ class LocalActorProviderOperator:
         provider = None
         repository = self._provider_repository(required=False)
         if repository is not None:
-            row = self._programs._db.execute(
-                """
-                SELECT 1 FROM provider_configuration_projections
-                WHERE binding_id = ?
-                """,
-                (actor.model_binding,),
-            ).fetchone()
-            if row is not None:
-                provider = to_canonical_data(repository.get(actor.model_binding))
+            configuration = repository.by_model_binding(actor.model_binding)
+            if configuration is not None:
+                provider = to_canonical_data(configuration)
         return {
             "actor": to_canonical_data(actor),
             "provider": provider,
@@ -124,7 +152,7 @@ class LocalActorProviderOperator:
         actors = self._actor_repository()
         actors.replace_binding(
             actor_id,
-            binding_id,
+            configuration.model_binding,
             expected_generation=expected_generation,
         )
         return self.show(actor_id)
