@@ -625,6 +625,27 @@ class ContextRepository:
                 END
                 """
             )
+            self._host_store._db.execute(
+                "DROP TRIGGER IF EXISTS context_persisted_source_invalidation_guard"
+            )
+            self._host_store._db.execute(
+                """
+                CREATE TRIGGER context_persisted_source_invalidation_guard
+                BEFORE UPDATE OF context_recall_invalidated ON events
+                WHEN OLD.context_recall_invalidated != 0
+                  AND NEW.context_recall_invalidated = 0
+                  AND (
+                      OLD.event_type = 'context.source_persisted'
+                      OR NEW.event_type = 'context.source_persisted'
+                  )
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'persisted Context source invalidation cannot be cleared'
+                    );
+                END
+                """
+            )
 
             persisted_source_columns = {
                 str(column["name"])
@@ -1648,6 +1669,7 @@ class ContextRepository:
     def persisted_source(self, program_id: str, source_ref: str) -> ContextSource:
         if not source_ref.startswith(_EVENT_REF_PREFIX):
             raise InvalidRequest("persisted Context source must use an Event address")
+        self._persisted_source_preflight(program_id, source_ref)
         event = self._event_by_id(source_ref[len(_EVENT_REF_PREFIX) :])
         _, source = self._source_from_persisted_event(
             event,
@@ -1658,6 +1680,7 @@ class ContextRepository:
     def persisted_source_revision(self, program_id: str, source_ref: str) -> int:
         if not source_ref.startswith(_EVENT_REF_PREFIX):
             raise InvalidRequest("persisted Context source must use an Event address")
+        self._persisted_source_preflight(program_id, source_ref)
         event = self._event_by_id(source_ref[len(_EVENT_REF_PREFIX) :])
         persisted, _ = self._source_from_persisted_event(
             event,
