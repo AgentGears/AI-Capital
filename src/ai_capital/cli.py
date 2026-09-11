@@ -50,6 +50,30 @@ def _parser() -> argparse.ArgumentParser:
     cancel.add_argument("program_id")
     cancel.add_argument("--expected-revision", required=True, type=int)
 
+    asks = commands.add_parser("asks", help="List Program-scoped approval requests.")
+    asks.add_argument("program_id")
+
+    approve = commands.add_parser("approve", help="Approve one current ASK decision.")
+    approve.add_argument("decision_id")
+
+    audit_operation = commands.add_parser(
+        "audit-operation",
+        help="Inspect authenticated Operation provenance.",
+    )
+    audit_operation.add_argument("operation_id")
+
+    audit_evidence = commands.add_parser(
+        "audit-evidence",
+        help="Inspect authenticated Evidence provenance.",
+    )
+    audit_evidence.add_argument("evidence_id")
+
+    audit_verification = commands.add_parser(
+        "audit-verification",
+        help="Inspect authenticated Verification provenance.",
+    )
+    audit_verification.add_argument("verification_id")
+
     return parser
 
 
@@ -110,6 +134,16 @@ def main(
                     args.program_id,
                     expected_revision=args.expected_revision,
                 )
+            elif args.command == "asks":
+                result = operator.asks(args.program_id)
+            elif args.command == "approve":
+                result = operator.approve(args.decision_id)
+            elif args.command == "audit-operation":
+                result = operator.audit_operation(args.operation_id)
+            elif args.command == "audit-evidence":
+                result = operator.audit_evidence(args.evidence_id)
+            elif args.command == "audit-verification":
+                result = operator.audit_verification(args.verification_id)
             else:
                 raise AssertionError(f"unhandled command: {args.command}")
     except AICapitalError as exc:
