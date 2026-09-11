@@ -141,8 +141,9 @@ class H2ProviderConfigurationTests(unittest.TestCase):
                 )
             with ProgramRepository(database) as programs:
                 programs._db.execute("DROP TABLE provider_configuration_projections")
-            with self.assertRaises(IntegrityViolation):
-                LocalProviderOperator.open(database)
+            with LocalProviderOperator.open(database) as restarted:
+                with self.assertRaises(IntegrityViolation):
+                    restarted.list()
 
     def test_read_only_provider_listing_does_not_bootstrap_provider_schema(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -268,7 +269,7 @@ class H2ProviderConfigurationTests(unittest.TestCase):
                     """
                     SELECT 1 FROM component_schema
                     WHERE component = 'product_provider_configuration'
-                    """
+                    """,
                 ).fetchone()
                 self.assertIsNone(row)
 
