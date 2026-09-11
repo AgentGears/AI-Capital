@@ -1,1 +1,1 @@
-# AI-Capital
+AI Capital
