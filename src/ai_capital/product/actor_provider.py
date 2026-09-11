@@ -74,10 +74,10 @@ class LocalActorProviderOperator:
         ).fetchone()
         if row is None:
             return None
-        try:
-            return int(row["version"])
-        except (TypeError, ValueError) as exc:
-            raise IntegrityViolation(f"{component} schema version is malformed") from exc
+        value = row["version"]
+        if type(value) is not int:
+            raise IntegrityViolation(f"{component} schema version is malformed")
+        return value
 
     def _provider_tables_exist(self) -> bool:
         placeholders = ",".join("?" for _ in _PROVIDER_TABLES)
