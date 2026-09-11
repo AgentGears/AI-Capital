@@ -15,12 +15,13 @@ from .errors import (
 from .events import utc_now
 from .models import Capability, CapabilityDescriptor, CapabilitySnapshot
 from .schema_codec import record_from_json, record_to_json
-from .serialization import canonical_digest
+from .serialization import canonical_digest, canonical_json
 from .structured_schema import validate_schema_definition
 
 
 _COMPONENT = "capability_registry"
-_COMPONENT_SCHEMA_VERSION = 1
+_COMPONENT_SCHEMA_VERSION = 2
+_BINDING_STORAGE_OVERHEAD_LIMIT = 4096
 
 
 def capability_descriptor(capability: Capability) -> CapabilityDescriptor:
@@ -66,9 +67,14 @@ class CapabilityRepository:
                         f"Capability schema version {version} is newer than supported "
                         f"{_COMPONENT_SCHEMA_VERSION}"
                     )
-                if version != _COMPONENT_SCHEMA_VERSION:
+                if version not in {1, _COMPONENT_SCHEMA_VERSION}:
                     raise IntegrityViolation(
                         f"unsupported Capability schema version {version}"
+                    )
+                if version == 1:
+                    self._host_store._db.execute(
+                        "UPDATE component_schema SET version = ? WHERE component = ?",
+                        (_COMPONENT_SCHEMA_VERSION, _COMPONENT),
                     )
                 return
 
@@ -123,6 +129,17 @@ class CapabilityRepository:
         validate_schema_definition(capability.input_schema, path="$input_schema")
         validate_schema_definition(capability.output_schema, path="$output_schema")
 
+    @staticmethod
+    def _validate_binding_storage(capability: Capability) -> None:
+        descriptor_units = len(
+            canonical_json(capability_descriptor(capability)).encode("utf-8")
+        )
+        binding_units = len(record_to_json(capability).encode("utf-8"))
+        if binding_units > descriptor_units + _BINDING_STORAGE_OVERHEAD_LIMIT:
+            raise InvalidRequest(
+                "Capability handler binding exceeds bounded storage envelope"
+            )
+
     def _capability_from_row(self, row: sqlite3.Row) -> Capability:
         try:
             capability = record_from_json(Capability, row["capability_json"])
@@ -160,6 +177,7 @@ class CapabilityRepository:
 
     def register(self, capability: Capability) -> Capability:
         self._validate_capability(capability, new=True)
+        self._validate_binding_storage(capability)
         encoded = record_to_json(capability)
         digest = canonical_digest(capability)
         try:
@@ -239,6 +257,7 @@ class CapabilityRepository:
                 binding_revision=current.binding_revision + 1,
             )
             self._validate_capability(updated, new=False)
+            self._validate_binding_storage(updated)
             encoded = record_to_json(updated)
             digest = canonical_digest(updated)
             self._host_store._db.execute(
@@ -323,6 +342,64 @@ class CapabilityRepository:
                 ),
             )
         return snapshot
+
+    def _snapshot_metadata(self, snapshot_id: str) -> tuple[str, int]:
+        row = self._host_store._db.execute(
+            """
+            SELECT snapshot_digest,
+                   length(CAST(snapshot_json AS BLOB)) AS snapshot_units
+            FROM capability_snapshots WHERE snapshot_id = ?
+            """,
+            (snapshot_id,),
+        ).fetchone()
+        if row is None:
+            raise InvalidRequest(f"unknown Capability snapshot: {snapshot_id}")
+        digest = row["snapshot_digest"]
+        try:
+            units = int(row["snapshot_units"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("Capability snapshot size metadata is malformed") from exc
+        if type(digest) is not str or not digest.strip() or units <= 0:
+            raise IntegrityViolation("Capability snapshot metadata is invalid")
+        return digest, units
+
+    def _snapshot_binding_units(
+        self,
+        descriptors: tuple[CapabilityDescriptor, ...],
+    ) -> int:
+        total_units = 0
+        for descriptor in descriptors:
+            row = self._host_store._db.execute(
+                """
+                SELECT capability_digest,
+                       length(CAST(capability_json AS BLOB)) AS binding_units
+                FROM capability_bindings
+                WHERE capability_id = ? AND binding_revision = ?
+                """,
+                (descriptor.capability_id, descriptor.binding_revision),
+            ).fetchone()
+            if row is None:
+                raise IntegrityViolation(
+                    f"Capability snapshot references missing binding: "
+                    f"{descriptor.capability_id}@{descriptor.binding_revision}"
+                )
+            try:
+                binding_units = int(row["binding_units"])
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation("Capability binding size metadata is malformed") from exc
+            digest = row["capability_digest"]
+            descriptor_units = len(canonical_json(descriptor).encode("utf-8"))
+            if (
+                binding_units <= 0
+                or type(digest) is not str
+                or not digest.strip()
+                or binding_units > descriptor_units + _BINDING_STORAGE_OVERHEAD_LIMIT
+            ):
+                raise IntegrityViolation(
+                    "Capability binding storage exceeds bounded descriptor envelope"
+                )
+            total_units += binding_units
+        return total_units
 
     def get_snapshot(self, snapshot_id: str) -> CapabilitySnapshot:
         row = self._host_store._db.execute(

@@ -116,6 +116,15 @@ class ContextCompleteness(StringEnum):
     INCOMPLETE = "incomplete"
 
 
+class ContextPriority(StringEnum):
+    HOST_CONTROL = "host_control"
+    CURRENT_PROGRAM = "current_program"
+    CURRENT_EVIDENCE = "current_evidence"
+    RECENT_INTERACTION = "recent_interaction"
+    RECALLED_HISTORY = "recalled_history"
+    ADVISORY_MEMORY = "advisory_memory"
+
+
 class AuthorityDomain(StringEnum):
     PROGRAM_LIFECYCLE = "program_lifecycle"
     ACTOR_IDENTITY = "actor_identity"

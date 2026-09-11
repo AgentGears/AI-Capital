@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 
 from .actor_state import replace_model_binding
 from .durable_program import ProgramRepository
@@ -225,6 +226,8 @@ class ActorRepository:
         receipt: ModelAttemptReceipt,
         turn: ModelTurn | None,
         request: InferenceRequest,
+        *,
+        precommit_validator: Callable[[], None] | None = None,
     ) -> None:
         generation = self._host_store._db.execute(
             """
@@ -276,6 +279,8 @@ class ActorRepository:
 
         try:
             with self._host_store._transaction():
+                if precommit_validator is not None:
+                    precommit_validator()
                 self._host_store._db.execute(
                     """
                     INSERT INTO model_attempts(

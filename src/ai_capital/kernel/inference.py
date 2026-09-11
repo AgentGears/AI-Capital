@@ -94,6 +94,10 @@ class InferenceHost:
         self._bindings = bindings
         self._capabilities = capabilities
 
+    def _validate_post_provider_freshness(self, request: InferenceRequest) -> None:
+        """Validate subclass-specific currentness immediately before success commit."""
+        return None
+
     def infer(
         self,
         *,
@@ -186,52 +190,6 @@ class InferenceHost:
             raise IntegrityViolation("inference provider returned invalid model output") from exc
 
         output_digest = canonical_digest(turn)
-        current_program = self._programs.get(program_id)
-        current_actor = self._actors.get(actor_id)
-        if current_program.revision != program.revision:
-            receipt = ModelAttemptReceipt(
-                attempt_id=attempt_id,
-                actor_id=actor.actor_id,
-                actor_generation=actor.generation,
-                program_id=program.program_id,
-                program_revision=program.revision,
-                model_binding=actor.model_binding,
-                context_receipt_ref=context_receipt.context_receipt_id,
-                input_digest=input_digest,
-                effective_config_digest=configuration_digest,
-                outcome=ModelAttemptOutcome.STALE,
-                started_at=started_at,
-                finished_at=finished_at,
-                output_digest=output_digest,
-                error_code="stale_program_revision",
-            )
-            self._actors.record_attempt(receipt, turn, request)
-            raise StaleProgramRevision("model output is stale for current Program revision")
-
-        if (
-            current_actor.generation != actor.generation
-            or current_actor.model_binding != actor.model_binding
-            or current_actor.status is not ActorStatus.ACTIVE
-        ):
-            receipt = ModelAttemptReceipt(
-                attempt_id=attempt_id,
-                actor_id=actor.actor_id,
-                actor_generation=actor.generation,
-                program_id=program.program_id,
-                program_revision=program.revision,
-                model_binding=actor.model_binding,
-                context_receipt_ref=context_receipt.context_receipt_id,
-                input_digest=input_digest,
-                effective_config_digest=configuration_digest,
-                outcome=ModelAttemptOutcome.STALE,
-                started_at=started_at,
-                finished_at=finished_at,
-                output_digest=output_digest,
-                error_code="stale_actor_generation",
-            )
-            self._actors.record_attempt(receipt, turn, request)
-            raise StaleActorGeneration("model output is stale for current Actor generation")
-
         receipt = ModelAttemptReceipt(
             attempt_id=attempt_id,
             actor_id=actor.actor_id,
@@ -248,8 +206,83 @@ class InferenceHost:
             output_digest=output_digest,
             error_code=None,
         )
-        self._actors.record_attempt(receipt, turn, request)
+        freshness_failure: Exception | None = None
+
+        def validate_success_freshness() -> None:
+            nonlocal freshness_failure
+            try:
+                current_program = self._programs.get(program_id)
+                if current_program.revision != program.revision:
+                    raise StaleProgramRevision(
+                        "model output is stale for current Program revision"
+                    )
+                current_actor = self._actors.get(actor_id)
+                if (
+                    current_actor.generation != actor.generation
+                    or current_actor.model_binding != actor.model_binding
+                    or current_actor.status is not ActorStatus.ACTIVE
+                ):
+                    raise StaleActorGeneration(
+                        "model output is stale for current Actor generation"
+                    )
+                self._validate_post_provider_freshness(request)
+            except (
+                StaleProgramRevision,
+                StaleActorGeneration,
+                IntegrityViolation,
+            ) as exc:
+                freshness_failure = exc
+                raise
+
+        try:
+            self._actors.record_attempt(
+                receipt,
+                turn,
+                request,
+                precommit_validator=validate_success_freshness,
+            )
+        except (
+            StaleProgramRevision,
+            StaleActorGeneration,
+            IntegrityViolation,
+        ):
+            if freshness_failure is None:
+                raise
+            if isinstance(freshness_failure, StaleProgramRevision):
+                stale_code = "stale_program_revision"
+                stale_error: Exception = StaleProgramRevision(
+                    "model output is stale for current Program revision"
+                )
+            elif isinstance(freshness_failure, StaleActorGeneration):
+                stale_code = "stale_actor_generation"
+                stale_error = StaleActorGeneration(
+                    "model output is stale for current Actor generation"
+                )
+            else:
+                stale_code = "stale_inference_context"
+                stale_error = IntegrityViolation(
+                    "model output is stale for current inference Context"
+                )
+            stale_receipt = ModelAttemptReceipt(
+                attempt_id=attempt_id,
+                actor_id=actor.actor_id,
+                actor_generation=actor.generation,
+                program_id=program.program_id,
+                program_revision=program.revision,
+                model_binding=actor.model_binding,
+                context_receipt_ref=context_receipt.context_receipt_id,
+                input_digest=input_digest,
+                effective_config_digest=configuration_digest,
+                outcome=ModelAttemptOutcome.STALE,
+                started_at=started_at,
+                finished_at=finished_at,
+                output_digest=output_digest,
+                error_code=stale_code,
+            )
+            self._actors.record_attempt(stale_receipt, turn, request)
+            raise stale_error from freshness_failure
         return InferenceResult(receipt=receipt, turn=turn)
+
 
 
 def capability_snapshot_ref(snapshot: CapabilitySnapshot) -> str:
