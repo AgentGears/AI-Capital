@@ -130,6 +130,57 @@ class H2ProviderConfigurationTests(unittest.TestCase):
                         ("binding-a",),
                     )
 
+    def test_projection_deletion_is_blocked_and_missing_projection_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "capital.db"
+            with LocalProviderOperator.open(database) as providers:
+                providers.register(
+                    binding_id="binding-a",
+                    adapter="adapter",
+                    model="model-a",
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    providers._programs._db.execute(
+                        """
+                        DELETE FROM provider_configuration_projections
+                        WHERE binding_id = ?
+                        """,
+                        ("binding-a",),
+                    )
+                providers._programs._db.execute(
+                    "DROP TRIGGER provider_configuration_projection_no_delete"
+                )
+                providers._programs._db.execute(
+                    """
+                    DELETE FROM provider_configuration_projections
+                    WHERE binding_id = ?
+                    """,
+                    ("binding-a",),
+                )
+                with self.assertRaises(IntegrityViolation):
+                    providers.list()
+                with self.assertRaises(IntegrityViolation):
+                    providers.show("binding-a")
+
+    def test_non_integer_provider_revision_scalar_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "capital.db"
+            with LocalProviderOperator.open(database) as providers:
+                providers.register(
+                    binding_id="binding-a",
+                    adapter="adapter",
+                    model="model-a",
+                )
+                providers._programs._db.execute(
+                    """
+                    UPDATE provider_configuration_projections
+                    SET revision = 0.5 WHERE binding_id = ?
+                    """,
+                    ("binding-a",),
+                )
+                with self.assertRaises(IntegrityViolation):
+                    providers.show("binding-a")
+
     def test_existing_schema_marker_reauthenticates_provider_table_shape(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "capital.db"
@@ -144,6 +195,33 @@ class H2ProviderConfigurationTests(unittest.TestCase):
             with LocalProviderOperator.open(database) as restarted:
                 with self.assertRaises(IntegrityViolation):
                     restarted.list()
+
+    def test_malformed_provider_schema_version_fails_closed_on_product_surfaces(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "capital.db"
+            with ProgramRepository(database) as programs:
+                ActorRepository(programs).register(
+                    Actor("a-1", 0, "worker", "legacy-binding")
+                )
+            with LocalProviderOperator.open(database) as providers:
+                providers.register(
+                    binding_id="binding-a",
+                    adapter="adapter",
+                    model="model",
+                )
+            with ProgramRepository(database) as programs:
+                programs._db.execute(
+                    """
+                    UPDATE component_schema SET version = 1.5
+                    WHERE component = 'product_provider_configuration'
+                    """
+                )
+            with LocalProviderOperator.open(database) as providers:
+                with self.assertRaises(IntegrityViolation):
+                    providers.list()
+            with LocalActorProviderOperator.open(database) as actor_provider:
+                with self.assertRaises(IntegrityViolation):
+                    actor_provider.show("a-1")
 
     def test_read_only_provider_listing_does_not_bootstrap_provider_schema(self):
         with tempfile.TemporaryDirectory() as directory:
