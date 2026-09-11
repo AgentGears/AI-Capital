@@ -739,3 +739,29 @@ Entries may reference internal decision IDs, tests, incidents, experiments, comm
 # 16. Canonical maintenance principle
 
 > **Study broadly in private research memory. Internalize architecture. Preserve AI Capital's own vocabulary. Adopt only under constitutional invariants. Implement narrowly. Verify independently. Scale only when a forcing function earns the complexity.**
+---
+# 17. v0.1 qualification contradiction audit
+
+**Audit scope:** K9 / v0.1 release qualification.
+**Executable Evidence:** `tests/test_k9_qualification.py`.
+**Tracking:** issue #12.
+
+The release audit reviews every `ACCEPTED` + `LINKED` pattern in this register against the K0–K9 kernel boundary and the Q1–Q7 qualification scenarios. `CANDIDATE` and `DEFERRED` entries remain outside the v0.1 kernel contract; this audit neither promotes them nor turns them into release scope.
+
+| Qualification | Constitutional/pattern contradiction challenged | Release evidence |
+|---|---|---|
+| Q1 — crash continuity | Program > Conversation; invocation does not imply effect confirmation; durable facts survive projection/process loss | process death before dispatch proves absence; process death after a protected external effect recovers one indeterminate Operation, preserves Program state, and never blindly replays the effect |
+| Q2 — model replacement | Actor > Model; inference integration vocabulary terminates at adapters | model binding changes while Actor identity, Grant references, canonical Program state, and Program history remain unchanged |
+| Q3 — authority resistance | Cognition is not Authority; availability is not permission; containment is not authorization | an Actor request outside its Grant resource scope is denied by Host Authority and cannot mint execution Authority |
+| Q4 — ambiguous mutation | execution outcome is distinct from environmental effect | timeout remains `INDETERMINATE`, replay is not intrinsically safe, and explicit reconciliation resolves effect truth without a second execution |
+| Q5 — evidence trace | Evidence is distinct from Claim, policy, Authority, and completion | certified completion traces through Verification and required Claim to admitted Evidence and exact source bytes whose SHA-256 digest matches the durable Evidence/admission bindings |
+| Q6 — false completion | Actor/model completion proposal is not Program completion | a passing verifier cannot certify a Program with required work still outstanding; Host completion deterministically rejects it |
+| Q7 — context pressure | retention is distinct from Context residency; recalled history cannot regain current Authority | over-budget history is deterministically excluded, survives restart, is exactly recalled by durable address, and returns only as historical advisory material |
+
+### Accepted-pattern coverage
+
+The v0.1 review found no unresolved contradiction for the accepted, linked kernel patterns: APR-001 through APR-011, APR-013 through APR-016, APR-019, APR-020, APR-031, and APR-032. Q1 exercises durable Program/Event/Operation and fresh-Authority boundaries; Q2 exercises replaceable Actor and model-neutral adapter boundaries; Q3 exercises Host Authority, typed Capability lifecycle, minimal exposure, fresh execution Authority, and containment-independent authorization; Q4 exercises explicit effect uncertainty; Q5 exercises Evidence/Claim/governance separation, independent completion, immutable receipts, and Verification freshness; Q6 challenges independent completion directly; Q7 exercises bounded Context over exact durable history.
+
+### Release disposition
+
+**Result:** no unresolved contradiction against an accepted constitutional pattern was found by the v0.1 K9 qualification. This is a release audit, not a blanket status promotion: individual register statuses remain governed by their own decision records, and candidate/deferred future patterns remain non-binding for v0.1.
