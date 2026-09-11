@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -26,7 +27,8 @@ from ai_capital.kernel.errors import (
 )
 from ai_capital.kernel.models import CapabilityResolution, Program, ResolvedEffect
 from ai_capital.kernel.operation_journal import ExecutionObservation, OperationJournal
-from ai_capital.kernel.program_control import ProgramControlRepository
+from ai_capital.kernel.schema_codec import record_to_json
+from ai_capital.kernel.serialization import canonical_digest
 from ai_capital.product import LocalProgramOperator
 
 
@@ -219,6 +221,40 @@ class H2ExplicitLifecycleControlTests(unittest.TestCase):
                 connection.close()
             with self.assertRaises(IntegrityViolation):
                 LocalProgramOperator.open(database)
+
+    def test_coherent_control_anchor_to_non_active_program_revision_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "capital.db"
+            with LocalProgramOperator.open(database) as operator:
+                operator.create(program_id="p-1", objective="semantic anchor")
+                operator.start("p-1", expected_revision=0)
+                operator.pause(
+                    "p-1",
+                    expected_revision=1,
+                    expected_control_revision=0,
+                )
+                control = operator._controls.history("p-1")[0]
+                forged = replace(control, program_revision=0)
+                encoded = record_to_json(forged)
+                digest = canonical_digest(forged)
+                operator._programs._db.execute(
+                    """
+                    UPDATE program_control_history
+                    SET program_revision = ?, control_json = ?, control_digest = ?
+                    WHERE program_id = ? AND revision = ?
+                    """,
+                    (0, encoded, digest, "p-1", 1),
+                )
+                operator._programs._db.execute(
+                    """
+                    UPDATE program_control_projections
+                    SET program_revision = ?, control_json = ?, control_digest = ?
+                    WHERE program_id = ?
+                    """,
+                    (0, encoded, digest, "p-1"),
+                )
+                with self.assertRaises(IntegrityViolation):
+                    operator.show("p-1")
 
     def test_reconciliation_presentation_is_scoped_to_the_correct_program(self):
         with tempfile.TemporaryDirectory() as directory:
