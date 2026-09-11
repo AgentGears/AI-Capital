@@ -9,10 +9,18 @@ from ..kernel.authority_store import AuthorityRepository
 from ..kernel.capability_store import CapabilityRepository
 from ..kernel.claim_store import ClaimRepository
 from ..kernel.durable_program import ProgramRepository
-from ..kernel.enums import ActorStatus, AuthorityDecisionKind, ProgramStatus
+from ..kernel.enums import (
+    ActorStatus,
+    AuthorityDecisionKind,
+    EffectStatus,
+    ExecutionOutcome,
+    ProgramStatus,
+    ReconciliationStatus,
+)
 from ..kernel.errors import (
     ApprovalInvalid,
     AuthorityDenied,
+    EvidenceMissing,
     IntegrityViolation,
     InvalidRequest,
     StaleActorGeneration,
@@ -21,7 +29,7 @@ from ..kernel.errors import (
     VerificationStale,
 )
 from ..kernel.events import utc_now, verify_event_digest
-from ..kernel.evidence_store import EvidenceAdmissionReceipt, EvidenceRepository
+from ..kernel.evidence_store import EvidenceRepository
 from ..kernel.frozen_json import FrozenMap
 from ..kernel.models import (
     CapabilityResolution,
@@ -29,6 +37,7 @@ from ..kernel.models import (
     ExecutionAuthorityReceipt,
     Operation,
 )
+from ..kernel.operations import validate_operation_semantics
 from ..kernel.operation_journal import (
     ExecutionReceipt,
     OperationJournal,
@@ -57,25 +66,74 @@ class LocalAuditOperator:
             raise InvalidRequest("audit components must share one Host store")
         self._programs = programs
         self._operations = operations
-        self._actors = ActorRepository(programs)
-        self._capabilities = CapabilityRepository(programs)
-        self._authority_store = AuthorityRepository(programs)
-        self._authority = AuthorityEngine(
-            programs,
-            self._actors,
-            self._capabilities,
-            self._authority_store,
-        )
+        self._actors: ActorRepository | None = None
+        self._capabilities: CapabilityRepository | None = None
+        self._authority_store: AuthorityRepository | None = None
+        self._authority: AuthorityEngine | None = None
         self._evidence: EvidenceRepository | None = None
         self._claims: ClaimRepository | None = None
         self._verifications: VerificationRepository | None = None
 
+    def _component_version(self, component: str) -> int | None:
+        row = self._programs._db.execute(
+            "SELECT version FROM component_schema WHERE component = ?",
+            (component,),
+        ).fetchone()
+        return None if row is None else int(row["version"])
+
+    def _authority_repository(
+        self,
+        *,
+        required: bool,
+    ) -> AuthorityRepository | None:
+        if self._component_version("authority") is None:
+            if required:
+                raise InvalidRequest("Authority store is not initialized")
+            return None
+        if self._authority_store is None:
+            self._authority_store = AuthorityRepository(self._programs)
+        return self._authority_store
+
+    def _authority_engine_components(self) -> AuthorityEngine:
+        store = self._authority_repository(required=True)
+        assert store is not None
+        if self._component_version("actor_inference") is None:
+            raise IntegrityViolation(
+                "Authority state exists without the Actor component"
+            )
+        if self._component_version("capability_registry") is None:
+            raise IntegrityViolation(
+                "Authority state exists without the Capability component"
+            )
+        if self._authority is None:
+            self._actors = ActorRepository(self._programs)
+            self._capabilities = CapabilityRepository(self._programs)
+            self._authority = AuthorityEngine(
+                self._programs,
+                self._actors,
+                self._capabilities,
+                store,
+            )
+        return self._authority
+
     def _evidence_repository(self) -> EvidenceRepository:
+        if self._component_version("evidence_store") is None:
+            raise EvidenceMissing("Evidence store is not initialized")
         if self._evidence is None:
             self._evidence = EvidenceRepository(self._programs)
         return self._evidence
 
     def _verification_repository(self) -> VerificationRepository:
+        if self._component_version("verification") is None:
+            raise InvalidRequest("Verification store is not initialized")
+        if self._component_version("claim_store") is None:
+            raise IntegrityViolation(
+                "Verification state exists without the Claim component"
+            )
+        if self._component_version("evidence_store") is None:
+            raise IntegrityViolation(
+                "Verification state exists without the Evidence component"
+            )
         if self._verifications is None:
             evidence = self._evidence_repository()
             self._claims = ClaimRepository(self._programs, evidence)
@@ -137,21 +195,52 @@ class LocalAuditOperator:
         ).fetchall()
         return tuple(self._decode_event_row(row) for row in rows)
 
+    @staticmethod
+    def _event_context_matches(
+        event: Event,
+        *,
+        actor_id: str | None = None,
+        actorless: bool = False,
+        correlation_id: str | None = None,
+        uncorrelated: bool = False,
+        host_scoped: bool = False,
+    ) -> bool:
+        if host_scoped and event.program_id is not None:
+            return False
+        if actorless and event.actor_id is not None:
+            return False
+        if actor_id is not None and event.actor_id != actor_id:
+            return False
+        if uncorrelated and event.correlation_id is not None:
+            return False
+        if correlation_id is not None and event.correlation_id != correlation_id:
+            return False
+        return True
+
     def _matching_event(
         self,
         event_type: str,
         payload: object,
         *,
         actor_id: str | None = None,
+        actorless: bool = False,
         correlation_id: str | None = None,
+        uncorrelated: bool = False,
+        host_scoped: bool = False,
     ) -> Event:
         expected = to_canonical_data(payload)
         matches = [
             event
             for event in self._events_of_type(event_type)
             if to_canonical_data(event.payload) == expected
-            and (actor_id is None or event.actor_id == actor_id)
-            and (correlation_id is None or event.correlation_id == correlation_id)
+            and self._event_context_matches(
+                event,
+                actor_id=actor_id,
+                actorless=actorless,
+                correlation_id=correlation_id,
+                uncorrelated=uncorrelated,
+                host_scoped=host_scoped,
+            )
         ]
         if len(matches) != 1:
             raise IntegrityViolation(
@@ -159,12 +248,30 @@ class LocalAuditOperator:
             )
         return matches[0]
 
-    def _matching_events(self, event_type: str, payload: object) -> tuple[Event, ...]:
+    def _matching_events(
+        self,
+        event_type: str,
+        payload: object,
+        *,
+        actor_id: str | None = None,
+        actorless: bool = False,
+        correlation_id: str | None = None,
+        uncorrelated: bool = False,
+        host_scoped: bool = False,
+    ) -> tuple[Event, ...]:
         expected = to_canonical_data(payload)
         return tuple(
             event
             for event in self._events_of_type(event_type)
             if to_canonical_data(event.payload) == expected
+            and self._event_context_matches(
+                event,
+                actor_id=actor_id,
+                actorless=actorless,
+                correlation_id=correlation_id,
+                uncorrelated=uncorrelated,
+                host_scoped=host_scoped,
+            )
         )
 
     def _approval_record(
@@ -227,6 +334,8 @@ class LocalAuditOperator:
         self,
         context: AuthorityDecisionContext,
     ) -> tuple[ExecutionAuthorityReceipt, str | None] | None:
+        store = self._authority_repository(required=True)
+        assert store is not None
         rows = self._programs._db.execute(
             """
             SELECT receipt_id, single_use_identity, receipt_json, receipt_digest, consumed_at
@@ -254,7 +363,7 @@ class LocalAuditOperator:
                 or canonical_digest(receipt) != row["receipt_digest"]
             ):
                 raise IntegrityViolation("execution authority audit row binding mismatch")
-            receipt_context = self._authority_store.get_decision(receipt.decision_id)
+            receipt_context = store.get_decision(receipt.decision_id)
             self._validate_execution_receipt_binding(receipt, receipt_context)
             consumed_at = row["consumed_at"]
             if consumed_at is not None and (
@@ -272,13 +381,18 @@ class LocalAuditOperator:
         return None if not matches else matches[0]
 
     def _validate_current_ask(self, context: AuthorityDecisionContext) -> None:
+        engine = self._authority_engine_components()
+        assert self._actors is not None
+        assert self._capabilities is not None
+        store = self._authority_repository(required=True)
+        assert store is not None
         if context.decision.decision is not AuthorityDecisionKind.ASK:
             raise ApprovalInvalid("only an ask decision may receive approval")
         self._programs.verify_integrity(context.program_id)
         program = self._programs.get(context.program_id)
         actor = self._actors.get(context.actor_id)
         capability = self._capabilities.get(context.capability_id)
-        policy = self._authority_store.current_policy()
+        policy = store.current_policy()
         if program.revision != context.program_revision:
             raise StaleProgramRevision("AuthorityDecision is stale for Program")
         if actor.generation != context.actor_generation:
@@ -297,12 +411,14 @@ class LocalAuditOperator:
             context.resolution.resolved_effect.resource_type != capability.resource_type
             or context.resolution.resolved_effect.effect_class is not capability.effect_class
         ):
-            raise IntegrityViolation("AuthorityDecision resolution violates Capability contract")
+            raise IntegrityViolation(
+                "AuthorityDecision resolution violates Capability contract"
+            )
         current_grants = {
             grant.grant_id: grant
-            for grant in self._authority_store.active_grants(actor_id=context.actor_id)
+            for grant in store.active_grants(actor_id=context.actor_id)
         }
-        self._authority._validate_decision_semantics(
+        engine._validate_decision_semantics(
             context=context,
             capability=capability,
             policy=policy,
@@ -315,10 +431,13 @@ class LocalAuditOperator:
             "authority.decided",
             context,
             actor_id=context.actor_id,
+            host_scoped=True,
+            uncorrelated=True,
         )
         approval_record = self._approval_record(context.decision.decision_id)
         approval_view: dict[str, Any] | None = None
         approval_state = "awaiting_approval"
+        approval_consumed_event: Event | None = None
         if approval_record is not None:
             approval, consumed_at = approval_record
             if (
@@ -327,8 +446,24 @@ class LocalAuditOperator:
                 or approval.policy_revision != context.decision.policy_revision
             ):
                 raise IntegrityViolation("approval does not match AuthorityDecision")
-            issued = self._matching_event("approval.issued", approval)
-            consumed_events = self._matching_events("approval.consumed", approval)
+            issued = self._matching_event(
+                "approval.issued",
+                approval,
+                actorless=True,
+                host_scoped=True,
+                uncorrelated=True,
+            )
+            if issued.sequence <= decision_event.sequence:
+                raise IntegrityViolation(
+                    "approval issuance precedes its AuthorityDecision"
+                )
+            consumed_events = self._matching_events(
+                "approval.consumed",
+                approval,
+                actorless=True,
+                host_scoped=True,
+                uncorrelated=True,
+            )
             if consumed_at is None:
                 if consumed_events:
                     raise IntegrityViolation(
@@ -341,8 +476,13 @@ class LocalAuditOperator:
                     raise IntegrityViolation(
                         "consumed approval lacks exactly one consumed semantic Event"
                     )
+                approval_consumed_event = consumed_events[0]
+                if approval_consumed_event.sequence <= issued.sequence:
+                    raise IntegrityViolation(
+                        "approval consumption precedes approval issuance"
+                    )
                 approval_state = "consumed"
-                consumed_anchor = self._event_anchor(consumed_events[0])
+                consumed_anchor = self._event_anchor(approval_consumed_event)
             approval_view = {
                 "receipt": to_canonical_data(approval),
                 "consumed_at": consumed_at,
@@ -354,10 +494,28 @@ class LocalAuditOperator:
         execution_view: dict[str, Any] | None = None
         if execution_record is not None:
             receipt, consumed_at = execution_record
-            issued = self._matching_event("authority.execution_issued", receipt)
+            issued = self._matching_event(
+                "authority.execution_issued",
+                receipt,
+                actorless=True,
+                host_scoped=True,
+                uncorrelated=True,
+            )
+            if approval_record is None or approval_record[1] is None:
+                raise IntegrityViolation(
+                    "ASK execution authority exists without a consumed approval"
+                )
+            assert approval_consumed_event is not None
+            if issued.sequence <= approval_consumed_event.sequence:
+                raise IntegrityViolation(
+                    "execution authority issuance precedes approval consumption"
+                )
             consumed_events = self._matching_events(
                 "authority.execution_consumed",
                 receipt,
+                actorless=True,
+                host_scoped=True,
+                uncorrelated=True,
             )
             if consumed_at is None:
                 if consumed_events:
@@ -370,17 +528,18 @@ class LocalAuditOperator:
                     raise IntegrityViolation(
                         "consumed execution authority lacks exactly one consumed Event"
                     )
-                consumed_anchor = self._event_anchor(consumed_events[0])
+                consumed_event = consumed_events[0]
+                if consumed_event.sequence <= issued.sequence:
+                    raise IntegrityViolation(
+                        "execution authority consumption precedes issuance"
+                    )
+                consumed_anchor = self._event_anchor(consumed_event)
             execution_view = {
                 "receipt": to_canonical_data(receipt),
                 "consumed_at": consumed_at,
                 "issued_event": self._event_anchor(issued),
                 "consumed_event": consumed_anchor,
             }
-            if approval_record is None or approval_record[1] is None:
-                raise IntegrityViolation(
-                    "ASK execution authority exists without a consumed approval"
-                )
 
         currentness = "current"
         stale_reason = None
@@ -421,12 +580,15 @@ class LocalAuditOperator:
     def asks(self, program_id: str) -> tuple[dict[str, Any], ...]:
         self._programs.verify_integrity(program_id)
         self._programs.get(program_id)
+        store = self._authority_repository(required=False)
+        if store is None:
+            return ()
         rows = self._programs._db.execute(
             "SELECT decision_id FROM authority_decisions ORDER BY decision_id"
         ).fetchall()
         views: list[dict[str, Any]] = []
         for row in rows:
-            context = self._authority_store.get_decision(str(row["decision_id"]))
+            context = store.get_decision(str(row["decision_id"]))
             if (
                 context.program_id == program_id
                 and context.decision.decision is AuthorityDecisionKind.ASK
@@ -436,11 +598,14 @@ class LocalAuditOperator:
         return tuple(views)
 
     def approve(self, decision_id: str) -> dict[str, Any]:
-        context = self._authority_store.get_decision(decision_id)
+        store = self._authority_repository(required=True)
+        assert store is not None
+        context = store.get_decision(decision_id)
         self._validate_current_ask(context)
         if self._approval_record(decision_id) is not None:
             raise ApprovalInvalid("AuthorityDecision already has an approval receipt")
-        self._authority.approve(decision_id=decision_id)
+        engine = self._authority_engine_components()
+        engine.approve(decision_id=decision_id)
         return self._ask_view(context)
 
     @staticmethod
@@ -498,6 +663,15 @@ class LocalAuditOperator:
             receipts.append(receipt)
         if tuple(receipt.receipt_id for receipt in receipts) != operation.receipt_refs:
             raise IntegrityViolation("Operation receipt history diverges from projection")
+        idempotency_key = self._operations.idempotency_key(operation.operation_id)
+        for receipt in receipts:
+            if (
+                isinstance(receipt, ExecutionReceipt)
+                and receipt.idempotency_key != idempotency_key
+            ):
+                raise IntegrityViolation(
+                    "Operation execution receipt idempotency binding mismatch"
+                )
         return tuple(receipts)
 
     def _operation_events(
@@ -515,10 +689,29 @@ class LocalAuditOperator:
             _OPERATION_EVENT_TYPES,
         ).fetchall()
         matches: list[Event] = []
-        event_receipt_ids: list[str] = []
         requested = 0
         admitted_sequences: list[int] = []
-        final_snapshot: Operation | None = None
+        seen_admitted = False
+        previous_snapshot: Operation | None = None
+        receipt_cursor = 0
+
+        def exact_receipt(
+            event_receipt: ExecutionReceipt | ReconciliationReceipt,
+            expected_type: type[ExecutionReceipt] | type[ReconciliationReceipt],
+        ) -> ExecutionReceipt | ReconciliationReceipt:
+            nonlocal receipt_cursor
+            if receipt_cursor >= len(receipts):
+                raise IntegrityViolation(
+                    "Operation semantic Event has an unrecorded receipt"
+                )
+            expected = receipts[receipt_cursor]
+            if not isinstance(expected, expected_type) or event_receipt != expected:
+                raise IntegrityViolation(
+                    "Operation semantic Event receipt diverges from durable receipt"
+                )
+            receipt_cursor += 1
+            return expected
+
         for row in rows:
             event = self._decode_event_row(row)
             payload = event.payload.get("operation")
@@ -539,8 +732,48 @@ class LocalAuditOperator:
                 or not self._immutable_operation_identity(snapshot, operation)
             ):
                 raise IntegrityViolation("Operation Event context/identity binding mismatch")
+            validate_operation_semantics(snapshot)
+
+            receipt_payload = event.payload.get("receipt")
+            event_receipt: ExecutionReceipt | ReconciliationReceipt | None = None
+            if receipt_payload is not None:
+                cls = (
+                    ReconciliationReceipt
+                    if event.event_type == "operation.reconciled"
+                    else ExecutionReceipt
+                )
+                if not isinstance(receipt_payload, FrozenMap):
+                    raise IntegrityViolation("Operation Event receipt payload is malformed")
+                try:
+                    event_receipt = record_from_json(
+                        cls,
+                        canonical_json(receipt_payload),
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise IntegrityViolation(
+                        "Operation Event receipt cannot be decoded"
+                    ) from exc
+                if event_receipt.operation_id != operation.operation_id:
+                    raise IntegrityViolation("Operation Event receipt binding mismatch")
+
             if event.event_type == "operation.requested":
                 requested += 1
+                if previous_snapshot is not None or event_receipt is not None:
+                    raise IntegrityViolation(
+                        "Operation requested Event is not the first semantic state"
+                    )
+                if (
+                    snapshot.execution_outcome is not ExecutionOutcome.NOT_STARTED
+                    or snapshot.effect_status is not EffectStatus.UNKNOWN
+                    or snapshot.reconciliation_status
+                    is not ReconciliationStatus.NOT_REQUIRED
+                    or snapshot.started_at is not None
+                    or snapshot.finished_at is not None
+                    or snapshot.receipt_refs
+                ):
+                    raise IntegrityViolation(
+                        "Operation requested Event contains a non-initial state"
+                    )
                 resolution_payload = event.payload.get("resolution")
                 if not isinstance(resolution_payload, FrozenMap):
                     raise IntegrityViolation(
@@ -559,43 +792,155 @@ class LocalAuditOperator:
                     raise IntegrityViolation(
                         "Operation projection resolution diverges from requested Event"
                     )
-            if event.event_type == "operation.admitted":
+
+            elif event.event_type == "operation.admitted":
+                if (
+                    previous_snapshot is None
+                    or seen_admitted
+                    or snapshot != previous_snapshot
+                    or snapshot.execution_outcome is not ExecutionOutcome.NOT_STARTED
+                    or event_receipt is not None
+                ):
+                    raise IntegrityViolation(
+                        "Operation admitted Event violates semantic ordering"
+                    )
+                seen_admitted = True
                 admitted_sequences.append(event.sequence)
                 if event.payload.get("authority_receipt_ref") != operation.authority_receipt_ref:
                     raise IntegrityViolation(
                         "Operation admission Event authority binding mismatch"
                     )
-            receipt_payload = event.payload.get("receipt")
-            if receipt_payload is not None:
-                cls = (
-                    ReconciliationReceipt
-                    if event.event_type == "operation.reconciled"
-                    else ExecutionReceipt
-                )
-                if not isinstance(receipt_payload, FrozenMap):
-                    raise IntegrityViolation("Operation Event receipt payload is malformed")
-                try:
-                    event_receipt = record_from_json(
-                        cls,
-                        canonical_json(receipt_payload),
+
+            elif event.event_type == "operation.started":
+                if (
+                    previous_snapshot is None
+                    or not seen_admitted
+                    or previous_snapshot.execution_outcome
+                    is not ExecutionOutcome.NOT_STARTED
+                    or snapshot.execution_outcome is not ExecutionOutcome.RUNNING
+                    or snapshot.receipt_refs != previous_snapshot.receipt_refs
+                    or snapshot.started_at is None
+                    or snapshot.finished_at is not None
+                    or event_receipt is not None
+                ):
+                    raise IntegrityViolation(
+                        "Operation started Event violates semantic ordering"
                     )
-                except (TypeError, ValueError) as exc:
-                    raise IntegrityViolation("Operation Event receipt cannot be decoded") from exc
-                if event_receipt.operation_id != operation.operation_id:
-                    raise IntegrityViolation("Operation Event receipt binding mismatch")
-                event_receipt_ids.append(event_receipt.receipt_id)
+
+            elif event.event_type in {"operation.finished", "operation.interrupted"}:
+                if previous_snapshot is None or not isinstance(
+                    event_receipt, ExecutionReceipt
+                ):
+                    raise IntegrityViolation(
+                        "Operation terminal Event lacks an execution receipt"
+                    )
+                exact_receipt(event_receipt, ExecutionReceipt)
+                if event.event_type == "operation.interrupted":
+                    if (
+                        previous_snapshot.execution_outcome
+                        is not ExecutionOutcome.RUNNING
+                        or snapshot.execution_outcome is not ExecutionOutcome.FAILED
+                    ):
+                        raise IntegrityViolation(
+                            "Operation interrupted Event violates execution state"
+                        )
+                elif previous_snapshot.execution_outcome not in {
+                    ExecutionOutcome.NOT_STARTED,
+                    ExecutionOutcome.RUNNING,
+                }:
+                    raise IntegrityViolation(
+                        "Operation finished Event follows a terminal state"
+                    )
+                if (
+                    previous_snapshot.execution_outcome
+                    is ExecutionOutcome.NOT_STARTED
+                    and snapshot.execution_outcome is not ExecutionOutcome.FAILED
+                ):
+                    raise IntegrityViolation(
+                        "pre-dispatch Operation finish must be a failure"
+                    )
+                expected_reconciliation = (
+                    ReconciliationStatus.PENDING
+                    if event_receipt.effect_status is EffectStatus.INDETERMINATE
+                    else ReconciliationStatus.NOT_REQUIRED
+                )
+                if (
+                    snapshot.execution_outcome is not event_receipt.execution_outcome
+                    or snapshot.effect_status is not event_receipt.effect_status
+                    or snapshot.reconciliation_status is not expected_reconciliation
+                    or snapshot.finished_at != event_receipt.observed_at
+                    or snapshot.receipt_refs
+                    != previous_snapshot.receipt_refs + (event_receipt.receipt_id,)
+                    or (
+                        previous_snapshot.execution_outcome
+                        is ExecutionOutcome.RUNNING
+                        and snapshot.started_at != previous_snapshot.started_at
+                    )
+                    or (
+                        previous_snapshot.execution_outcome
+                        is ExecutionOutcome.NOT_STARTED
+                        and snapshot.started_at is not None
+                    )
+                ):
+                    raise IntegrityViolation(
+                        "Operation terminal Event disagrees with execution receipt"
+                    )
+
+            elif event.event_type == "operation.reconciled":
+                if previous_snapshot is None or not isinstance(
+                    event_receipt, ReconciliationReceipt
+                ):
+                    raise IntegrityViolation(
+                        "Operation reconciliation Event lacks a reconciliation receipt"
+                    )
+                exact_receipt(event_receipt, ReconciliationReceipt)
+                if (
+                    previous_snapshot.execution_outcome
+                    in {ExecutionOutcome.NOT_STARTED, ExecutionOutcome.RUNNING}
+                    or previous_snapshot.effect_status is not EffectStatus.INDETERMINATE
+                    or previous_snapshot.reconciliation_status
+                    not in {
+                        ReconciliationStatus.PENDING,
+                        ReconciliationStatus.UNRESOLVED,
+                    }
+                ):
+                    raise IntegrityViolation(
+                        "Operation reconciliation Event follows a closed state"
+                    )
+                expected_reconciliation = (
+                    ReconciliationStatus.UNRESOLVED
+                    if event_receipt.effect_status is EffectStatus.INDETERMINATE
+                    else ReconciliationStatus.RESOLVED
+                )
+                if (
+                    snapshot.execution_outcome
+                    is not previous_snapshot.execution_outcome
+                    or snapshot.started_at != previous_snapshot.started_at
+                    or snapshot.finished_at != previous_snapshot.finished_at
+                    or snapshot.effect_status is not event_receipt.effect_status
+                    or snapshot.reconciliation_status is not expected_reconciliation
+                    or snapshot.receipt_refs
+                    != previous_snapshot.receipt_refs + (event_receipt.receipt_id,)
+                ):
+                    raise IntegrityViolation(
+                        "Operation reconciliation Event disagrees with receipt"
+                    )
+
             matches.append(event)
-            final_snapshot = snapshot
+            previous_snapshot = snapshot
+
         if requested != 1 or not matches:
             raise IntegrityViolation(
                 "Operation audit requires exactly one requested semantic Event"
             )
-        if final_snapshot != operation:
-            raise IntegrityViolation("Operation projection diverges from latest semantic Event")
-        if tuple(event_receipt_ids) != tuple(
-            receipt.receipt_id for receipt in receipts
-        ):
-            raise IntegrityViolation("Operation receipt records diverge from semantic Events")
+        if previous_snapshot != operation:
+            raise IntegrityViolation(
+                "Operation projection diverges from latest semantic Event"
+            )
+        if receipt_cursor != len(receipts):
+            raise IntegrityViolation(
+                "Operation durable receipt lacks matching semantic Event"
+            )
         projection = self._programs._db.execute(
             """
             SELECT admitted_sequence, last_sequence FROM operation_projections
@@ -610,9 +955,13 @@ class LocalAuditOperator:
         admitted_sequence = projection["admitted_sequence"]
         if admitted_sequence is None:
             if admitted_sequences:
-                raise IntegrityViolation("Operation admission Event lacks projection anchor")
+                raise IntegrityViolation(
+                    "Operation admission Event lacks projection anchor"
+                )
         elif admitted_sequences != [int(admitted_sequence)]:
-            raise IntegrityViolation("Operation admission sequence provenance mismatch")
+            raise IntegrityViolation(
+                "Operation admission sequence provenance mismatch"
+            )
         return tuple(matches)
 
     def audit_operation(self, operation_id: str) -> dict[str, Any]:
@@ -653,6 +1002,8 @@ class LocalAuditOperator:
         event = self._event_by_id(str(row["admitted_event_id"]))
         if (
             event.event_type != "evidence.admitted"
+            or event.program_id is not None
+            or event.actor_id is not None
             or event.correlation_id != evidence.evidence_id
             or to_canonical_data(event.payload)
             != to_canonical_data({"evidence": evidence, "admission": admission})
@@ -688,6 +1039,8 @@ class LocalAuditOperator:
         if (
             event.sequence != int(row["event_sequence"])
             or event.event_type != "verification.recorded"
+            or event.program_id is not None
+            or event.actor_id is not None
             or event.correlation_id != contract.program_id
             or to_canonical_data(event.payload.get("verification"))
             != to_canonical_data(verification)
