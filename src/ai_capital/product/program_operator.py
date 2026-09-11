@@ -91,6 +91,7 @@ class LocalProgramOperator:
     def start(self, program_id: str, *, expected_revision: int) -> dict[str, Any]:
         self._ensure_open()
         program_id = self._require_text(program_id, field="program_id")
+        self._programs.verify_integrity(program_id)
         current = self._programs.get(program_id)
         if current.revision != expected_revision:
             raise StaleProgramRevision(
@@ -110,6 +111,7 @@ class LocalProgramOperator:
     def cancel(self, program_id: str, *, expected_revision: int) -> dict[str, Any]:
         self._ensure_open()
         program_id = self._require_text(program_id, field="program_id")
+        self._programs.verify_integrity(program_id)
         program = self._programs.transition(
             program_id,
             ProgramStatus.CANCELLED,
