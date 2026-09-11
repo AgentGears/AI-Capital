@@ -36,6 +36,16 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("program_id")
     start.add_argument("--expected-revision", required=True, type=int)
 
+    pause = commands.add_parser("pause", help="Pause an active Program for the user.")
+    pause.add_argument("program_id")
+    pause.add_argument("--expected-revision", required=True, type=int)
+    pause.add_argument("--expected-control-revision", required=True, type=int)
+
+    resume = commands.add_parser("resume", help="Resume a user-paused active Program.")
+    resume.add_argument("program_id")
+    resume.add_argument("--expected-revision", required=True, type=int)
+    resume.add_argument("--expected-control-revision", required=True, type=int)
+
     cancel = commands.add_parser("cancel", help="Cancel a non-terminal Program.")
     cancel.add_argument("program_id")
     cancel.add_argument("--expected-revision", required=True, type=int)
@@ -82,6 +92,18 @@ def main(
                 result = operator.start(
                     args.program_id,
                     expected_revision=args.expected_revision,
+                )
+            elif args.command == "pause":
+                result = operator.pause(
+                    args.program_id,
+                    expected_revision=args.expected_revision,
+                    expected_control_revision=args.expected_control_revision,
+                )
+            elif args.command == "resume":
+                result = operator.resume(
+                    args.program_id,
+                    expected_revision=args.expected_revision,
+                    expected_control_revision=args.expected_control_revision,
                 )
             elif args.command == "cancel":
                 result = operator.cancel(

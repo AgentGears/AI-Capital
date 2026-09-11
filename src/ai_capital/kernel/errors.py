@@ -5,6 +5,7 @@ class AICapitalError(Exception):
 class InvalidRequest(AICapitalError): pass
 class InvalidStateTransition(AICapitalError): pass
 class StaleProgramRevision(AICapitalError): pass
+class StaleProgramControlRevision(AICapitalError): pass
 class StaleActorGeneration(AICapitalError): pass
 class UnknownCapability(AICapitalError): pass
 class StaleCapabilityBinding(AICapitalError): pass
