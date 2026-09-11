@@ -123,6 +123,27 @@ class H2LocalProgramOperatorTests(unittest.TestCase):
                 self.assertEqual(shown["program"]["revision"], 2)
                 self.assertEqual(shown["event_count"], 3)
 
+    def test_lifecycle_write_rejects_corrupted_history_before_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "capital.db"
+            with ProgramRepository(database) as programs:
+                programs.create(Program("p-1", 0, "integrity before write"))
+                programs._db.execute(
+                    "UPDATE events SET event_digest = ? WHERE program_id = ?",
+                    ("0" * 64, "p-1"),
+                )
+
+            with LocalProgramOperator.open(database) as operator:
+                with self.assertRaises(IntegrityViolation):
+                    operator.start("p-1", expected_revision=0)
+                self.assertEqual(operator._programs.get("p-1").revision, 0)
+                self.assertEqual(operator._programs.get("p-1").status, ProgramStatus.CREATED)
+                row = operator._programs._db.execute(
+                    "SELECT COUNT(*) FROM events WHERE program_id = ?",
+                    ("p-1",),
+                ).fetchone()
+                self.assertEqual(int(row[0]), 1)
+
     def test_program_listing_authenticates_each_projection(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "capital.db"
