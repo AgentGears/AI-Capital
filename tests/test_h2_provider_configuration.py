@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -75,7 +76,7 @@ class H2ProviderConfigurationTests(unittest.TestCase):
                             )
                 self.assertEqual(providers.list(), ())
 
-    def test_provider_configuration_fails_closed_on_projection_or_history_corruption(self):
+    def test_provider_projection_corruption_fails_closed_and_history_is_immutable(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "capital.db"
             with LocalProviderOperator.open(database) as providers:
@@ -84,7 +85,7 @@ class H2ProviderConfigurationTests(unittest.TestCase):
                     adapter="adapter",
                     model="model-a",
                 )
-                providers.update(
+                updated = providers.update(
                     "binding-a",
                     expected_revision=0,
                     adapter="adapter",
@@ -92,24 +93,56 @@ class H2ProviderConfigurationTests(unittest.TestCase):
                 )
                 providers._programs._db.execute(
                     """
-                    UPDATE provider_configuration_revisions
-                    SET configuration_digest = ?
-                    WHERE binding_id = ? AND revision = 0
+                    UPDATE provider_configuration_projections
+                    SET configuration_digest = ? WHERE binding_id = ?
                     """,
                     ("0" * 64, "binding-a"),
                 )
                 with self.assertRaises(IntegrityViolation):
                     providers.show("binding-a")
-
-            with ProgramRepository(database) as programs:
-                programs._db.execute(
-                    "DELETE FROM provider_configuration_revisions WHERE binding_id = ? AND revision = 0",
-                    ("binding-a",),
+                providers._programs._db.execute(
+                    """
+                    UPDATE provider_configuration_projections
+                    SET configuration_digest = (
+                        SELECT configuration_digest
+                        FROM provider_configuration_revisions
+                        WHERE binding_id = ? AND revision = 1
+                    ) WHERE binding_id = ?
+                    """,
+                    ("binding-a", "binding-a"),
                 )
+                self.assertEqual(providers.show("binding-a"), updated)
+                with self.assertRaises(sqlite3.IntegrityError):
+                    providers._programs._db.execute(
+                        """
+                        UPDATE provider_configuration_revisions
+                        SET configuration_digest = ?
+                        WHERE binding_id = ? AND revision = 0
+                        """,
+                        ("0" * 64, "binding-a"),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    providers._programs._db.execute(
+                        """
+                        DELETE FROM provider_configuration_revisions
+                        WHERE binding_id = ? AND revision = 0
+                        """,
+                        ("binding-a",),
+                    )
 
-            with LocalProviderOperator.open(database) as restarted:
-                with self.assertRaises(IntegrityViolation):
-                    restarted.show("binding-a")
+    def test_existing_schema_marker_reauthenticates_provider_table_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "capital.db"
+            with LocalProviderOperator.open(database) as providers:
+                providers.register(
+                    binding_id="binding-a",
+                    adapter="adapter",
+                    model="model",
+                )
+            with ProgramRepository(database) as programs:
+                programs._db.execute("DROP TABLE provider_configuration_projections")
+            with self.assertRaises(IntegrityViolation):
+                LocalProviderOperator.open(database)
 
     def test_read_only_provider_listing_does_not_bootstrap_provider_schema(self):
         with tempfile.TemporaryDirectory() as directory:
