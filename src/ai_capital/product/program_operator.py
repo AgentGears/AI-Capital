@@ -10,6 +10,7 @@ from ..kernel.models import Program
 from ..kernel.operation_journal import OperationJournal
 from ..kernel.program_control import ProgramControl, ProgramControlRepository
 from ..kernel.serialization import to_canonical_data
+from .audit_operator import LocalAuditOperator
 
 
 class LocalProgramOperator:
@@ -19,6 +20,7 @@ class LocalProgramOperator:
         self._programs = programs
         self._controls = ProgramControlRepository(programs)
         self._operations = OperationJournal(programs)
+        self._audit: LocalAuditOperator | None = None
         self._owns_repository = owns_repository
         self._closed = False
 
@@ -53,6 +55,12 @@ class LocalProgramOperator:
         if not isinstance(value, str) or not value.strip():
             raise InvalidRequest(f"{field} must be non-empty")
         return value
+
+    def _audit_operator(self) -> LocalAuditOperator:
+        self._ensure_open()
+        if self._audit is None:
+            self._audit = LocalAuditOperator(self._programs, self._operations)
+        return self._audit
 
     def _lifecycle(self, program: Program, control: ProgramControl) -> dict[str, Any]:
         pending = tuple(
@@ -209,3 +217,26 @@ class LocalProgramOperator:
             expected_revision=expected_revision,
         )
         return self._view(program)
+
+    def asks(self, program_id: str) -> tuple[dict[str, Any], ...]:
+        program_id = self._require_text(program_id, field="program_id")
+        return self._audit_operator().asks(program_id)
+
+    def approve(self, decision_id: str) -> dict[str, Any]:
+        decision_id = self._require_text(decision_id, field="decision_id")
+        return self._audit_operator().approve(decision_id)
+
+    def audit_operation(self, operation_id: str) -> dict[str, Any]:
+        operation_id = self._require_text(operation_id, field="operation_id")
+        return self._audit_operator().audit_operation(operation_id)
+
+    def audit_evidence(self, evidence_id: str) -> dict[str, Any]:
+        evidence_id = self._require_text(evidence_id, field="evidence_id")
+        return self._audit_operator().audit_evidence(evidence_id)
+
+    def audit_verification(self, verification_id: str) -> dict[str, Any]:
+        verification_id = self._require_text(
+            verification_id,
+            field="verification_id",
+        )
+        return self._audit_operator().audit_verification(verification_id)
