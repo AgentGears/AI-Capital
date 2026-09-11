@@ -13,6 +13,7 @@ from .errors import (
     StaleProgramRevision,
 )
 from .events import utc_now
+from .frozen_json import FrozenMap
 from .models import Program
 from .schema_codec import record_from_json, record_to_json
 from .serialization import canonical_digest, canonical_json
@@ -207,6 +208,35 @@ class ProgramControlRepository:
         ).fetchall()
         return tuple(rows)
 
+    def _program_statuses_by_revision(
+        self,
+        program_id: str,
+    ) -> dict[int, ProgramStatus]:
+        statuses: dict[int, ProgramStatus] = {}
+        for event in self._host_store.list_events(program_id):
+            try:
+                snapshot = event.payload["program"]
+            except KeyError as exc:
+                raise IntegrityViolation(
+                    "Program Event lacks Program snapshot while validating control"
+                ) from exc
+            if not isinstance(snapshot, FrozenMap):
+                raise IntegrityViolation(
+                    "Program Event lacks canonical Program snapshot while validating control"
+                )
+            try:
+                candidate = record_from_json(Program, canonical_json(snapshot))
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation(
+                    "Program Event snapshot cannot be decoded while validating control"
+                ) from exc
+            if not isinstance(candidate, Program) or candidate.program_id != program_id:
+                raise IntegrityViolation(
+                    "Program Event snapshot identity mismatch while validating control"
+                )
+            statuses[candidate.revision] = candidate.status
+        return statuses
+
     def _verified_history(self, program: Program) -> tuple[ProgramControl, ...]:
         projection_row = self._projection_row(program.program_id)
         history_rows = self._history_rows(program.program_id)
@@ -217,6 +247,7 @@ class ProgramControlRepository:
         if not history_rows:
             raise IntegrityViolation("Program-control projection lacks history")
 
+        statuses = self._program_statuses_by_revision(program.program_id)
         history: list[ProgramControl] = []
         expected_paused = True
         previous_program_revision = -1
@@ -235,6 +266,10 @@ class ProgramControlRepository:
                 raise IntegrityViolation(
                     "Program-control history references a future Program revision"
                 )
+            if statuses.get(control.program_revision) is not ProgramStatus.ACTIVE:
+                raise IntegrityViolation(
+                    "Program-control history is not anchored to an active Program revision"
+                )
             history.append(control)
             previous_program_revision = control.program_revision
             expected_paused = not expected_paused
@@ -246,6 +281,7 @@ class ProgramControlRepository:
         return tuple(history)
 
     def get(self, program_id: str) -> ProgramControl:
+        self._host_store.verify_integrity(program_id)
         program = self._host_store.get(program_id)
         history = self._verified_history(program)
         return self._default(program) if not history else history[-1]
@@ -294,6 +330,7 @@ class ProgramControlRepository:
         digest = canonical_digest(updated)
         try:
             with self._host_store._transaction():
+                self._host_store.verify_integrity(previous.program_id)
                 program = self._host_store._program_from_row(
                     self._host_store._read_projection_row(previous.program_id)
                 )
