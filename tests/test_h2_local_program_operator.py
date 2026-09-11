@@ -11,6 +11,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ai_capital.kernel.durable_program import ProgramRepository
+from ai_capital.kernel.enums import ProgramStatus
 from ai_capital.kernel.errors import IntegrityViolation, InvalidStateTransition, StaleProgramRevision
 from ai_capital.kernel.models import Program
 from ai_capital.product import LocalProgramOperator
@@ -96,6 +97,31 @@ class H2LocalProgramOperatorTests(unittest.TestCase):
 
                 with self.assertRaises(InvalidStateTransition):
                     operator.cancel("p-1", expected_revision=2)
+
+    def test_start_does_not_resume_a_blocked_program(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "capital.db"
+            with ProgramRepository(database) as programs:
+                program = programs.create(Program("p-1", 0, "blocked work"))
+                program = programs.transition(
+                    program.program_id,
+                    ProgramStatus.ACTIVE,
+                    expected_revision=program.revision,
+                )
+                program = programs.transition(
+                    program.program_id,
+                    ProgramStatus.BLOCKED,
+                    expected_revision=program.revision,
+                )
+                self.assertEqual(program.revision, 2)
+
+            with LocalProgramOperator.open(database) as operator:
+                with self.assertRaises(InvalidStateTransition):
+                    operator.start("p-1", expected_revision=2)
+                shown = operator.show("p-1")
+                self.assertEqual(shown["program"]["status"], "blocked")
+                self.assertEqual(shown["program"]["revision"], 2)
+                self.assertEqual(shown["event_count"], 3)
 
     def test_program_listing_authenticates_each_projection(self):
         with tempfile.TemporaryDirectory() as directory:
