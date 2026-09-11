@@ -24,7 +24,12 @@ class LocalProgramOperator:
 
     @classmethod
     def open(cls, database_path: str | Path) -> "LocalProgramOperator":
-        return cls(ProgramRepository(database_path), owns_repository=True)
+        programs = ProgramRepository(database_path)
+        try:
+            return cls(programs, owns_repository=True)
+        except Exception:
+            programs.close()
+            raise
 
     def close(self) -> None:
         if self._closed:
