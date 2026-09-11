@@ -5,7 +5,7 @@ from typing import Any
 
 from ..kernel.durable_program import ProgramRepository
 from ..kernel.enums import ProgramStatus
-from ..kernel.errors import InvalidRequest
+from ..kernel.errors import InvalidRequest, InvalidStateTransition, StaleProgramRevision
 from ..kernel.models import Program
 from ..kernel.serialization import to_canonical_data
 
@@ -35,6 +35,10 @@ class LocalProgramOperator:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise InvalidRequest("local Program operator is closed")
+
     @staticmethod
     def _require_text(value: str, *, field: str) -> str:
         if not isinstance(value, str) or not value.strip():
@@ -57,6 +61,7 @@ class LocalProgramOperator:
         constraints: tuple[str, ...] = (),
         success_criteria: tuple[str, ...] = (),
     ) -> dict[str, Any]:
+        self._ensure_open()
         program_id = self._require_text(program_id, field="program_id")
         objective = self._require_text(objective, field="objective")
         for value in constraints:
@@ -75,14 +80,26 @@ class LocalProgramOperator:
         return self._view(program)
 
     def list(self) -> tuple[dict[str, Any], ...]:
+        self._ensure_open()
         return tuple(self._view(program) for program in self._programs.list_programs())
 
     def show(self, program_id: str) -> dict[str, Any]:
+        self._ensure_open()
         program_id = self._require_text(program_id, field="program_id")
         return self._view(self._programs.get(program_id))
 
     def start(self, program_id: str, *, expected_revision: int) -> dict[str, Any]:
+        self._ensure_open()
         program_id = self._require_text(program_id, field="program_id")
+        current = self._programs.get(program_id)
+        if current.revision != expected_revision:
+            raise StaleProgramRevision(
+                f"expected revision {expected_revision}, current revision {current.revision}"
+            )
+        if current.status is not ProgramStatus.CREATED:
+            raise InvalidStateTransition(
+                f"{current.status.value} -> {ProgramStatus.ACTIVE.value}"
+            )
         program = self._programs.transition(
             program_id,
             ProgramStatus.ACTIVE,
@@ -91,6 +108,7 @@ class LocalProgramOperator:
         return self._view(program)
 
     def cancel(self, program_id: str, *, expected_revision: int) -> dict[str, Any]:
+        self._ensure_open()
         program_id = self._require_text(program_id, field="program_id")
         program = self._programs.transition(
             program_id,
