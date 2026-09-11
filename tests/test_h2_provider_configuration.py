@@ -162,6 +162,46 @@ class H2ProviderConfigurationTests(unittest.TestCase):
                     ).fetchone()
                     self.assertIsNone(row)
 
+    def test_registration_cannot_retroactively_adopt_matching_legacy_actor_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "capital.db"
+            with ProgramRepository(database) as programs:
+                ActorRepository(programs).register(
+                    Actor("a-1", 0, "worker", "binding-a")
+                )
+
+            with LocalProviderOperator.open(database) as providers:
+                registered = providers.register(
+                    binding_id="binding-a",
+                    adapter="adapter",
+                    model="model-a",
+                )
+                self.assertNotEqual(registered["model_binding"], "binding-a")
+                self.assertTrue(
+                    registered["model_binding"].startswith("provider-binding:")
+                )
+
+            with LocalActorProviderOperator.open(database) as actor_provider:
+                unchanged = actor_provider.show("a-1")
+                self.assertEqual(unchanged["actor"]["generation"], 0)
+                self.assertEqual(unchanged["actor"]["model_binding"], "binding-a")
+                self.assertFalse(unchanged["configured"])
+                self.assertIsNone(unchanged["provider"])
+
+                rebound = actor_provider.rebind(
+                    "a-1",
+                    "binding-a",
+                    expected_generation=0,
+                    expected_provider_revision=0,
+                )
+                self.assertEqual(rebound["actor"]["generation"], 1)
+                self.assertEqual(
+                    rebound["actor"]["model_binding"],
+                    registered["model_binding"],
+                )
+                self.assertEqual(rebound["provider"], registered)
+                self.assertTrue(rebound["configured"])
+
     def test_actor_rebind_preserves_identity_program_and_non_binding_actor_state(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "capital.db"
@@ -201,9 +241,9 @@ class H2ProviderConfigurationTests(unittest.TestCase):
                 self.assertEqual(actor["profile"], before_actor.profile)
                 self.assertEqual(actor["status"], before_actor.status.value)
                 self.assertEqual(actor["grant_refs"], list(before_actor.grant_refs))
-                self.assertEqual(actor["model_binding"], "binding-new")
+                self.assertEqual(actor["model_binding"], provider["model_binding"])
                 self.assertTrue(changed["configured"])
-                self.assertEqual(changed["provider"]["binding_id"], "binding-new")
+                self.assertEqual(changed["provider"], provider)
 
             with ProgramRepository(database) as programs:
                 self.assertEqual(programs.get("p-1"), before_program)
