@@ -63,7 +63,10 @@ class H2ProviderCliTests(unittest.TestCase):
             registered_json = json.loads(registered.stdout)
             self.assertEqual(registered_json["binding_id"], "binding-a")
             self.assertEqual(registered_json["revision"], 0)
-            self.assertEqual(registered_json["model_binding"], "binding-a")
+            self.assertNotEqual(registered_json["model_binding"], "binding-a")
+            self.assertTrue(
+                registered_json["model_binding"].startswith("provider-binding:")
+            )
 
             listed = _run(database, "providers")
             self.assertEqual(listed.returncode, 0, listed.stderr)
