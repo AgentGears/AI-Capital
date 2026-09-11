@@ -37,12 +37,14 @@ _EXPECTED_COLUMNS = {
     _HISTORY_TABLE: (
         "binding_id",
         "revision",
+        "model_binding",
         "configuration_json",
         "configuration_digest",
     ),
     _PROJECTION_TABLE: (
         "binding_id",
         "revision",
+        "model_binding",
         "configuration_json",
         "configuration_digest",
     ),
@@ -51,10 +53,11 @@ _EXPECTED_COLUMNS = {
 
 @dataclass(frozen=True, slots=True)
 class ProviderConfiguration:
-    """Non-secret product metadata for one runtime model-binding identity."""
+    """Non-secret product metadata for one immutable runtime model binding."""
 
     binding_id: str
     revision: int
+    model_binding: str
     adapter: str
     model: str
     settings: FrozenMap
@@ -119,10 +122,18 @@ def _validate_settings(settings: FrozenMap) -> None:
 
 def validate_provider_configuration(configuration: ProviderConfiguration) -> None:
     _require_text(configuration.binding_id, field="binding_id")
+    _require_text(configuration.model_binding, field="model_binding")
     _require_text(configuration.adapter, field="adapter")
     _require_text(configuration.model, field="model")
     if type(configuration.revision) is not int or configuration.revision < 0:
         raise InvalidRequest("provider configuration revision must be non-negative")
+    expected_model_binding = (
+        configuration.binding_id
+        if configuration.revision == 0
+        else f"{configuration.binding_id}:revision:{configuration.revision}"
+    )
+    if configuration.model_binding != expected_model_binding:
+        raise InvalidRequest("provider runtime binding does not match its revision identity")
     _require_text(configuration.configured_at, field="configured_at")
     _validate_settings(configuration.settings)
 
@@ -221,6 +232,7 @@ class ProviderConfigurationRepository:
                 CREATE TABLE provider_configuration_revisions (
                     binding_id TEXT NOT NULL,
                     revision INTEGER NOT NULL,
+                    model_binding TEXT NOT NULL UNIQUE,
                     configuration_json TEXT NOT NULL,
                     configuration_digest TEXT NOT NULL,
                     PRIMARY KEY(binding_id, revision)
@@ -232,6 +244,7 @@ class ProviderConfigurationRepository:
                 CREATE TABLE provider_configuration_projections (
                     binding_id TEXT PRIMARY KEY,
                     revision INTEGER NOT NULL,
+                    model_binding TEXT NOT NULL UNIQUE,
                     configuration_json TEXT NOT NULL,
                     configuration_digest TEXT NOT NULL
                 )
@@ -262,6 +275,7 @@ class ProviderConfigurationRepository:
         if (
             configuration.binding_id != row["binding_id"]
             or configuration.revision != int(row["revision"])
+            or configuration.model_binding != row["model_binding"]
             or canonical_digest(configuration) != row["configuration_digest"]
         ):
             raise IntegrityViolation("provider configuration row/digest binding mismatch")
@@ -270,7 +284,8 @@ class ProviderConfigurationRepository:
     def _projection_row(self, binding_id: str) -> sqlite3.Row:
         row = self._host_store._db.execute(
             """
-            SELECT binding_id, revision, configuration_json, configuration_digest
+            SELECT binding_id, revision, model_binding,
+                   configuration_json, configuration_digest
             FROM provider_configuration_projections WHERE binding_id = ?
             """,
             (binding_id,),
@@ -284,7 +299,8 @@ class ProviderConfigurationRepository:
         projection = self._configuration_from_row(projection_row)
         rows = self._host_store._db.execute(
             """
-            SELECT binding_id, revision, configuration_json, configuration_digest
+            SELECT binding_id, revision, model_binding,
+                   configuration_json, configuration_digest
             FROM provider_configuration_revisions
             WHERE binding_id = ? ORDER BY revision
             """,
@@ -322,6 +338,9 @@ class ProviderConfigurationRepository:
         configuration = ProviderConfiguration(
             binding_id=binding_id,
             revision=revision,
+            model_binding=(
+                binding_id if revision == 0 else f"{binding_id}:revision:{revision}"
+            ),
             adapter=adapter,
             model=model,
             settings=frozen,
@@ -364,22 +383,36 @@ class ProviderConfigurationRepository:
                 self._host_store._db.execute(
                     """
                     INSERT INTO provider_configuration_revisions(
-                        binding_id, revision, configuration_json, configuration_digest
-                    ) VALUES (?, ?, ?, ?)
+                        binding_id, revision, model_binding,
+                        configuration_json, configuration_digest
+                    ) VALUES (?, ?, ?, ?, ?)
                     """,
-                    (binding_id, 0, encoded, digest),
+                    (
+                        binding_id,
+                        0,
+                        configuration.model_binding,
+                        encoded,
+                        digest,
+                    ),
                 )
                 self._host_store._db.execute(
                     """
                     INSERT INTO provider_configuration_projections(
-                        binding_id, revision, configuration_json, configuration_digest
-                    ) VALUES (?, ?, ?, ?)
+                        binding_id, revision, model_binding,
+                        configuration_json, configuration_digest
+                    ) VALUES (?, ?, ?, ?, ?)
                     """,
-                    (binding_id, 0, encoded, digest),
+                    (
+                        binding_id,
+                        0,
+                        configuration.model_binding,
+                        encoded,
+                        digest,
+                    ),
                 )
         except sqlite3.IntegrityError as exc:
             raise PersistenceConflict(
-                f"provider binding already exists: {binding_id}"
+                f"provider binding identity conflicts with durable state: {binding_id}"
             ) from exc
         return configuration
 
@@ -397,6 +430,29 @@ class ProviderConfigurationRepository:
         _require_text(binding_id, field="binding_id")
         return self._validated_history(binding_id)
 
+    def by_model_binding(self, model_binding: str) -> ProviderConfiguration | None:
+        _require_text(model_binding, field="model_binding")
+        row = self._host_store._db.execute(
+            """
+            SELECT binding_id, revision, model_binding,
+                   configuration_json, configuration_digest
+            FROM provider_configuration_revisions WHERE model_binding = ?
+            """,
+            (model_binding,),
+        ).fetchone()
+        if row is None:
+            return None
+        configuration = self._configuration_from_row(row)
+        history = self._validated_history(configuration.binding_id)
+        matches = tuple(
+            item for item in history if item.model_binding == model_binding
+        )
+        if matches != (configuration,):
+            raise IntegrityViolation(
+                "provider runtime binding diverges from immutable revision history"
+            )
+        return configuration
+
     def update(
         self,
         binding_id: str,
@@ -409,45 +465,59 @@ class ProviderConfigurationRepository:
         _require_text(binding_id, field="binding_id")
         if type(expected_revision) is not int or expected_revision < 0:
             raise InvalidRequest("expected provider revision must be non-negative")
-        with self._host_store._transaction():
-            current = self._validated_history(binding_id)[-1]
-            if current.revision != expected_revision:
-                raise StaleProviderConfigurationRevision(
-                    f"expected provider revision {expected_revision}, current revision {current.revision}"
+        try:
+            with self._host_store._transaction():
+                current = self._validated_history(binding_id)[-1]
+                if current.revision != expected_revision:
+                    raise StaleProviderConfigurationRevision(
+                        f"expected provider revision {expected_revision}, current revision {current.revision}"
+                    )
+                updated = self._new_configuration(
+                    binding_id=binding_id,
+                    revision=current.revision + 1,
+                    adapter=adapter,
+                    model=model,
+                    settings={} if settings is None else settings,
                 )
-            updated = self._new_configuration(
-                binding_id=binding_id,
-                revision=current.revision + 1,
-                adapter=adapter,
-                model=model,
-                settings={} if settings is None else settings,
-            )
-            encoded = record_to_json(updated)
-            digest = canonical_digest(updated)
-            self._host_store._db.execute(
-                """
-                INSERT INTO provider_configuration_revisions(
-                    binding_id, revision, configuration_json, configuration_digest
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (binding_id, updated.revision, encoded, digest),
-            )
-            cursor = self._host_store._db.execute(
-                """
-                UPDATE provider_configuration_projections
-                SET revision = ?, configuration_json = ?, configuration_digest = ?
-                WHERE binding_id = ? AND revision = ?
-                """,
-                (
-                    updated.revision,
-                    encoded,
-                    digest,
-                    binding_id,
-                    expected_revision,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise StaleProviderConfigurationRevision(
-                    f"provider revision changed during update: {binding_id}"
+                encoded = record_to_json(updated)
+                digest = canonical_digest(updated)
+                self._host_store._db.execute(
+                    """
+                    INSERT INTO provider_configuration_revisions(
+                        binding_id, revision, model_binding,
+                        configuration_json, configuration_digest
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        binding_id,
+                        updated.revision,
+                        updated.model_binding,
+                        encoded,
+                        digest,
+                    ),
                 )
+                cursor = self._host_store._db.execute(
+                    """
+                    UPDATE provider_configuration_projections
+                    SET revision = ?, model_binding = ?,
+                        configuration_json = ?, configuration_digest = ?
+                    WHERE binding_id = ? AND revision = ?
+                    """,
+                    (
+                        updated.revision,
+                        updated.model_binding,
+                        encoded,
+                        digest,
+                        binding_id,
+                        expected_revision,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise StaleProviderConfigurationRevision(
+                        f"provider revision changed during update: {binding_id}"
+                    )
+        except sqlite3.IntegrityError as exc:
+            raise PersistenceConflict(
+                f"provider runtime binding identity conflict: {binding_id}"
+            ) from exc
         return updated
