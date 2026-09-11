@@ -20,6 +20,8 @@ from ..kernel.serialization import canonical_digest
 
 _COMPONENT = "product_provider_configuration"
 _COMPONENT_SCHEMA_VERSION = 1
+_HISTORY_TABLE = "provider_configuration_revisions"
+_PROJECTION_TABLE = "provider_configuration_projections"
 _ALLOWED_SETTINGS = frozenset(
     {
         "temperature",
@@ -31,6 +33,20 @@ _ALLOWED_SETTINGS = frozenset(
         "response_format",
     }
 )
+_EXPECTED_COLUMNS = {
+    _HISTORY_TABLE: (
+        "binding_id",
+        "revision",
+        "configuration_json",
+        "configuration_digest",
+    ),
+    _PROJECTION_TABLE: (
+        "binding_id",
+        "revision",
+        "configuration_json",
+        "configuration_digest",
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +89,6 @@ def _validate_settings(settings: FrozenMap) -> None:
             "provider settings contain unsupported or secret-capable fields: "
             + ", ".join(unknown)
         )
-
     if "temperature" in settings:
         value = _number(settings["temperature"], field="temperature")
         if value < 0 or value > 2:
@@ -99,9 +114,7 @@ def _validate_settings(settings: FrozenMap) -> None:
             )
     if "response_format" in settings:
         if settings["response_format"] not in {"text", "json"}:
-            raise InvalidRequest(
-                "provider setting response_format must be text or json"
-            )
+            raise InvalidRequest("provider setting response_format must be text or json")
 
 
 def validate_provider_configuration(configuration: ProviderConfiguration) -> None:
@@ -121,6 +134,50 @@ class ProviderConfigurationRepository:
         self._host_store = host_store
         self._migrate()
 
+    def _table_exists(self, table_name: str) -> bool:
+        row = self._host_store._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        return row is not None
+
+    def _verify_schema_shape(self) -> None:
+        for table_name, expected_columns in _EXPECTED_COLUMNS.items():
+            if not self._table_exists(table_name):
+                raise IntegrityViolation(
+                    f"provider configuration schema is missing {table_name}"
+                )
+            columns = tuple(
+                str(row["name"])
+                for row in self._host_store._db.execute(
+                    f"PRAGMA table_info({table_name})"
+                ).fetchall()
+            )
+            if columns != expected_columns:
+                raise IntegrityViolation(
+                    f"provider configuration schema shape mismatch: {table_name}"
+                )
+
+    def _install_history_guards(self) -> None:
+        self._host_store._db.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS provider_configuration_history_no_update
+            BEFORE UPDATE ON provider_configuration_revisions
+            BEGIN
+                SELECT RAISE(ABORT, 'provider configuration history is immutable');
+            END
+            """
+        )
+        self._host_store._db.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS provider_configuration_history_no_delete
+            BEFORE DELETE ON provider_configuration_revisions
+            BEGIN
+                SELECT RAISE(ABORT, 'provider configuration history is immutable');
+            END
+            """
+        )
+
     def _migrate(self) -> None:
         with self._host_store._transaction():
             self._host_store._db.execute(
@@ -136,7 +193,12 @@ class ProviderConfigurationRepository:
                 (_COMPONENT,),
             ).fetchone()
             if row is not None:
-                version = int(row["version"])
+                try:
+                    version = int(row["version"])
+                except (TypeError, ValueError) as exc:
+                    raise IntegrityViolation(
+                        "provider configuration schema version is malformed"
+                    ) from exc
                 if version > _COMPONENT_SCHEMA_VERSION:
                     raise IntegrityViolation(
                         f"provider configuration schema version {version} is newer than supported "
@@ -146,8 +208,14 @@ class ProviderConfigurationRepository:
                     raise IntegrityViolation(
                         f"unsupported provider configuration schema version {version}"
                     )
+                self._verify_schema_shape()
+                self._install_history_guards()
                 return
 
+            if any(self._table_exists(table_name) for table_name in _EXPECTED_COLUMNS):
+                raise IntegrityViolation(
+                    "provider configuration tables exist without a schema marker"
+                )
             self._host_store._db.execute(
                 """
                 CREATE TABLE provider_configuration_revisions (
@@ -169,6 +237,8 @@ class ProviderConfigurationRepository:
                 )
                 """
             )
+            self._verify_schema_shape()
+            self._install_history_guards()
             self._host_store._db.execute(
                 "INSERT INTO component_schema(component, version) VALUES (?, ?)",
                 (_COMPONENT, _COMPONENT_SCHEMA_VERSION),
@@ -182,9 +252,7 @@ class ProviderConfigurationRepository:
                 row["configuration_json"],
             )
         except (TypeError, ValueError) as exc:
-            raise IntegrityViolation(
-                "provider configuration cannot be decoded"
-            ) from exc
+            raise IntegrityViolation("provider configuration cannot be decoded") from exc
         if not isinstance(configuration, ProviderConfiguration):
             raise IntegrityViolation("provider configuration decoded wrong type")
         try:
