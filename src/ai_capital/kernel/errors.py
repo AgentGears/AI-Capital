@@ -7,6 +7,7 @@ class InvalidStateTransition(AICapitalError): pass
 class StaleProgramRevision(AICapitalError): pass
 class StaleProgramControlRevision(AICapitalError): pass
 class StaleActorGeneration(AICapitalError): pass
+class StaleProviderConfigurationRevision(AICapitalError): pass
 class UnknownCapability(AICapitalError): pass
 class StaleCapabilityBinding(AICapitalError): pass
 class CapabilityUnavailable(AICapitalError): pass
