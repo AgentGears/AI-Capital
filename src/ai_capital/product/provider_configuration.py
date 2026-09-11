@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Mapping
 
 from ..kernel.durable_program import ProgramRepository
@@ -49,6 +50,20 @@ _EXPECTED_COLUMNS = {
         "configuration_digest",
     ),
 }
+_EXPECTED_PRIMARY_KEYS = {
+    _HISTORY_TABLE: (("binding_id", 1), ("revision", 2)),
+    _PROJECTION_TABLE: (("binding_id", 1),),
+}
+_EXPECTED_UNIQUE_KEYS = {
+    _HISTORY_TABLE: {
+        ("binding_id", "revision"),
+        ("model_binding",),
+    },
+    _PROJECTION_TABLE: {
+        ("binding_id",),
+        ("model_binding",),
+    },
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +89,22 @@ def _require_text(value: str, *, field: str) -> str:
     if type(value) is not str or not value.strip():
         raise InvalidRequest(f"{field} must be non-empty")
     return value
+
+
+def _runtime_model_binding(binding_id: str, revision: int) -> str:
+    return "provider-binding:" + canonical_digest(
+        {"binding_id": binding_id, "revision": revision}
+    )
+
+
+def _validate_timestamp(value: str, *, field: str) -> None:
+    _require_text(value, field=field)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise InvalidRequest(f"{field} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise InvalidRequest(f"{field} must be timezone-aware")
 
 
 def _number(value: object, *, field: str) -> float:
@@ -127,14 +158,13 @@ def validate_provider_configuration(configuration: ProviderConfiguration) -> Non
     _require_text(configuration.model, field="model")
     if type(configuration.revision) is not int or configuration.revision < 0:
         raise InvalidRequest("provider configuration revision must be non-negative")
-    expected_model_binding = (
-        configuration.binding_id
-        if configuration.revision == 0
-        else f"{configuration.binding_id}:revision:{configuration.revision}"
+    expected_model_binding = _runtime_model_binding(
+        configuration.binding_id,
+        configuration.revision,
     )
     if configuration.model_binding != expected_model_binding:
         raise InvalidRequest("provider runtime binding does not match its revision identity")
-    _require_text(configuration.configured_at, field="configured_at")
+    _validate_timestamp(configuration.configured_at, field="configured_at")
     _validate_settings(configuration.settings)
 
 
@@ -152,21 +182,61 @@ class ProviderConfigurationRepository:
         ).fetchone()
         return row is not None
 
+    def _unique_keys(self, table_name: str) -> set[tuple[str, ...]]:
+        keys: set[tuple[str, ...]] = set()
+        for index in self._host_store._db.execute(
+            f"PRAGMA index_list({table_name})"
+        ).fetchall():
+            if int(index["unique"]) != 1:
+                continue
+            columns = tuple(
+                str(row["name"])
+                for row in self._host_store._db.execute(
+                    f"PRAGMA index_info({index['name']})"
+                ).fetchall()
+            )
+            if columns:
+                keys.add(columns)
+        return keys
+
     def _verify_schema_shape(self) -> None:
         for table_name, expected_columns in _EXPECTED_COLUMNS.items():
             if not self._table_exists(table_name):
                 raise IntegrityViolation(
                     f"provider configuration schema is missing {table_name}"
                 )
-            columns = tuple(
-                str(row["name"])
-                for row in self._host_store._db.execute(
-                    f"PRAGMA table_info({table_name})"
-                ).fetchall()
-            )
+            info = self._host_store._db.execute(
+                f"PRAGMA table_info({table_name})"
+            ).fetchall()
+            columns = tuple(str(row["name"]) for row in info)
             if columns != expected_columns:
                 raise IntegrityViolation(
                     f"provider configuration schema shape mismatch: {table_name}"
+                )
+            primary_keys = tuple(
+                (str(row["name"]), int(row["pk"]))
+                for row in info
+                if int(row["pk"]) != 0
+            )
+            if primary_keys != _EXPECTED_PRIMARY_KEYS[table_name]:
+                raise IntegrityViolation(
+                    f"provider configuration primary key mismatch: {table_name}"
+                )
+            not_null = {
+                str(row["name"])
+                for row in info
+                if int(row["notnull"]) == 1
+            }
+            required_not_null = set(expected_columns) - {"binding_id"}
+            if not required_not_null.issubset(not_null):
+                raise IntegrityViolation(
+                    f"provider configuration nullability mismatch: {table_name}"
+                )
+            if not _EXPECTED_UNIQUE_KEYS[table_name].issubset(
+                self._unique_keys(table_name)
+            ):
+                raise IntegrityViolation(
+                    f"provider configuration unique-key mismatch: {table_name}"
                 )
 
     def _install_history_guards(self) -> None:
@@ -272,9 +342,13 @@ class ProviderConfigurationRepository:
             validate_provider_configuration(configuration)
         except InvalidRequest as exc:
             raise IntegrityViolation("provider configuration is invalid") from exc
+        try:
+            row_revision = int(row["revision"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation("provider configuration row revision is malformed") from exc
         if (
             configuration.binding_id != row["binding_id"]
-            or configuration.revision != int(row["revision"])
+            or configuration.revision != row_revision
             or configuration.model_binding != row["model_binding"]
             or canonical_digest(configuration) != row["configuration_digest"]
         ):
@@ -338,9 +412,7 @@ class ProviderConfigurationRepository:
         configuration = ProviderConfiguration(
             binding_id=binding_id,
             revision=revision,
-            model_binding=(
-                binding_id if revision == 0 else f"{binding_id}:revision:{revision}"
-            ),
+            model_binding=_runtime_model_binding(binding_id, revision),
             adapter=adapter,
             model=model,
             settings=frozen,
@@ -444,9 +516,7 @@ class ProviderConfigurationRepository:
             return None
         configuration = self._configuration_from_row(row)
         history = self._validated_history(configuration.binding_id)
-        matches = tuple(
-            item for item in history if item.model_binding == model_binding
-        )
+        matches = tuple(item for item in history if item.model_binding == model_binding)
         if matches != (configuration,):
             raise IntegrityViolation(
                 "provider runtime binding diverges from immutable revision history"
