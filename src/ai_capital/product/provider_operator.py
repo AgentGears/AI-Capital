@@ -4,9 +4,15 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ..kernel.durable_program import ProgramRepository
-from ..kernel.errors import InvalidRequest
+from ..kernel.errors import IntegrityViolation, InvalidRequest
 from ..kernel.serialization import to_canonical_data
 from .provider_configuration import ProviderConfigurationRepository
+
+
+_PROVIDER_TABLES = (
+    "provider_configuration_revisions",
+    "provider_configuration_projections",
+)
 
 
 class LocalProviderOperator:
@@ -60,7 +66,23 @@ class LocalProviderOperator:
             "SELECT version FROM component_schema WHERE component = ?",
             (component,),
         ).fetchone()
-        return None if row is None else int(row["version"])
+        if row is None:
+            return None
+        try:
+            return int(row["version"])
+        except (TypeError, ValueError) as exc:
+            raise IntegrityViolation(f"{component} schema version is malformed") from exc
+
+    def _provider_tables_exist(self) -> bool:
+        placeholders = ",".join("?" for _ in _PROVIDER_TABLES)
+        row = self._programs._db.execute(
+            f"""
+            SELECT COUNT(*) AS count FROM sqlite_master
+            WHERE type = 'table' AND name IN ({placeholders})
+            """,
+            _PROVIDER_TABLES,
+        ).fetchone()
+        return int(row["count"]) != 0
 
     def _repository(
         self,
@@ -71,6 +93,9 @@ class LocalProviderOperator:
         self._ensure_open()
         version = self._component_version("product_provider_configuration")
         if version is None and not initialize:
+            if self._provider_tables_exist():
+                # Repository admission fails closed on orphan backing tables.
+                return ProviderConfigurationRepository(self._programs)
             if required:
                 raise InvalidRequest("provider configuration is not initialized")
             return None
