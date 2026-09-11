@@ -629,19 +629,18 @@ class ContextRepository:
                 "DROP TRIGGER IF EXISTS context_persisted_source_invalidation_guard"
             )
             self._host_store._db.execute(
+                "DROP TRIGGER IF EXISTS context_recall_invalidation_guard"
+            )
+            self._host_store._db.execute(
                 """
-                CREATE TRIGGER context_persisted_source_invalidation_guard
+                CREATE TRIGGER context_recall_invalidation_guard
                 BEFORE UPDATE OF context_recall_invalidated ON events
                 WHEN OLD.context_recall_invalidated != 0
                   AND NEW.context_recall_invalidated = 0
-                  AND (
-                      OLD.event_type = 'context.source_persisted'
-                      OR NEW.event_type = 'context.source_persisted'
-                  )
                 BEGIN
                     SELECT RAISE(
                         ABORT,
-                        'persisted Context source invalidation cannot be cleared'
+                        'Context Event recall invalidation cannot be cleared'
                     );
                 END
                 """

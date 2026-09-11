@@ -85,7 +85,7 @@ class K8ReviewRound47Tests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(
                     sqlite3.IntegrityError,
-                    "persisted Context source invalidation cannot be cleared",
+                    "Context Event recall invalidation cannot be cleared",
                 ):
                     programs._db.execute(
                         "UPDATE events SET context_recall_invalidated = 0 WHERE event_id = ?",
