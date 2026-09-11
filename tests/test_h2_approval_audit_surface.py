@@ -266,7 +266,10 @@ class H2ApprovalAuditSurfaceTests(unittest.TestCase):
             with LocalProgramOperator.open(database) as operator:
                 audit = operator.audit_operation(operation.operation_id)
                 self.assertEqual(audit["operation"]["operation_id"], operation.operation_id)
-                self.assertEqual(audit["operation"]["receipt_refs"], finished.receipt_refs)
+                self.assertEqual(
+                    audit["operation"]["receipt_refs"],
+                    list(finished.receipt_refs),
+                )
                 self.assertEqual(len(audit["receipts"]), 1)
                 self.assertEqual(
                     [event["event_type"] for event in audit["events"]],
