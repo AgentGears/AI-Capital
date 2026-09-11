@@ -103,18 +103,6 @@ class H2ProviderConfigurationTests(unittest.TestCase):
 
             with ProgramRepository(database) as programs:
                 programs._db.execute(
-                    """
-                    UPDATE provider_configuration_revisions
-                    SET configuration_digest = (
-                        SELECT configuration_digest
-                        FROM provider_configuration_projections
-                        WHERE binding_id = ?
-                    )
-                    WHERE binding_id = ? AND revision = 0
-                    """,
-                    ("binding-a", "binding-a"),
-                )
-                programs._db.execute(
                     "DELETE FROM provider_configuration_revisions WHERE binding_id = ? AND revision = 0",
                     ("binding-a",),
                 )
@@ -176,7 +164,7 @@ class H2ProviderConfigurationTests(unittest.TestCase):
                 actor = changed["actor"]
                 self.assertEqual(actor["actor_id"], before_actor.actor_id)
                 self.assertEqual(actor["generation"], 1)
-                self.assertEqual(actor["role"], before_actor.role)
+                self.assertEqual(actor["profile"], before_actor.profile)
                 self.assertEqual(actor["status"], before_actor.status.value)
                 self.assertEqual(actor["grant_refs"], list(before_actor.grant_refs))
                 self.assertEqual(actor["model_binding"], "binding-new")
