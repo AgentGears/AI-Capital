@@ -11,13 +11,14 @@ import subprocess
 import tempfile
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ..kernel.enums import EffectClass, EffectStatus, ExecutionOutcome
 from ..kernel.errors import ExecutionFailure, ExecutionTimeout, InvalidRequest
 from ..kernel.models import ResolvedEffect
 from ..kernel.operation_journal import ExecutionObservation
 from ..kernel.serialization import canonical_json
+from .workspace_capture import _read_stable_regular_file
 from .workspace_types import canonical_artifact_path
 
 
@@ -25,6 +26,11 @@ _MAX_OBSERVATION_BYTES = 1024 * 1024
 _COMMAND_TIMEOUT_SECONDS = 15
 _HTTP_TIMEOUT_SECONDS = 15
 _READ_ONLY_COMMANDS = frozenset({"pwd", "ls", "cat", "head", "tail", "wc", "stat"})
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def _canonical_relative(value: str, *, allow_root: bool) -> str:
@@ -65,10 +71,9 @@ def _safe_existing(root: Path, target: str, *, allow_root: bool = True) -> Path:
 
 
 def _safe_write_target(root: Path, target: str, *, artifact: bool = False) -> Path:
-    if artifact:
-        target = canonical_artifact_path(target)
-    else:
-        target = _canonical_relative(target, allow_root=False)
+    target = canonical_artifact_path(target) if artifact else _canonical_relative(
+        target, allow_root=False
+    )
     root = root.resolve()
     candidate = root.joinpath(*PurePosixPath(target).parts)
     parent_relative = PurePosixPath(target).parent.as_posix()
@@ -113,11 +118,11 @@ def _atomic_write(path: Path, content: bytes) -> None:
 def _success(
     output: dict[str, object],
     *,
-    effect_status: EffectStatus = EffectStatus.CONFIRMED,
+    observational: bool = False,
 ) -> ExecutionObservation:
     return ExecutionObservation(
         ExecutionOutcome.SUCCEEDED,
-        effect_status,
+        EffectStatus.NOT_APPLICABLE if observational else EffectStatus.CONFIRMED,
         output,
     )
 
@@ -126,18 +131,18 @@ def _failed(
     output: dict[str, object],
     code: str,
     *,
-    effect_status: EffectStatus = EffectStatus.NO_EFFECT,
+    observational: bool = False,
 ) -> ExecutionObservation:
     return ExecutionObservation(
         ExecutionOutcome.FAILED,
-        effect_status,
+        EffectStatus.NOT_APPLICABLE if observational else EffectStatus.ABSENT,
         output,
         error_code=code,
     )
 
 
 class ProductCapabilityExecutor:
-    """Local product adapter that executes one already-authorized semantic Capability."""
+    """Executes one already-authorized local product Capability."""
 
     supports_idempotency = False
 
@@ -174,12 +179,11 @@ class ProductCapabilityExecutor:
             "artifact.write": self._artifact_write,
         }
         try:
-            handler = handlers[self._capability_id]
+            return handlers[self._capability_id](effect)
         except KeyError as exc:
             raise InvalidRequest(
                 f"no product executor for Capability: {self._capability_id}"
             ) from exc
-        return handler(effect)
 
     @staticmethod
     def _require_effect(
@@ -188,10 +192,7 @@ class ProductCapabilityExecutor:
         resource_type: str,
         effect_class: EffectClass,
     ) -> None:
-        if (
-            effect.resource_type != resource_type
-            or effect.effect_class is not effect_class
-        ):
+        if effect.resource_type != resource_type or effect.effect_class is not effect_class:
             raise InvalidRequest("authorized effect does not match product executor contract")
 
     def _workspace_read(self, effect: ResolvedEffect) -> ExecutionObservation:
@@ -201,16 +202,11 @@ class ProductCapabilityExecutor:
             effect_class=EffectClass.OBSERVE,
         )
         path = _safe_existing(self._workspace_root, effect.target, allow_root=False)
+        content = _read_stable_regular_file(path, relative=effect.target)
         try:
-            info = os.lstat(path)
-            if not stat.S_ISREG(info.st_mode):
-                raise InvalidRequest("workspace.read target must be a regular file")
-            content = path.read_bytes()
             text = content.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ExecutionFailure("workspace.read requires UTF-8 text") from exc
-        except OSError as exc:
-            raise ExecutionFailure("workspace.read failed") from exc
         return _success(
             {
                 "path": effect.target,
@@ -218,7 +214,7 @@ class ProductCapabilityExecutor:
                 "byte_length": len(content),
                 "sha256": hashlib.sha256(content).hexdigest(),
             },
-            effect_status=EffectStatus.NOT_APPLICABLE,
+            observational=True,
         )
 
     def _workspace_list(self, effect: ResolvedEffect) -> ExecutionObservation:
@@ -235,24 +231,17 @@ class ProductCapabilityExecutor:
             for child in sorted(path.iterdir(), key=lambda item: item.name):
                 info = os.lstat(child)
                 if stat.S_ISLNK(info.st_mode):
-                    kind = "symlink"
-                    size = 0
+                    kind, size = "symlink", 0
                 elif stat.S_ISDIR(info.st_mode):
-                    kind = "directory"
-                    size = 0
+                    kind, size = "directory", 0
                 elif stat.S_ISREG(info.st_mode):
-                    kind = "file"
-                    size = int(info.st_size)
+                    kind, size = "file", int(info.st_size)
                 else:
-                    kind = "special"
-                    size = 0
+                    kind, size = "special", 0
                 entries.append({"name": child.name, "kind": kind, "byte_length": size})
         except OSError as exc:
             raise ExecutionFailure("workspace.list failed") from exc
-        return _success(
-            {"path": effect.target, "entries": entries},
-            effect_status=EffectStatus.NOT_APPLICABLE,
-        )
+        return _success({"path": effect.target, "entries": entries}, observational=True)
 
     def _workspace_write(self, effect: ResolvedEffect) -> ExecutionObservation:
         self._require_effect(
@@ -275,19 +264,14 @@ class ProductCapabilityExecutor:
         )
 
     def _command_observe(self, effect: ResolvedEffect) -> ExecutionObservation:
-        self._require_effect(
-            effect,
-            resource_type="command",
-            effect_class=EffectClass.OBSERVE,
-        )
+        self._require_effect(effect, resource_type="command", effect_class=EffectClass.OBSERVE)
         try:
             parts = shlex.split(effect.target, posix=True)
         except ValueError as exc:
             raise InvalidRequest("command.observe command cannot be parsed") from exc
         if not parts or parts[0] not in _READ_ONLY_COMMANDS:
             raise InvalidRequest("command.observe is outside the read-only product profile")
-        command = parts[0]
-        operands = parts[1:]
+        command, operands = parts[0], parts[1:]
         if command == "pwd":
             if operands:
                 raise InvalidRequest("pwd does not accept arguments in the product profile")
@@ -323,13 +307,11 @@ class ProductCapabilityExecutor:
             "stdout": completed.stdout,
             "stderr": completed.stderr,
         }
-        if completed.returncode != 0:
-            return _failed(
-                output,
-                "command_failed",
-                effect_status=EffectStatus.NOT_APPLICABLE,
-            )
-        return _success(output, effect_status=EffectStatus.NOT_APPLICABLE)
+        return (
+            _success(output, observational=True)
+            if completed.returncode == 0
+            else _failed(output, "command_failed", observational=True)
+        )
 
     def _network_fetch(self, effect: ResolvedEffect) -> ExecutionObservation:
         self._require_effect(
@@ -343,10 +325,11 @@ class ProductCapabilityExecutor:
         if parsed.username is not None or parsed.password is not None:
             raise InvalidRequest("network.fetch URL cannot contain credentials")
         request = Request(effect.target, method="GET", headers={"User-Agent": "ai-capital/0.1"})
+        opener = build_opener(_NoRedirect())
         response = None
         try:
             try:
-                response = urlopen(request, timeout=_HTTP_TIMEOUT_SECONDS)
+                response = opener.open(request, timeout=_HTTP_TIMEOUT_SECONDS)
             except HTTPError as exc:
                 response = exc
             content = response.read(_MAX_OBSERVATION_BYTES + 1)
@@ -370,7 +353,7 @@ class ProductCapabilityExecutor:
                 "sha256": hashlib.sha256(content).hexdigest(),
                 "content_base64": base64.b64encode(content).decode("ascii"),
             },
-            effect_status=EffectStatus.NOT_APPLICABLE,
+            observational=True,
         )
 
     def _git_observe(self, effect: ResolvedEffect) -> ExecutionObservation:
@@ -418,13 +401,11 @@ class ProductCapabilityExecutor:
             "stdout": completed.stdout,
             "stderr": completed.stderr,
         }
-        if completed.returncode != 0:
-            return _failed(
-                output,
-                "git_observation_failed",
-                effect_status=EffectStatus.NOT_APPLICABLE,
-            )
-        return _success(output, effect_status=EffectStatus.NOT_APPLICABLE)
+        return (
+            _success(output, observational=True)
+            if completed.returncode == 0
+            else _failed(output, "git_observation_failed", observational=True)
+        )
 
     def _json_read(self, effect: ResolvedEffect) -> ExecutionObservation:
         self._require_effect(
@@ -433,16 +414,11 @@ class ProductCapabilityExecutor:
             effect_class=EffectClass.OBSERVE,
         )
         path = _safe_existing(self._workspace_root, effect.target, allow_root=False)
+        exact = _read_stable_regular_file(path, relative=effect.target)
         try:
-            if not stat.S_ISREG(os.lstat(path).st_mode):
-                raise InvalidRequest("structured.json.read target must be a regular file")
-            exact = path.read_bytes()
-            value = json.loads(exact.decode("utf-8"))
-            canonical = canonical_json(value)
+            canonical = canonical_json(json.loads(exact.decode("utf-8")))
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ExecutionFailure("structured.json.read found invalid canonical JSON data") from exc
-        except OSError as exc:
-            raise ExecutionFailure("structured.json.read failed") from exc
         canonical_bytes = canonical.encode("utf-8")
         return _success(
             {
@@ -451,7 +427,7 @@ class ProductCapabilityExecutor:
                 "byte_length": len(canonical_bytes),
                 "sha256": hashlib.sha256(canonical_bytes).hexdigest(),
             },
-            effect_status=EffectStatus.NOT_APPLICABLE,
+            observational=True,
         )
 
     def _json_write(self, effect: ResolvedEffect) -> ExecutionObservation:
