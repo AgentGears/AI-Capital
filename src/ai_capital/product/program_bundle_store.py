@@ -10,6 +10,7 @@ from ..kernel.operation_journal import OperationJournal
 from ..kernel.program_control import ProgramControlRepository
 from ..kernel.serialization import canonical_digest, to_canonical_data
 from .audit_operator import LocalAuditOperator
+from .program_bundle_auth import build_operation_audit_auth
 from .program_bundle_codec import embedded_artifact, encode_bundle, validate_bundle
 from .workspace_snapshots import WorkspaceSnapshotStore
 from .workspace_types import WorkspaceArtifact, require_text, sha256_bytes, validate_timestamp
@@ -62,6 +63,10 @@ class ProgramBundleStore:
                 for ref in program.verification_refs
             ),
         }
+        operation_audit_auth = build_operation_audit_auth(
+            self._programs,
+            audit["operations"],
+        )
         return {
             "source_program_id": program.program_id,
             "program": to_canonical_data(program),
@@ -73,6 +78,7 @@ class ProgramBundleStore:
                 "artifacts": artifacts,
             },
             "audit": audit,
+            "operation_audit_auth": operation_audit_auth,
         }
 
     def export(self, program_id: str, snapshot_id: str) -> bytes:
