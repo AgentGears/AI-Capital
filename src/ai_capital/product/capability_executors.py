@@ -70,6 +70,18 @@ def _safe_existing(root: Path, target: str, *, allow_root: bool = True) -> Path:
     return current
 
 
+def _validate_command_target(path: Path, *, allow_directory: bool) -> None:
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise InvalidRequest("command.observe target changed during validation") from exc
+    if stat.S_ISREG(info.st_mode):
+        return
+    if allow_directory and stat.S_ISDIR(info.st_mode):
+        return
+    raise InvalidRequest("command.observe target has unsupported file type")
+
+
 def _safe_write_target(
     root: Path,
     target: str,
@@ -320,14 +332,16 @@ class ProductCapabilityExecutor:
             if operands:
                 if operands[0].startswith("-"):
                     raise InvalidRequest("shell options are not admitted by the product profile")
-                _safe_existing(self._workspace_root, operands[0])
+                target = _safe_existing(self._workspace_root, operands[0])
+                _validate_command_target(target, allow_directory=True)
         else:
             if not operands:
                 raise InvalidRequest(f"{command} requires a workspace path")
             for operand in operands:
                 if operand.startswith("-"):
                     raise InvalidRequest("shell options are not admitted by the product profile")
-                _safe_existing(self._workspace_root, operand, allow_root=False)
+                target = _safe_existing(self._workspace_root, operand, allow_root=False)
+                _validate_command_target(target, allow_directory=command == "stat")
         try:
             completed = subprocess.run(
                 parts,
