@@ -13,6 +13,7 @@ from ..kernel.program_control import ProgramControl
 from ..kernel.schema_codec import record_from_json
 from ..kernel.serialization import canonical_digest, canonical_json, to_canonical_data
 from .program_bundle_audit import validate_bundle_audit
+from .program_bundle_auth import validate_operation_audit_auth
 from .workspace_types import (
     BUNDLE_PREFIX,
     WorkspaceArtifact,
@@ -230,8 +231,14 @@ def validate_bundle(
     if bundle_id != f"{BUNDLE_PREFIX}{canonical_digest(payload)}":
         raise InvalidRequest("Program bundle identity does not match its payload")
     if set(payload) != {
-        "source_program_id", "program", "program_digest", "events",
-        "control", "workspace", "audit",
+        "source_program_id",
+        "program",
+        "program_digest",
+        "events",
+        "control",
+        "workspace",
+        "audit",
+        "operation_audit_auth",
     }:
         raise InvalidRequest("Program bundle payload fields are invalid")
     source_program_id = require_text(payload["source_program_id"], field="source_program_id")
@@ -248,6 +255,11 @@ def validate_bundle(
     _validate_control(payload["control"], program=program, events=events)
     snapshot, artifacts = _validate_workspace(payload["workspace"], program=program)
     validate_bundle_audit(payload["audit"], program=program)
+    validate_operation_audit_auth(
+        payload["operation_audit_auth"],
+        program=program,
+        audit=payload["audit"],
+    )
     return envelope, program, snapshot, artifacts
 
 
