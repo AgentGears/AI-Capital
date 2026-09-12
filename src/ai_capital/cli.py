@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import sys
 from collections.abc import Sequence
@@ -11,6 +13,7 @@ from .kernel.errors import AICapitalError, InvalidRequest
 from .product.actor_provider import LocalActorProviderOperator
 from .product.program_operator import LocalProgramOperator
 from .product.provider_operator import LocalProviderOperator
+from .product.workspace_operator import LocalWorkspaceOperator
 
 
 _PROVIDER_COMMANDS = {
@@ -21,6 +24,19 @@ _PROVIDER_COMMANDS = {
     "provider-history",
 }
 _ACTOR_PROVIDER_COMMANDS = {"actor-provider", "actor-rebind"}
+_WORKSPACE_COMMANDS = {
+    "snapshot",
+    "snapshots",
+    "snapshot-show",
+    "artifacts",
+    "artifact-read",
+    "bundle-export",
+    "bundle-import",
+    "bundles",
+    "bundle-show",
+    "bundle-artifacts",
+    "bundle-artifact-read",
+}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -115,6 +131,53 @@ def _parser() -> argparse.ArgumentParser:
     actor_rebind.add_argument("binding_id")
     actor_rebind.add_argument("--expected-generation", required=True, type=int)
     actor_rebind.add_argument("--expected-provider-revision", required=True, type=int)
+
+    snapshot = commands.add_parser(
+        "snapshot", help="Capture the local workspace for one exact Program revision."
+    )
+    snapshot.add_argument("program_id")
+    snapshots = commands.add_parser(
+        "snapshots", help="List authenticated workspace snapshots for a Program."
+    )
+    snapshots.add_argument("program_id")
+    snapshot_show = commands.add_parser(
+        "snapshot-show", help="Inspect one authenticated workspace snapshot."
+    )
+    snapshot_show.add_argument("snapshot_id")
+    artifacts = commands.add_parser(
+        "artifacts", help="List exact artifacts in one workspace snapshot."
+    )
+    artifacts.add_argument("snapshot_id")
+    artifact_read = commands.add_parser(
+        "artifact-read", help="Read one authenticated snapshot artifact as base64."
+    )
+    artifact_read.add_argument("snapshot_id")
+    artifact_read.add_argument("path")
+
+    bundle_export = commands.add_parser(
+        "bundle-export", help="Export a deterministic Program bundle."
+    )
+    bundle_export.add_argument("program_id")
+    bundle_export.add_argument("snapshot_id")
+    bundle_export.add_argument("output", type=Path)
+    bundle_import = commands.add_parser(
+        "bundle-import", help="Import a Program bundle as a read-only archive."
+    )
+    bundle_import.add_argument("input", type=Path)
+    commands.add_parser("bundles", help="List imported read-only Program bundles.")
+    bundle_show = commands.add_parser(
+        "bundle-show", help="Inspect one imported Program bundle."
+    )
+    bundle_show.add_argument("bundle_id")
+    bundle_artifacts = commands.add_parser(
+        "bundle-artifacts", help="List artifacts in one imported Program bundle."
+    )
+    bundle_artifacts.add_argument("bundle_id")
+    bundle_artifact_read = commands.add_parser(
+        "bundle-artifact-read", help="Read one imported bundle artifact as base64."
+    )
+    bundle_artifact_read.add_argument("bundle_id")
+    bundle_artifact_read.add_argument("path")
     return parser
 
 
@@ -215,6 +278,58 @@ def _actor_provider_command(args: argparse.Namespace) -> Any:
     raise AssertionError(f"unhandled Actor provider command: {args.command}")
 
 
+def _workspace_command(args: argparse.Namespace) -> Any:
+    with LocalWorkspaceOperator.open(args.database) as operator:
+        if args.command == "snapshot":
+            return operator.snapshot(args.program_id)
+        if args.command == "snapshots":
+            return operator.snapshots(args.program_id)
+        if args.command == "snapshot-show":
+            return operator.show_snapshot(args.snapshot_id)
+        if args.command == "artifacts":
+            return operator.artifacts(args.snapshot_id)
+        if args.command == "artifact-read":
+            content = operator.artifact_bytes(args.snapshot_id, args.path)
+            return {
+                "path": args.path,
+                "byte_length": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            }
+        if args.command == "bundle-export":
+            content = operator.export_bundle(args.program_id, args.snapshot_id)
+            try:
+                args.output.write_bytes(content)
+            except OSError as exc:
+                raise InvalidRequest(f"cannot write Program bundle: {args.output}") from exc
+            return {
+                "output": str(args.output),
+                "byte_length": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+        if args.command == "bundle-import":
+            try:
+                content = args.input.read_bytes()
+            except OSError as exc:
+                raise InvalidRequest(f"cannot read Program bundle: {args.input}") from exc
+            return operator.import_bundle(content)
+        if args.command == "bundles":
+            return operator.bundles()
+        if args.command == "bundle-show":
+            return operator.show_bundle(args.bundle_id)
+        if args.command == "bundle-artifacts":
+            return operator.bundle_artifacts(args.bundle_id)
+        if args.command == "bundle-artifact-read":
+            content = operator.bundle_artifact_bytes(args.bundle_id, args.path)
+            return {
+                "path": args.path,
+                "byte_length": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            }
+    raise AssertionError(f"unhandled workspace command: {args.command}")
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -229,6 +344,8 @@ def main(
             result = _provider_command(args)
         elif args.command in _ACTOR_PROVIDER_COMMANDS:
             result = _actor_provider_command(args)
+        elif args.command in _WORKSPACE_COMMANDS:
+            result = _workspace_command(args)
         else:
             result = _program_command(args)
     except AICapitalError as exc:
