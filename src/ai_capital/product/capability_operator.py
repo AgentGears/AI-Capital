@@ -26,6 +26,10 @@ from .capability_catalog import (
 from .capability_executors import ProductCapabilityExecutor
 
 
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left == right or left in right.parents or right in left.parents
+
+
 class LocalCapabilityOperator:
     """Governed local product path from typed Capability request to durable Operation."""
 
@@ -51,6 +55,8 @@ class LocalCapabilityOperator:
         self._programs = programs
         self._workspace_root = Path(workspace_root).resolve()
         self._artifact_root = Path(artifact_root).resolve()
+        if _paths_overlap(self._workspace_root, self._artifact_root):
+            raise InvalidRequest("workspace and artifact roots must be disjoint")
         self._workspace_root.mkdir(parents=True, exist_ok=True)
         self._artifact_root.mkdir(parents=True, exist_ok=True)
         self._actors = ActorRepository(programs)
