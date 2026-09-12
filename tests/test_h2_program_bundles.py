@@ -108,6 +108,38 @@ class H2ProgramBundleTests(unittest.TestCase):
                 with self.assertRaises(InvalidRequest):
                     operator.import_bundle(tampered)
 
+    def test_tampered_bundle_control_anchor_is_rejected_with_recomputed_bundle_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, snapshot_id = self._source(root)
+            with LocalWorkspaceOperator.open(source) as operator:
+                content = operator.export_bundle("p-1", snapshot_id)
+            envelope = json.loads(content)
+            control = envelope["payload"]["control"]
+            control.update(
+                {
+                    "revision": 1,
+                    "program_revision": 0,
+                    "paused": True,
+                    "last_reason_code": "user_paused",
+                    "changed_at": "2026-09-12T00:00:00+00:00",
+                }
+            )
+            envelope["bundle_id"] = "program-bundle:" + canonical_digest(envelope["payload"])
+            tampered = canonical_json(envelope).encode("utf-8")
+
+            target = root / "target.db"
+            target_workspace = root / "target-workspace"
+            target_artifacts = root / "target-artifacts"
+            target_workspace.mkdir()
+            with LocalWorkspaceOperator.open(
+                target,
+                workspace_root=target_workspace,
+                artifact_root=target_artifacts,
+            ) as operator:
+                with self.assertRaises(InvalidRequest):
+                    operator.import_bundle(tampered)
+
     def test_noncanonical_bundle_encoding_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
