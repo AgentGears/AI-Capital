@@ -106,6 +106,55 @@ def _install_guards(programs: ProgramRepository) -> None:
             )
 
 
+def _create_schema(programs: ProgramRepository) -> None:
+    programs._db.execute(
+        """
+        CREATE TABLE workspace_artifacts (
+            artifact_digest TEXT PRIMARY KEY,
+            content_ref TEXT NOT NULL UNIQUE,
+            byte_length INTEGER NOT NULL
+        )
+        """
+    )
+    programs._db.execute(
+        """
+        CREATE TABLE workspace_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            program_id TEXT NOT NULL,
+            program_revision INTEGER NOT NULL,
+            manifest_digest TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            snapshot_digest TEXT NOT NULL
+        )
+        """
+    )
+    programs._db.execute(
+        """
+        CREATE TABLE workspace_snapshot_entries (
+            snapshot_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            artifact_digest TEXT NOT NULL,
+            entry_json TEXT NOT NULL,
+            entry_digest TEXT NOT NULL,
+            PRIMARY KEY(snapshot_id, path),
+            FOREIGN KEY(snapshot_id) REFERENCES workspace_snapshots(snapshot_id),
+            FOREIGN KEY(artifact_digest) REFERENCES workspace_artifacts(artifact_digest)
+        )
+        """
+    )
+    programs._db.execute(
+        """
+        CREATE TABLE program_bundle_imports (
+            bundle_id TEXT PRIMARY KEY,
+            source_program_id TEXT NOT NULL,
+            bundle_json TEXT NOT NULL,
+            bundle_digest TEXT NOT NULL,
+            imported_at TEXT NOT NULL
+        )
+        """
+    )
+
+
 def migrate_workspace_archive(programs: ProgramRepository) -> None:
     with programs._transaction():
         programs._db.execute(
@@ -132,40 +181,7 @@ def migrate_workspace_archive(programs: ProgramRepository) -> None:
             return
         if any(_table_exists(programs, table) for table in TABLES):
             raise IntegrityViolation("workspace archive tables exist without a schema marker")
-        programs._db.executescript(
-            """
-            CREATE TABLE workspace_artifacts (
-                artifact_digest TEXT PRIMARY KEY,
-                content_ref TEXT NOT NULL UNIQUE,
-                byte_length INTEGER NOT NULL
-            );
-            CREATE TABLE workspace_snapshots (
-                snapshot_id TEXT PRIMARY KEY,
-                program_id TEXT NOT NULL,
-                program_revision INTEGER NOT NULL,
-                manifest_digest TEXT NOT NULL,
-                snapshot_json TEXT NOT NULL,
-                snapshot_digest TEXT NOT NULL
-            );
-            CREATE TABLE workspace_snapshot_entries (
-                snapshot_id TEXT NOT NULL,
-                path TEXT NOT NULL,
-                artifact_digest TEXT NOT NULL,
-                entry_json TEXT NOT NULL,
-                entry_digest TEXT NOT NULL,
-                PRIMARY KEY(snapshot_id, path),
-                FOREIGN KEY(snapshot_id) REFERENCES workspace_snapshots(snapshot_id),
-                FOREIGN KEY(artifact_digest) REFERENCES workspace_artifacts(artifact_digest)
-            );
-            CREATE TABLE program_bundle_imports (
-                bundle_id TEXT PRIMARY KEY,
-                source_program_id TEXT NOT NULL,
-                bundle_json TEXT NOT NULL,
-                bundle_digest TEXT NOT NULL,
-                imported_at TEXT NOT NULL
-            );
-            """
-        )
+        _create_schema(programs)
         verify_schema(programs)
         _install_guards(programs)
         programs._db.execute(
