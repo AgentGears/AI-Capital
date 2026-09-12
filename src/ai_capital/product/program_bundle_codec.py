@@ -12,6 +12,7 @@ from ..kernel.models import Event, Program
 from ..kernel.program_control import ProgramControl
 from ..kernel.schema_codec import record_from_json
 from ..kernel.serialization import canonical_digest, canonical_json, to_canonical_data
+from .program_bundle_audit import validate_bundle_audit
 from .workspace_types import (
     BUNDLE_PREFIX,
     WorkspaceArtifact,
@@ -209,48 +210,6 @@ def _validate_workspace(
     return snapshot, tuple(captured)
 
 
-def _audit_identity(view: object, *, category: str) -> str:
-    if type(view) is not dict:
-        raise InvalidRequest(f"Program bundle {category} audit item is invalid")
-    key = {
-        "operations": "operation",
-        "evidence": "evidence",
-        "verifications": "verification",
-    }[category]
-    record = view.get(key)
-    if type(record) is not dict:
-        raise InvalidRequest(f"Program bundle {category} audit item is invalid")
-    identity = record.get(
-        {
-            "operations": "operation_id",
-            "evidence": "evidence_id",
-            "verifications": "verification_id",
-        }[category]
-    )
-    return require_text(identity, field=f"{category} audit identity")
-
-
-def _validate_audit(value: object, *, program: Program) -> None:
-    if type(value) is not dict or set(value) != {
-        "asks", "operations", "evidence", "verifications"
-    }:
-        raise InvalidRequest("Program bundle audit section is invalid")
-    if any(type(value[key]) is not list for key in value):
-        raise InvalidRequest("Program bundle audit collections must be arrays")
-    expected = {
-        "operations": tuple(program.operation_refs),
-        "evidence": tuple(program.evidence_refs),
-        "verifications": tuple(program.verification_refs),
-    }
-    for category, refs in expected.items():
-        identities = tuple(_audit_identity(item, category=category) for item in value[category])
-        if identities != refs:
-            raise InvalidRequest(f"Program bundle {category} audit coverage mismatch")
-    for ask in value["asks"]:
-        if type(ask) is not dict or ask.get("program_id") != program.program_id:
-            raise InvalidRequest("Program bundle ASK audit Program mismatch")
-
-
 def validate_bundle(
     content: bytes,
 ) -> tuple[
@@ -288,7 +247,7 @@ def validate_bundle(
     )
     _validate_control(payload["control"], program=program, events=events)
     snapshot, artifacts = _validate_workspace(payload["workspace"], program=program)
-    _validate_audit(payload["audit"], program=program)
+    validate_bundle_audit(payload["audit"], program=program)
     return envelope, program, snapshot, artifacts
 
 
