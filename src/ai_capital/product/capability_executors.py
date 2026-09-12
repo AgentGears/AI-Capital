@@ -50,7 +50,8 @@ def _safe_existing(root: Path, target: str, *, allow_root: bool = True) -> Path:
     current = root
     if target == ".":
         return root
-    for index, part in enumerate(PurePosixPath(target).parts):
+    parts = PurePosixPath(target).parts
+    for index, part in enumerate(parts):
         current = current / part
         try:
             info = os.lstat(current)
@@ -58,7 +59,7 @@ def _safe_existing(root: Path, target: str, *, allow_root: bool = True) -> Path:
             raise InvalidRequest(f"capability path does not exist: {target}") from exc
         if stat.S_ISLNK(info.st_mode):
             raise InvalidRequest("capability path cannot traverse a symlink")
-        if index < len(PurePosixPath(target).parts) - 1 and not stat.S_ISDIR(info.st_mode):
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
             raise InvalidRequest("capability path parent is not a directory")
     return current
 
@@ -109,18 +110,27 @@ def _atomic_write(path: Path, content: bytes) -> None:
                 pass
 
 
-def _success(output: dict[str, object]) -> ExecutionObservation:
+def _success(
+    output: dict[str, object],
+    *,
+    effect_status: EffectStatus = EffectStatus.CONFIRMED,
+) -> ExecutionObservation:
     return ExecutionObservation(
         ExecutionOutcome.SUCCEEDED,
-        EffectStatus.CONFIRMED,
+        effect_status,
         output,
     )
 
 
-def _failed(output: dict[str, object], code: str) -> ExecutionObservation:
+def _failed(
+    output: dict[str, object],
+    code: str,
+    *,
+    effect_status: EffectStatus = EffectStatus.NO_EFFECT,
+) -> ExecutionObservation:
     return ExecutionObservation(
         ExecutionOutcome.FAILED,
-        EffectStatus.NO_EFFECT,
+        effect_status,
         output,
         error_code=code,
     )
@@ -207,7 +217,8 @@ class ProductCapabilityExecutor:
                 "content": text,
                 "byte_length": len(content),
                 "sha256": hashlib.sha256(content).hexdigest(),
-            }
+            },
+            effect_status=EffectStatus.NOT_APPLICABLE,
         )
 
     def _workspace_list(self, effect: ResolvedEffect) -> ExecutionObservation:
@@ -238,7 +249,10 @@ class ProductCapabilityExecutor:
                 entries.append({"name": child.name, "kind": kind, "byte_length": size})
         except OSError as exc:
             raise ExecutionFailure("workspace.list failed") from exc
-        return _success({"path": effect.target, "entries": entries})
+        return _success(
+            {"path": effect.target, "entries": entries},
+            effect_status=EffectStatus.NOT_APPLICABLE,
+        )
 
     def _workspace_write(self, effect: ResolvedEffect) -> ExecutionObservation:
         self._require_effect(
@@ -310,8 +324,12 @@ class ProductCapabilityExecutor:
             "stderr": completed.stderr,
         }
         if completed.returncode != 0:
-            return _failed(output, "command_failed")
-        return _success(output)
+            return _failed(
+                output,
+                "command_failed",
+                effect_status=EffectStatus.NOT_APPLICABLE,
+            )
+        return _success(output, effect_status=EffectStatus.NOT_APPLICABLE)
 
     def _network_fetch(self, effect: ResolvedEffect) -> ExecutionObservation:
         self._require_effect(
@@ -334,7 +352,7 @@ class ProductCapabilityExecutor:
             content = response.read(_MAX_OBSERVATION_BYTES + 1)
             if len(content) > _MAX_OBSERVATION_BYTES:
                 raise ExecutionFailure("network.fetch response exceeds product observation bound")
-            status = int(getattr(response, "status", response.getcode()))
+            status = int(response.getcode())
             content_type = response.headers.get("Content-Type", "")
         except URLError as exc:
             raise ExecutionFailure("network.fetch failed") from exc
@@ -351,7 +369,8 @@ class ProductCapabilityExecutor:
                 "byte_length": len(content),
                 "sha256": hashlib.sha256(content).hexdigest(),
                 "content_base64": base64.b64encode(content).decode("ascii"),
-            }
+            },
+            effect_status=EffectStatus.NOT_APPLICABLE,
         )
 
     def _git_observe(self, effect: ResolvedEffect) -> ExecutionObservation:
@@ -374,7 +393,9 @@ class ProductCapabilityExecutor:
         except (KeyError, TypeError) as exc:
             raise InvalidRequest("git.observe operation is invalid") from exc
         environment = os.environ.copy()
-        environment.update({"GIT_PAGER": "cat", "PAGER": "cat", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
+        environment.update(
+            {"GIT_PAGER": "cat", "PAGER": "cat", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}
+        )
         try:
             completed = subprocess.run(
                 argv,
@@ -398,8 +419,12 @@ class ProductCapabilityExecutor:
             "stderr": completed.stderr,
         }
         if completed.returncode != 0:
-            return _failed(output, "git_observation_failed")
-        return _success(output)
+            return _failed(
+                output,
+                "git_observation_failed",
+                effect_status=EffectStatus.NOT_APPLICABLE,
+            )
+        return _success(output, effect_status=EffectStatus.NOT_APPLICABLE)
 
     def _json_read(self, effect: ResolvedEffect) -> ExecutionObservation:
         self._require_effect(
@@ -425,7 +450,8 @@ class ProductCapabilityExecutor:
                 "canonical_json": canonical,
                 "byte_length": len(canonical_bytes),
                 "sha256": hashlib.sha256(canonical_bytes).hexdigest(),
-            }
+            },
+            effect_status=EffectStatus.NOT_APPLICABLE,
         )
 
     def _json_write(self, effect: ResolvedEffect) -> ExecutionObservation:
