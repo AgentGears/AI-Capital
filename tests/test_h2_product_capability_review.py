@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -130,6 +131,30 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
                     arguments={"command": "ls -a"},
                 )
             self.assertEqual(result["operation"]["execution_outcome"], "failed")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
+    def test_command_observe_rejects_special_file_before_subprocess(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            os.mkfifo(workspace / "pipe")
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="command.observe",
+                    resource_scope=("cat pipe",),
+                )
+                with patch(
+                    "ai_capital.product.capability_executors.subprocess.run"
+                ) as run:
+                    result = operator.invoke(
+                        program_id="p-1",
+                        actor_id="a-1",
+                        capability_id="command.observe",
+                        arguments={"command": "cat pipe"},
+                    )
+            self.assertEqual(result["operation"]["execution_outcome"], "failed")
+            run.assert_not_called()
 
 
 if __name__ == "__main__":
