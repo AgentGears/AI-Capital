@@ -4,12 +4,14 @@ from pathlib import Path
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from ai_capital.kernel.durable_program import ProgramRepository
 from ai_capital.kernel.enums import ProgramStatus
-from ai_capital.kernel.errors import IntegrityViolation, InvalidRequest
+from ai_capital.kernel.errors import IntegrityViolation, InvalidRequest, PersistenceConflict
 from ai_capital.kernel.models import Program
 from ai_capital.product import LocalWorkspaceOperator
+from ai_capital.product import workspace_capture
 
 
 class H2WorkspaceSnapshotTests(unittest.TestCase):
@@ -95,6 +97,39 @@ class H2WorkspaceSnapshotTests(unittest.TestCase):
             with LocalWorkspaceOperator.open(database) as operator:
                 with self.assertRaises(InvalidRequest):
                     operator.snapshot("p-1")
+
+    @unittest.skipIf(os.name == "nt", "symlink creation is not reliably available")
+    def test_snapshot_rejects_file_replaced_by_symlink_after_enumeration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "capital.db"
+            workspace = root / "workspace"
+            outside = root / "outside.txt"
+            workspace.mkdir()
+            candidate = workspace / "candidate.txt"
+            candidate.write_bytes(b"inside")
+            outside.write_bytes(b"outside-secret")
+            self._program(database)
+            original_paths = workspace_capture._workspace_paths
+            replaced = False
+
+            def replace_after_enumeration(path: Path):
+                nonlocal replaced
+                result = original_paths(path)
+                if not replaced:
+                    candidate.unlink()
+                    candidate.symlink_to(outside)
+                    replaced = True
+                return result
+
+            with mock.patch.object(
+                workspace_capture,
+                "_workspace_paths",
+                side_effect=replace_after_enumeration,
+            ):
+                with LocalWorkspaceOperator.open(database) as operator:
+                    with self.assertRaises((InvalidRequest, PersistenceConflict)):
+                        operator.snapshot("p-1")
 
     def test_artifact_tampering_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
