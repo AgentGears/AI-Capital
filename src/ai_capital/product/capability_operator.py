@@ -6,7 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from ..kernel.actor_store import ActorRepository
-from ..kernel.authority import AuthorityEngine, PolicySnapshot
+from ..kernel.authority import AuthorityEngine, PolicySnapshot, grant_is_current
 from ..kernel.authority_store import AuthorityRepository
 from ..kernel.capability_broker import CapabilityBroker, CapabilityHandlerRegistry
 from ..kernel.capability_store import CapabilityRepository, capability_descriptor
@@ -148,9 +148,11 @@ class LocalCapabilityOperator:
         self._ensure_open()
         actor_id = self._require_text(actor_id, field="actor_id")
         self._actors.get(actor_id)
+        now = utc_now()
         return tuple(
             to_canonical_data(grant)
             for grant in self._authority_store.active_grants(actor_id=actor_id)
+            if grant_is_current(grant, at=now)
         )
 
     def grant(
