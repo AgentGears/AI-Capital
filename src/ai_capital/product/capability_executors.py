@@ -70,7 +70,13 @@ def _safe_existing(root: Path, target: str, *, allow_root: bool = True) -> Path:
     return current
 
 
-def _safe_write_target(root: Path, target: str, *, artifact: bool = False) -> Path:
+def _safe_write_target(
+    root: Path,
+    target: str,
+    *,
+    artifact: bool = False,
+    create_only: bool = False,
+) -> Path:
     target = canonical_artifact_path(target) if artifact else _canonical_relative(
         target, allow_root=False
     )
@@ -81,6 +87,8 @@ def _safe_write_target(root: Path, target: str, *, artifact: bool = False) -> Pa
     if not parent.is_dir():
         raise InvalidRequest("capability target parent is not a directory")
     if candidate.exists() or candidate.is_symlink():
+        if create_only:
+            raise InvalidRequest("capability create target already exists")
         info = os.lstat(candidate)
         if stat.S_ISLNK(info.st_mode):
             raise InvalidRequest("capability target cannot be a symlink")
@@ -111,6 +119,37 @@ def _atomic_write(path: Path, content: bytes) -> None:
         if temporary_name is not None:
             try:
                 os.unlink(temporary_name)
+            except OSError:
+                pass
+
+
+def _exclusive_create(path: Path, content: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    descriptor: int | None = None
+    completed = False
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short artifact create write")
+            view = view[written:]
+        os.fsync(descriptor)
+        completed = True
+    except FileExistsError as exc:
+        raise InvalidRequest("capability create target already exists") from exc
+    except OSError as exc:
+        raise ExecutionFailure("capability create failed") from exc
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if descriptor is not None and not completed:
+            try:
+                os.unlink(path)
             except OSError:
                 pass
 
@@ -279,6 +318,8 @@ class ProductCapabilityExecutor:
             if len(operands) > 1:
                 raise InvalidRequest("ls accepts at most one path in the product profile")
             if operands:
+                if operands[0].startswith("-"):
+                    raise InvalidRequest("shell options are not admitted by the product profile")
                 _safe_existing(self._workspace_root, operands[0])
         else:
             if not operands:
@@ -366,10 +407,11 @@ class ProductCapabilityExecutor:
         if not repository.is_dir():
             raise InvalidRequest("git.observe target must be a directory")
         operation = effect.parameters.get("operation")
+        safe_git = ["git", "-c", "core.fsmonitor=false"]
         commands = {
-            "status": ["git", "status", "--short", "--branch"],
-            "diff": ["git", "diff", "--no-ext-diff"],
-            "log": ["git", "log", "-n", "20", "--pretty=format:%H%x09%s"],
+            "status": [*safe_git, "status", "--short", "--branch"],
+            "diff": [*safe_git, "diff", "--no-ext-diff", "--no-textconv"],
+            "log": [*safe_git, "log", "-n", "20", "--pretty=format:%H%x09%s"],
         }
         try:
             argv = commands[operation]
@@ -464,9 +506,14 @@ class ProductCapabilityExecutor:
         content = effect.parameters.get("content")
         if type(content) is not str:
             raise InvalidRequest("artifact.write content is invalid")
-        path = _safe_write_target(self._artifact_root, effect.target, artifact=True)
+        path = _safe_write_target(
+            self._artifact_root,
+            effect.target,
+            artifact=True,
+            create_only=True,
+        )
         exact = content.encode("utf-8")
-        _atomic_write(path, exact)
+        _exclusive_create(path, exact)
         return _success(
             {
                 "path": effect.target,
