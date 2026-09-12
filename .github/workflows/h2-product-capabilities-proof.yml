@@ -1,0 +1,33 @@
+name: H2.6 Product Capability Proof
+
+on:
+  push:
+    branches:
+      - h2-product-capabilities-proof-v2
+
+jobs:
+  prove:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pytest
+      - name: Diff check
+        run: git diff --check 78aa79a2bcfa0d162c6a65cb710950c5719cbfce HEAD^
+      - name: Focused H2.6 gate
+        run: >-
+          PYTHONPATH=src python -m pytest -q
+          tests/test_h2_product_capabilities.py
+          tests/test_h2_capability_cli.py
+          tests/test_capability_registry.py
+          tests/test_k4_authority.py
+          tests/test_k5_operation_journal.py
+          tests/test_h2_approval_audit_surface.py
+          tests/test_h2_program_bundles.py
+          tests/test_h2_program_bundle_operation_auth.py
+      - name: Full suite
+        run: PYTHONPATH=src python -m pytest -q
