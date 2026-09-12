@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from ..kernel.durable_program import ProgramRepository
+from ..kernel.enums import ProgramStatus
 from ..kernel.errors import InvalidRequest
 from ..kernel.events import verify_event_digest
 from ..kernel.models import Event, Program
@@ -100,7 +101,28 @@ def _validate_event_history(
     return tuple(events)
 
 
-def _validate_control(value: object, *, program: Program) -> ProgramControl:
+def _program_statuses(events: tuple[Event, ...]) -> dict[int, ProgramStatus]:
+    statuses: dict[int, ProgramStatus] = {}
+    for event in events:
+        snapshot = event.payload.get("program")
+        try:
+            candidate = record_from_json(Program, canonical_json(snapshot))
+        except (TypeError, ValueError) as exc:
+            raise InvalidRequest(
+                "Program bundle Event Program snapshot cannot be decoded"
+            ) from exc
+        if not isinstance(candidate, Program):
+            raise InvalidRequest("Program bundle Event Program snapshot is invalid")
+        statuses[candidate.revision] = candidate.status
+    return statuses
+
+
+def _validate_control(
+    value: object,
+    *,
+    program: Program,
+    events: tuple[Event, ...],
+) -> ProgramControl:
     control = decode_record(ProgramControl, value, field="control")
     if control.program_id != program.program_id:
         raise InvalidRequest("Program bundle control Program mismatch")
@@ -119,10 +141,19 @@ def _validate_control(value: object, *, program: Program) -> ProgramControl:
         ):
             raise InvalidRequest("Program bundle default control state is invalid")
     else:
-        expected_reason = "user_paused" if control.paused else "user_resumed"
-        if control.last_reason_code != expected_reason or not control.changed_at:
+        expected_paused = control.revision % 2 == 1
+        expected_reason = "user_paused" if expected_paused else "user_resumed"
+        if (
+            control.paused is not expected_paused
+            or control.last_reason_code != expected_reason
+            or not control.changed_at
+        ):
             raise InvalidRequest("Program bundle persisted control state is invalid")
         validate_timestamp(control.changed_at, field="control changed_at")
+        if _program_statuses(events).get(control.program_revision) is not ProgramStatus.ACTIVE:
+            raise InvalidRequest(
+                "Program bundle control is not anchored to an active Program revision"
+            )
     return control
 
 
@@ -250,12 +281,12 @@ def validate_bundle(
         raise InvalidRequest("Program bundle source identity mismatch")
     if payload["program_digest"] != canonical_digest(program):
         raise InvalidRequest("Program bundle Program digest mismatch")
-    _validate_event_history(
+    events = _validate_event_history(
         payload["events"],
         source_program_id=source_program_id,
         program=program,
     )
-    _validate_control(payload["control"], program=program)
+    _validate_control(payload["control"], program=program, events=events)
     snapshot, artifacts = _validate_workspace(payload["workspace"], program=program)
     _validate_audit(payload["audit"], program=program)
     return envelope, program, snapshot, artifacts
