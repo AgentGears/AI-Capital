@@ -138,7 +138,7 @@ class H2WorkspaceSnapshotTests(unittest.TestCase):
                 with self.assertRaises(IntegrityViolation):
                     restarted.show_snapshot(snapshot_id)
 
-    def test_schema_version_numeric_string_fails_closed(self):
+    def test_schema_version_non_integer_storage_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = root / "capital.db"
@@ -150,7 +150,7 @@ class H2WorkspaceSnapshotTests(unittest.TestCase):
             with ProgramRepository(database) as programs:
                 programs._db.execute(
                     """
-                    UPDATE component_schema SET version = '1'
+                    UPDATE component_schema SET version = X'31'
                     WHERE component = 'product_workspace_archive'
                     """
                 )
