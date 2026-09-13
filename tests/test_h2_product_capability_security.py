@@ -8,10 +8,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ai_capital.kernel.actor_store import ActorRepository
+from ai_capital.kernel.authority_store import AuthorityRepository
 from ai_capital.kernel.durable_program import ProgramRepository
-from ai_capital.kernel.enums import ProgramStatus
+from ai_capital.kernel.enums import EffectClass, ProgramStatus
 from ai_capital.kernel.errors import InvalidRequest
-from ai_capital.kernel.models import Actor, Program
+from ai_capital.kernel.events import utc_now
+from ai_capital.kernel.models import Actor, Grant, Program
 from ai_capital.product import LocalCapabilityOperator
 from ai_capital.product.git_repository_guard import validate_git_repository
 
@@ -48,6 +50,14 @@ class H2ProductCapabilitySecurityTests(unittest.TestCase):
             "\tbare = false\n"
         )
         return git_dir
+
+    @staticmethod
+    def _binding_count(database: Path) -> int:
+        with ProgramRepository(database) as programs:
+            row = programs._db.execute(
+                "SELECT COUNT(*) FROM product_capability_root_bindings"
+            ).fetchone()
+            return int(row[0])
 
     def test_authority_store_is_rejected_inside_capability_roots(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -103,6 +113,47 @@ class H2ProductCapabilitySecurityTests(unittest.TestCase):
                 grants = operator.grants("a-1")
             self.assertEqual(len(grants), 1)
             self.assertEqual(grants[0]["grant_id"], issued["grant_id"])
+
+    def test_unbound_store_with_existing_grant_refuses_root_adoption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            with ProgramRepository(database) as programs:
+                AuthorityRepository(programs).issue_grant(
+                    Grant(
+                        grant_id="legacy-grant",
+                        subject_ref="actor:a-1",
+                        capability_scope=("workspace.write",),
+                        resource_scope=("x.txt",),
+                        effect_ceiling=EffectClass.MODIFY,
+                        constraints=(),
+                        issued_at=utc_now(),
+                        revision=0,
+                    )
+                )
+
+            with self.assertRaisesRegex(
+                InvalidRequest,
+                "unbound authority store already contains durable rooted authority state",
+            ):
+                self._open(database, workspace, artifacts)
+            self.assertEqual(self._binding_count(database), 0)
+
+    def test_root_validation_failure_does_not_persist_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, _, artifacts = self._fixture(root)
+            bad_workspace = root / "workspace-file"
+            bad_workspace.write_text("not a directory\n")
+
+            with self.assertRaisesRegex(InvalidRequest, "capability root must be a directory"):
+                self._open(database, bad_workspace, artifacts)
+            self.assertEqual(self._binding_count(database), 0)
+
+            corrected_workspace = root / "workspace-corrected"
+            with self._open(database, corrected_workspace, artifacts) as operator:
+                self.assertTrue(operator.capabilities())
+            self.assertEqual(self._binding_count(database), 1)
 
     def test_bom_prefixed_git_filter_config_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
