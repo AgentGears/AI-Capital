@@ -18,6 +18,7 @@ from ..kernel.errors import ExecutionFailure, ExecutionTimeout, InvalidRequest
 from ..kernel.models import ResolvedEffect
 from ..kernel.operation_journal import ExecutionObservation
 from ..kernel.serialization import canonical_json
+from .git_repository_guard import validate_git_repository
 from .workspace_capture import _read_stable_regular_file
 from .workspace_types import canonical_artifact_path
 
@@ -420,36 +421,64 @@ class ProductCapabilityExecutor:
         repository = _safe_existing(self._workspace_root, effect.target)
         if not repository.is_dir():
             raise InvalidRequest("git.observe target must be a directory")
+        validate_git_repository(repository)
         operation = effect.parameters.get("operation")
-        safe_git = ["git", "-c", "core.fsmonitor=false"]
+        safe_git = [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "log.showSignature=false",
+            "-c",
+            "submodule.recurse=false",
+        ]
         commands = {
-            "status": [*safe_git, "status", "--short", "--branch"],
-            "diff": [*safe_git, "diff", "--no-ext-diff", "--no-textconv"],
+            "status": [*safe_git, "status", "--short", "--branch", "--ignore-submodules=all"],
+            "diff": [
+                *safe_git,
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=all",
+            ],
             "log": [*safe_git, "log", "-n", "20", "--pretty=format:%H%x09%s"],
         }
         try:
             argv = commands[operation]
         except (KeyError, TypeError) as exc:
             raise InvalidRequest("git.observe operation is invalid") from exc
-        environment = os.environ.copy()
-        environment.update(
-            {"GIT_PAGER": "cat", "PAGER": "cat", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}
-        )
-        try:
-            completed = subprocess.run(
-                argv,
-                cwd=repository,
-                shell=False,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=_COMMAND_TIMEOUT_SECONDS,
-                env=environment,
+        with tempfile.TemporaryDirectory(prefix="ai-capital-git-home-") as isolated_home:
+            environment = {
+                key: os.environ[key]
+                for key in ("PATH", "SYSTEMROOT", "WINDIR", "PATHEXT")
+                if key in os.environ
+            }
+            environment.update(
+                {
+                    "HOME": isolated_home,
+                    "XDG_CONFIG_HOME": isolated_home,
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_PAGER": "cat",
+                    "PAGER": "cat",
+                    "GIT_OPTIONAL_LOCKS": "0",
+                    "LC_ALL": "C",
+                }
             )
-        except subprocess.TimeoutExpired as exc:
-            raise ExecutionTimeout("git observation timed out") from exc
-        except OSError as exc:
-            raise ExecutionFailure("git observation could not be started") from exc
+            try:
+                completed = subprocess.run(
+                    argv,
+                    cwd=repository,
+                    shell=False,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=_COMMAND_TIMEOUT_SECONDS,
+                    env=environment,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ExecutionTimeout("git observation timed out") from exc
+            except OSError as exc:
+                raise ExecutionFailure("git observation could not be started") from exc
         output = {
             "path": effect.target,
             "operation": operation,
