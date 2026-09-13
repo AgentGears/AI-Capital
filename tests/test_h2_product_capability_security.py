@@ -49,6 +49,33 @@ class H2ProductCapabilitySecurityTests(unittest.TestCase):
         )
         return git_dir
 
+    def test_authority_store_is_rejected_inside_capability_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = (
+                (
+                    root / "workspace-case" / "capital.db",
+                    root / "workspace-case",
+                    root / "workspace-case-artifacts",
+                ),
+                (
+                    root / "artifact-case" / "capital.db",
+                    root / "artifact-case-workspace",
+                    root / "artifact-case",
+                ),
+            )
+            for index, (database, workspace, artifacts) in enumerate(cases):
+                with self.subTest(index=index):
+                    with self.assertRaisesRegex(
+                        InvalidRequest,
+                        "authority store paths must be outside capability roots",
+                    ):
+                        LocalCapabilityOperator.open(
+                            database,
+                            workspace_root=workspace,
+                            artifact_root=artifacts,
+                        )
+
     def test_bom_prefixed_git_filter_config_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory) / "repo"
