@@ -28,6 +28,12 @@ from .capability_executors import ProductCapabilityExecutor
 
 
 _ROOT_BINDING_ID = "local-product-capability-roots-v1"
+_ROOTED_AUTHORITY_TABLES = (
+    "grants",
+    "authority_decisions",
+    "approval_receipts",
+    "execution_authority_receipts",
+)
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -55,12 +61,7 @@ def _root_identity(path: Path) -> str:
     return os.path.normcase(str(path.resolve()))
 
 
-def _bind_capability_roots(
-    programs: ProgramRepository,
-    *,
-    workspace_root: Path,
-    artifact_root: Path,
-) -> None:
+def _ensure_root_binding_table(programs: ProgramRepository) -> None:
     programs._db.execute(
         """
         CREATE TABLE IF NOT EXISTS product_capability_root_bindings (
@@ -70,7 +71,10 @@ def _bind_capability_roots(
         )
         """
     )
-    expected = (_root_identity(workspace_root), _root_identity(artifact_root))
+
+
+def _root_binding(programs: ProgramRepository) -> tuple[str, str] | None:
+    _ensure_root_binding_table(programs)
     row = programs._db.execute(
         """
         SELECT workspace_root, artifact_root
@@ -80,6 +84,77 @@ def _bind_capability_roots(
         (_ROOT_BINDING_ID,),
     ).fetchone()
     if row is None:
+        return None
+    return str(row["workspace_root"]), str(row["artifact_root"])
+
+
+def _rooted_authority_exists(programs: ProgramRepository) -> bool:
+    for table in _ROOTED_AUTHORITY_TABLES:
+        row = programs._db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+        if row is not None:
+            return True
+    return False
+
+
+def _validate_root_binding(
+    programs: ProgramRepository,
+    *,
+    workspace_root: Path,
+    artifact_root: Path,
+) -> bool:
+    expected = (_root_identity(workspace_root), _root_identity(artifact_root))
+    current = _root_binding(programs)
+    if current is None:
+        if _rooted_authority_exists(programs):
+            raise InvalidRequest(
+                "unbound authority store already contains durable rooted authority state"
+            )
+        return False
+    if current != expected:
+        raise InvalidRequest(
+            "capability roots do not match the durable authority root binding"
+        )
+    return True
+
+
+def _prepare_capability_root(path: Path) -> None:
+    try:
+        if path.exists():
+            if not path.is_dir():
+                raise InvalidRequest("capability root must be a directory")
+            return
+        path.mkdir(parents=True, exist_ok=True)
+    except InvalidRequest:
+        raise
+    except OSError as exc:
+        raise InvalidRequest("capability root cannot be created as a directory") from exc
+    if not path.is_dir():
+        raise InvalidRequest("capability root must be a directory")
+
+
+def _persist_root_binding(
+    programs: ProgramRepository,
+    *,
+    workspace_root: Path,
+    artifact_root: Path,
+) -> None:
+    expected = (_root_identity(workspace_root), _root_identity(artifact_root))
+    with programs._transaction():
+        row = programs._db.execute(
+            """
+            SELECT workspace_root, artifact_root
+            FROM product_capability_root_bindings
+            WHERE binding_id = ?
+            """,
+            (_ROOT_BINDING_ID,),
+        ).fetchone()
+        if row is not None:
+            current = (str(row["workspace_root"]), str(row["artifact_root"]))
+            if current != expected:
+                raise InvalidRequest(
+                    "capability roots changed while durable root binding was established"
+                )
+            return
         programs._db.execute(
             """
             INSERT INTO product_capability_root_bindings(
@@ -87,12 +162,6 @@ def _bind_capability_roots(
             ) VALUES (?, ?, ?)
             """,
             (_ROOT_BINDING_ID, *expected),
-        )
-        return
-    actual = (str(row["workspace_root"]), str(row["artifact_root"]))
-    if actual != expected:
-        raise InvalidRequest(
-            "capability roots do not match the durable authority root binding"
         )
 
 
@@ -127,19 +196,21 @@ class LocalCapabilityOperator:
             for store_path in _authority_store_paths(programs):
                 if root == store_path or root in store_path.parents:
                     raise InvalidRequest("authority store paths must be outside capability roots")
-        _bind_capability_roots(
+
+        self._authority_store = AuthorityRepository(programs)
+        binding_exists = _validate_root_binding(
             programs,
             workspace_root=self._workspace_root,
             artifact_root=self._artifact_root,
         )
-        self._workspace_root.mkdir(parents=True, exist_ok=True)
-        self._artifact_root.mkdir(parents=True, exist_ok=True)
+        _prepare_capability_root(self._workspace_root)
+        _prepare_capability_root(self._artifact_root)
+
         self._actors = ActorRepository(programs)
         self._capabilities = CapabilityRepository(programs)
         self._handlers = CapabilityHandlerRegistry()
         install_product_capabilities(self._capabilities, self._handlers)
         self._broker = CapabilityBroker(self._capabilities, self._handlers)
-        self._authority_store = AuthorityRepository(programs)
         self._ensure_product_policy()
         self._authority = AuthorityEngine(
             programs,
@@ -150,6 +221,12 @@ class LocalCapabilityOperator:
         self._controls = ProgramControlRepository(programs)
         self._journal = OperationJournal(programs)
         self._host = OperationHost(self._journal, self._authority)
+        if not binding_exists:
+            _persist_root_binding(
+                programs,
+                workspace_root=self._workspace_root,
+                artifact_root=self._artifact_root,
+            )
         self._owns_repository = owns_repository
         self._closed = False
 
