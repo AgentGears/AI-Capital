@@ -37,6 +37,17 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
             artifact_root=artifacts,
         )
 
+    @staticmethod
+    def _minimal_git_dir(repository: Path) -> Path:
+        git_dir = repository / ".git"
+        git_dir.mkdir(parents=True)
+        (git_dir / "config").write_text(
+            "[core]\n"
+            "\trepositoryformatversion = 0\n"
+            "\tbare = false\n"
+        )
+        return git_dir
+
     def test_create_only_artifact_does_not_replace_existing_target(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -58,11 +69,55 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
             self.assertEqual(result["operation"]["execution_outcome"], "failed")
             self.assertEqual(target.read_text(), "original\n")
 
-    def test_git_observe_disables_configured_helpers_and_text_conversion(self):
+    def test_git_observe_uses_fixed_arguments_and_isolated_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database, workspace, artifacts = self._fixture(root)
+            self._minimal_git_dir(workspace)
             completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+            with patch.dict(os.environ, {"GIT_DIR": str(root / "outside")}, clear=False):
+                with self._open(database, workspace, artifacts) as operator:
+                    operator.grant(
+                        actor_id="a-1",
+                        capability_id="git.observe",
+                        resource_scope=(".",),
+                    )
+                    with patch(
+                        "ai_capital.product.capability_executors.subprocess.run",
+                        return_value=completed,
+                    ) as run:
+                        result = operator.invoke(
+                            program_id="p-1",
+                            actor_id="a-1",
+                            capability_id="git.observe",
+                            arguments={"path": ".", "operation": "diff"},
+                        )
+            self.assertEqual(result["operation"]["execution_outcome"], "succeeded")
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[0], "git")
+            self.assertIn("core.fsmonitor=false", argv)
+            self.assertIn("log.showSignature=false", argv)
+            self.assertIn("submodule.recurse=false", argv)
+            self.assertIn("--no-ext-diff", argv)
+            self.assertIn("--no-textconv", argv)
+            self.assertIn("--ignore-submodules=all", argv)
+            self.assertFalse(run.call_args.kwargs["shell"])
+            environment = run.call_args.kwargs["env"]
+            self.assertNotIn("GIT_DIR", environment)
+            self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+            self.assertEqual(environment["HOME"], environment["XDG_CONFIG_HOME"])
+
+    def test_git_observe_rejects_repository_filter_configuration_before_subprocess(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            git_dir = self._minimal_git_dir(workspace)
+            (git_dir / "config").write_text(
+                "[core]\n"
+                "\trepositoryformatversion = 0\n"
+                "[filter \"workspace-driver\"]\n"
+                "\tclean = cat\n"
+            )
             with self._open(database, workspace, artifacts) as operator:
                 operator.grant(
                     actor_id="a-1",
@@ -70,21 +125,57 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
                     resource_scope=(".",),
                 )
                 with patch(
-                    "ai_capital.product.capability_executors.subprocess.run",
-                    return_value=completed,
+                    "ai_capital.product.capability_executors.subprocess.run"
                 ) as run:
                     result = operator.invoke(
                         program_id="p-1",
                         actor_id="a-1",
                         capability_id="git.observe",
-                        arguments={"path": ".", "operation": "diff"},
+                        arguments={"path": ".", "operation": "status"},
                     )
-            self.assertEqual(result["operation"]["execution_outcome"], "succeeded")
-            argv = run.call_args.args[0]
-            self.assertEqual(argv[:4], ["git", "-c", "core.fsmonitor=false", "diff"])
-            self.assertIn("--no-ext-diff", argv)
-            self.assertIn("--no-textconv", argv)
-            self.assertFalse(run.call_args.kwargs["shell"])
+            self.assertEqual(result["operation"]["execution_outcome"], "failed")
+            run.assert_not_called()
+
+    def test_git_observe_rejects_metadata_routing_before_subprocess(self):
+        cases = ("gitfile", "commondir", "alternates")
+        for case in cases:
+            with self.subTest(case=case):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    database, workspace, artifacts = self._fixture(root)
+                    if case == "gitfile":
+                        (workspace / ".git").write_text(
+                            f"gitdir: {(root / 'outside.git').as_posix()}\n"
+                        )
+                    else:
+                        git_dir = self._minimal_git_dir(workspace)
+                        if case == "commondir":
+                            (git_dir / "commondir").write_text("../outside.git\n")
+                        else:
+                            info = git_dir / "objects" / "info"
+                            info.mkdir(parents=True)
+                            (info / "alternates").write_text(
+                                f"{(root / 'outside-objects').as_posix()}\n"
+                            )
+                    with self._open(database, workspace, artifacts) as operator:
+                        operator.grant(
+                            actor_id="a-1",
+                            capability_id="git.observe",
+                            resource_scope=(".",),
+                        )
+                        with patch(
+                            "ai_capital.product.capability_executors.subprocess.run"
+                        ) as run:
+                            result = operator.invoke(
+                                program_id="p-1",
+                                actor_id="a-1",
+                                capability_id="git.observe",
+                                arguments={"path": ".", "operation": "log"},
+                            )
+                    self.assertEqual(
+                        result["operation"]["execution_outcome"], "failed"
+                    )
+                    run.assert_not_called()
 
     def test_active_grants_view_excludes_expired_grants(self):
         with tempfile.TemporaryDirectory() as directory:
