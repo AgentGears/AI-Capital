@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -26,6 +27,9 @@ from .capability_catalog import (
 from .capability_executors import ProductCapabilityExecutor
 
 
+_ROOT_BINDING_ID = "local-product-capability-roots-v1"
+
+
 def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
@@ -45,6 +49,51 @@ def _authority_store_paths(programs: ProgramRepository) -> tuple[Path, ...]:
         lock_entry.resolve(),
     )
     return tuple(dict.fromkeys(paths))
+
+
+def _root_identity(path: Path) -> str:
+    return os.path.normcase(str(path.resolve()))
+
+
+def _bind_capability_roots(
+    programs: ProgramRepository,
+    *,
+    workspace_root: Path,
+    artifact_root: Path,
+) -> None:
+    programs._db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_capability_root_bindings (
+            binding_id TEXT PRIMARY KEY,
+            workspace_root TEXT NOT NULL,
+            artifact_root TEXT NOT NULL
+        )
+        """
+    )
+    expected = (_root_identity(workspace_root), _root_identity(artifact_root))
+    row = programs._db.execute(
+        """
+        SELECT workspace_root, artifact_root
+        FROM product_capability_root_bindings
+        WHERE binding_id = ?
+        """,
+        (_ROOT_BINDING_ID,),
+    ).fetchone()
+    if row is None:
+        programs._db.execute(
+            """
+            INSERT INTO product_capability_root_bindings(
+                binding_id, workspace_root, artifact_root
+            ) VALUES (?, ?, ?)
+            """,
+            (_ROOT_BINDING_ID, *expected),
+        )
+        return
+    actual = (str(row["workspace_root"]), str(row["artifact_root"]))
+    if actual != expected:
+        raise InvalidRequest(
+            "capability roots do not match the durable authority root binding"
+        )
 
 
 class LocalCapabilityOperator:
@@ -78,6 +127,11 @@ class LocalCapabilityOperator:
             for store_path in _authority_store_paths(programs):
                 if root == store_path or root in store_path.parents:
                     raise InvalidRequest("authority store paths must be outside capability roots")
+        _bind_capability_roots(
+            programs,
+            workspace_root=self._workspace_root,
+            artifact_root=self._artifact_root,
+        )
         self._workspace_root.mkdir(parents=True, exist_ok=True)
         self._artifact_root.mkdir(parents=True, exist_ok=True)
         self._actors = ActorRepository(programs)
