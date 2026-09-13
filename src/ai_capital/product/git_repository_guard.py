@@ -33,7 +33,7 @@ def _validate_config(content: bytes) -> None:
             if closing < 0:
                 raise InvalidRequest("Git config is malformed")
             header = line[1:closing].strip().lower()
-            section = header.split(None, 1)[0]
+            section = header.split(None, 1)[0].split(".", 1)[0]
             if section in {"filter", "include", "includeif", "diff", "gpg"}:
                 raise InvalidRequest("Git config is outside the read-only observation profile")
             continue
