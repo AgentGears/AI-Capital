@@ -8,6 +8,9 @@ from ..kernel.errors import InvalidRequest
 from .workspace_capture import _read_stable_regular_file
 
 
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
 def _exists(path: Path) -> bool:
     try:
         os.lstat(path)
@@ -19,6 +22,8 @@ def _exists(path: Path) -> bool:
 
 
 def _validate_config(content: bytes) -> None:
+    if content.startswith(_UTF8_BOM):
+        raise InvalidRequest("Git config cannot contain a UTF-8 BOM")
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError as exc:
