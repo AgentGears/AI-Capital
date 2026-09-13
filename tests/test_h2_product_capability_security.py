@@ -128,6 +128,7 @@ class H2ProductCapabilitySecurityTests(unittest.TestCase):
                         effect_ceiling=EffectClass.MODIFY,
                         constraints=(),
                         issued_at=utc_now(),
+                        expires_at=None,
                         revision=0,
                     )
                 )
