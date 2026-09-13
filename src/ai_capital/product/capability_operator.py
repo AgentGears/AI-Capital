@@ -30,6 +30,23 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
+def _authority_store_paths(programs: ProgramRepository) -> tuple[Path, ...]:
+    database_path = str(programs._database_path)
+    if database_path == ":memory:":
+        return ()
+    raw = Path(database_path)
+    parent = raw.parent.resolve()
+    database_entry = parent / raw.name
+    lock_entry = parent / f"{raw.name}.writer.lock"
+    paths = (
+        database_entry,
+        database_entry.resolve(),
+        lock_entry,
+        lock_entry.resolve(),
+    )
+    return tuple(dict.fromkeys(paths))
+
+
 class LocalCapabilityOperator:
     """Governed local product path from typed Capability request to durable Operation."""
 
@@ -57,6 +74,10 @@ class LocalCapabilityOperator:
         self._artifact_root = Path(artifact_root).resolve()
         if _paths_overlap(self._workspace_root, self._artifact_root):
             raise InvalidRequest("workspace and artifact roots must be disjoint")
+        for root in (self._workspace_root, self._artifact_root):
+            for store_path in _authority_store_paths(programs):
+                if root == store_path or root in store_path.parents:
+                    raise InvalidRequest("authority store paths must be outside capability roots")
         self._workspace_root.mkdir(parents=True, exist_ok=True)
         self._artifact_root.mkdir(parents=True, exist_ok=True)
         self._actors = ActorRepository(programs)
