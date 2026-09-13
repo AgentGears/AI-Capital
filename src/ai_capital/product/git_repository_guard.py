@@ -34,13 +34,32 @@ def _validate_config(content: bytes) -> None:
                 raise InvalidRequest("Git config is malformed")
             header = line[1:closing].strip().lower()
             section = header.split(None, 1)[0]
-            if section in {"filter", "include", "includeif", "diff"}:
+            if section in {"filter", "include", "includeif", "diff", "gpg"}:
                 raise InvalidRequest("Git config is outside the read-only observation profile")
             continue
         if section == "core":
             key = line.split("=", 1)[0].strip().lower()
             if key in {"worktree", "fsmonitor", "hookspath"}:
                 raise InvalidRequest("Git config changes repository routing")
+        if section == "log":
+            key = line.split("=", 1)[0].strip().lower()
+            if key == "showsignature":
+                raise InvalidRequest("Git config changes observation execution")
+
+
+def _validate_metadata_tree(git_dir: Path) -> None:
+    for current, dirs, files in os.walk(git_dir, topdown=True, followlinks=False):
+        current_path = Path(current)
+        dirs.sort()
+        files.sort()
+        for name in dirs:
+            info = os.lstat(current_path / name)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise InvalidRequest("git.observe rejects indirect Git metadata")
+        for name in files:
+            info = os.lstat(current_path / name)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise InvalidRequest("git.observe rejects indirect Git metadata")
 
 
 def validate_git_repository(repository: Path) -> None:
@@ -60,6 +79,7 @@ def validate_git_repository(repository: Path) -> None:
         if _exists(forbidden):
             raise InvalidRequest("git.observe rejects routed Git metadata")
 
+    _validate_metadata_tree(git_dir)
     config = git_dir / "config"
     try:
         info = os.lstat(config)
