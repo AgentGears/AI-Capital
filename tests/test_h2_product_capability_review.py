@@ -10,6 +10,7 @@ from unittest.mock import patch
 from ai_capital.kernel.actor_store import ActorRepository
 from ai_capital.kernel.durable_program import ProgramRepository
 from ai_capital.kernel.enums import ProgramStatus
+from ai_capital.kernel.errors import InvalidRequest
 from ai_capital.kernel.models import Actor, Program
 from ai_capital.product import LocalCapabilityOperator
 
@@ -155,6 +156,23 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
                     )
             self.assertEqual(result["operation"]["execution_outcome"], "failed")
             run.assert_not_called()
+
+    def test_capability_operator_rejects_overlapping_workspace_and_artifact_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = (
+                (root / "same", root / "same"),
+                (root / "workspace", root / "workspace" / "artifacts"),
+                (root / "artifacts" / "workspace", root / "artifacts"),
+            )
+            for index, (workspace, artifacts) in enumerate(cases):
+                with self.subTest(index=index):
+                    with self.assertRaises(InvalidRequest):
+                        LocalCapabilityOperator.open(
+                            root / f"overlap-{index}.db",
+                            workspace_root=workspace,
+                            artifact_root=artifacts,
+                        )
 
 
 if __name__ == "__main__":
