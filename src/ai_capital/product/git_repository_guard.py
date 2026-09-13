@@ -34,17 +34,32 @@ def _validate_config(content: bytes) -> None:
                 raise InvalidRequest("Git config is malformed")
             header = line[1:closing].strip().lower()
             section = header.split(None, 1)[0].split(".", 1)[0]
-            if section in {"filter", "include", "includeif", "diff", "gpg"}:
+            if section in {
+                "alias",
+                "diff",
+                "filter",
+                "gpg",
+                "include",
+                "includeif",
+                "pager",
+            }:
                 raise InvalidRequest("Git config is outside the read-only observation profile")
             continue
-        if section == "core":
-            key = line.split("=", 1)[0].strip().lower()
-            if key in {"worktree", "fsmonitor", "hookspath"}:
-                raise InvalidRequest("Git config changes repository routing")
-        if section == "log":
-            key = line.split("=", 1)[0].strip().lower()
-            if key == "showsignature":
-                raise InvalidRequest("Git config changes observation execution")
+        key = line.split("=", 1)[0].strip().lower()
+        if section == "core" and key in {
+            "alternaterefscommand",
+            "fsmonitor",
+            "hookspath",
+            "pager",
+            "worktree",
+        }:
+            raise InvalidRequest("Git config changes repository routing or execution")
+        if section == "extensions" and key == "partialclone":
+            raise InvalidRequest("Git config permits implicit object fetching")
+        if section == "log" and key == "showsignature":
+            raise InvalidRequest("Git config changes observation execution")
+        if section == "remote" and key in {"partialclonefilter", "promisor"}:
+            raise InvalidRequest("Git config permits implicit object fetching")
 
 
 def _validate_metadata_tree(git_dir: Path) -> None:
@@ -75,6 +90,7 @@ def validate_git_repository(repository: Path) -> None:
         git_dir / "commondir",
         git_dir / "config.worktree",
         git_dir / "objects" / "info" / "alternates",
+        git_dir / "objects" / "info" / "http-alternates",
     ):
         if _exists(forbidden):
             raise InvalidRequest("git.observe rejects routed Git metadata")
