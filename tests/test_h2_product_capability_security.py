@@ -76,6 +76,34 @@ class H2ProductCapabilitySecurityTests(unittest.TestCase):
                             artifact_root=artifacts,
                         )
 
+    def test_durable_authority_is_bound_to_initial_capability_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace_a, artifacts_a = self._fixture(root)
+            workspace_b = root / "workspace-b"
+            artifacts_b = root / "generated-artifacts-b"
+
+            with self._open(database, workspace_a, artifacts_a) as operator:
+                issued = operator.grant(
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    resource_scope=("x.txt",),
+                )
+            self.assertEqual(issued["capability_scope"], ["workspace.write"])
+
+            with self.assertRaisesRegex(
+                InvalidRequest,
+                "capability roots do not match the durable authority root binding",
+            ):
+                self._open(database, workspace_b, artifacts_b)
+            self.assertFalse(workspace_b.exists())
+            self.assertFalse(artifacts_b.exists())
+
+            with self._open(database, workspace_a, artifacts_a) as operator:
+                grants = operator.grants("a-1")
+            self.assertEqual(len(grants), 1)
+            self.assertEqual(grants[0]["grant_id"], issued["grant_id"])
+
     def test_bom_prefixed_git_filter_config_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory) / "repo"
