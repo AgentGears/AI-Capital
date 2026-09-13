@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -81,6 +82,50 @@ def _validate_command_target(path: Path, *, allow_directory: bool) -> None:
     if allow_directory and stat.S_ISDIR(info.st_mode):
         return
     raise InvalidRequest("command.observe target has unsupported file type")
+
+
+def _trusted_search_path(name: str) -> str:
+    directories: list[str] = []
+    if os.name == "nt":
+        system_root = os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR")
+        if system_root:
+            directories.append(str(Path(system_root) / "System32"))
+        if name == "git":
+            for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+                root = os.environ.get(variable)
+                if root:
+                    directories.extend(
+                        (
+                            str(Path(root) / "Git" / "cmd"),
+                            str(Path(root) / "Git" / "bin"),
+                        )
+                    )
+    else:
+        try:
+            configured = os.confstr("CS_PATH")
+        except (AttributeError, OSError, ValueError):
+            configured = None
+        if configured:
+            directories.extend(item for item in configured.split(os.pathsep) if item)
+        directories.extend(("/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"))
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for directory in directories:
+        path = Path(directory)
+        if not path.is_absolute():
+            continue
+        normalized = str(path.resolve(strict=False))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+    return os.pathsep.join(unique)
+
+
+def _inside(path: Path, root: Path) -> bool:
+    root = root.resolve()
+    return path == root or root in path.parents
 
 
 def _safe_write_target(
@@ -211,6 +256,31 @@ class ProductCapabilityExecutor:
         self._workspace_root.mkdir(parents=True, exist_ok=True)
         self._artifact_root.mkdir(parents=True, exist_ok=True)
 
+    def _trusted_executable(self, name: str) -> str:
+        resolved = shutil.which(name, path=_trusted_search_path(name))
+        if resolved is None:
+            raise ExecutionFailure(f"trusted executable is unavailable: {name}")
+        candidate = Path(resolved).resolve()
+        if _inside(candidate, self._workspace_root) or _inside(candidate, self._artifact_root):
+            raise ExecutionFailure("trusted executable cannot resolve inside a capability root")
+        try:
+            info = os.stat(candidate)
+        except OSError as exc:
+            raise ExecutionFailure("trusted executable cannot be inspected") from exc
+        if not stat.S_ISREG(info.st_mode) or not os.access(candidate, os.X_OK):
+            raise ExecutionFailure("trusted executable is not executable")
+        return str(candidate)
+
+    @staticmethod
+    def _process_environment() -> dict[str, str]:
+        environment = {
+            key: os.environ[key]
+            for key in ("SYSTEMROOT", "WINDIR", "PATHEXT")
+            if key in os.environ
+        }
+        environment["LC_ALL"] = "C"
+        return environment
+
     def execute(
         self,
         effect: ResolvedEffect,
@@ -336,22 +406,25 @@ class ProductCapabilityExecutor:
                 target = _safe_existing(self._workspace_root, operands[0])
                 _validate_command_target(target, allow_directory=True)
         else:
-            if not operands:
-                raise InvalidRequest(f"{command} requires a workspace path")
-            for operand in operands:
-                if operand.startswith("-"):
-                    raise InvalidRequest("shell options are not admitted by the product profile")
-                target = _safe_existing(self._workspace_root, operand, allow_root=False)
-                _validate_command_target(target, allow_directory=command == "stat")
+            if len(operands) != 1:
+                raise InvalidRequest(f"{command} accepts exactly one workspace path")
+            operand = operands[0]
+            if operand.startswith("-"):
+                raise InvalidRequest("shell options are not admitted by the product profile")
+            target = _safe_existing(self._workspace_root, operand, allow_root=False)
+            _validate_command_target(target, allow_directory=command == "stat")
+        executable = self._trusted_executable(command)
         try:
             completed = subprocess.run(
                 parts,
                 cwd=self._workspace_root,
+                executable=executable,
                 shell=False,
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=_COMMAND_TIMEOUT_SECONDS,
+                env=self._process_environment(),
             )
         except subprocess.TimeoutExpired as exc:
             raise ExecutionTimeout("read-only command timed out") from exc
@@ -447,27 +520,26 @@ class ProductCapabilityExecutor:
             argv = commands[operation]
         except (KeyError, TypeError) as exc:
             raise InvalidRequest("git.observe operation is invalid") from exc
+        executable = self._trusted_executable("git")
         with tempfile.TemporaryDirectory(prefix="ai-capital-git-home-") as isolated_home:
-            environment = {
-                key: os.environ[key]
-                for key in ("PATH", "SYSTEMROOT", "WINDIR", "PATHEXT")
-                if key in os.environ
-            }
+            environment = self._process_environment()
             environment.update(
                 {
                     "HOME": isolated_home,
                     "XDG_CONFIG_HOME": isolated_home,
                     "GIT_CONFIG_NOSYSTEM": "1",
-                    "GIT_PAGER": "cat",
-                    "PAGER": "cat",
+                    "GIT_ATTR_NOSYSTEM": "1",
+                    "GIT_PAGER": "",
+                    "PAGER": "",
                     "GIT_OPTIONAL_LOCKS": "0",
-                    "LC_ALL": "C",
+                    "GIT_TERMINAL_PROMPT": "0",
                 }
             )
             try:
                 completed = subprocess.run(
                     argv,
                     cwd=repository,
+                    executable=executable,
                     shell=False,
                     check=False,
                     capture_output=True,
