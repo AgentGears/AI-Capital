@@ -22,113 +22,175 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
-          path = Path('src/ai_capital/product/capability_executors.py')
-          text = path.read_text()
-          old = '''        self._capability_id = capability_id
-          self._workspace_root = workspace_root.resolve()
-          self._artifact_root = artifact_root.resolve()
-          self._workspace_root.mkdir(parents=True, exist_ok=True)
-          self._artifact_root.mkdir(parents=True, exist_ok=True)
-          self._before_dispatch = before_dispatch
-          '''
-          new = '''        self._capability_id = capability_id
-          self._workspace_root = Path(workspace_root)
-          self._artifact_root = Path(artifact_root)
-          if not self._workspace_root.is_absolute() or not self._artifact_root.is_absolute():
-              raise InvalidRequest("product capability roots must be absolute")
-          self._before_dispatch = before_dispatch
-          '''
-          if old not in text:
-              raise SystemExit('capability executor constructor seam changed')
-          path.write_text(text.replace(old, new, 1))
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              if text.count(old) != 1:
+                  raise SystemExit(f"{label}: expected one match, found {text.count(old)}")
+              return text.replace(old, new, 1)
 
-          path = Path('src/ai_capital/product/rooted_io.py')
+          path = Path("src/ai_capital/product/rooted_io.py")
           text = path.read_text()
-          old = '''def _open_root(root: Path) -> int:
-              _require_platform_support()
-              root = root.resolve()
-              try:
-          '''
-          new = '''def _open_root(root: Path) -> int:
-              _require_platform_support()
-              root = Path(root)
-              if not root.is_absolute():
-                  raise ExecutionFailure("capability root must be absolute for rooted access")
-              try:
-          '''
-          if old not in text:
-              raise SystemExit('root open seam changed')
-          text = text.replace(old, new, 1)
-          old = '''            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0),
-              dir_fd=parent_fd,
+          text = replace_once(
+              text,
+              "def _open_root(root: Path) -> int:\n    _require_platform_support()\n    root = root.resolve()\n",
+              "def _open_root(\n    root: Path,\n    *,\n    expected_identity: tuple[int, int] | None = None,\n) -> int:\n    _require_platform_support()\n    root = Path(root)\n    if not root.is_absolute():\n        raise ExecutionFailure(\"capability root must be absolute for rooted access\")\n",
+              "root open",
           )
-          info = os.fstat(descriptor)
-          '''
-          new = '''            os.O_RDONLY
-              | os.O_NOFOLLOW
-              | getattr(os, "O_NONBLOCK", 0)
-              | getattr(os, "O_BINARY", 0),
-              dir_fd=parent_fd,
+          text = replace_once(
+              text,
+              "        or not _same_identity(before, opened)\n    ):\n        os.close(descriptor)\n        raise ExecutionFailure(\"capability root changed during rooted access\")\n    return descriptor\n",
+              "        or not _same_identity(before, opened)\n        or (\n            expected_identity is not None\n            and (int(opened.st_dev), int(opened.st_ino)) != expected_identity\n        )\n    ):\n        os.close(descriptor)\n        raise ExecutionFailure(\"capability root changed during rooted access\")\n    return descriptor\n\n\ndef root_identity(root: Path) -> tuple[int, int]:\n    descriptor = _open_root(root)\n    try:\n        info = os.fstat(descriptor)\n        return int(info.st_dev), int(info.st_ino)\n    finally:\n        os.close(descriptor)\n",
+              "root identity",
           )
-          info = os.fstat(descriptor)
-          '''
-          if old not in text:
-              raise SystemExit('rooted read open seam changed')
-          text = text.replace(old, new, 1)
-          old = '''        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0)
-          if allow_directory:
-          '''
-          new = '''        flags = (
-              os.O_RDONLY
-              | os.O_NOFOLLOW
-              | getattr(os, "O_NONBLOCK", 0)
-              | getattr(os, "O_BINARY", 0)
-          )
-          if allow_directory:
-          '''
-          if old not in text:
-              raise SystemExit('pinned open flags seam changed')
-          text = text.replace(old, new, 1)
-          old = '''        return root_fd, target_fd
-              except OSError as exc:
-              if target_fd is not None:
-                  os.close(target_fd)
-              os.close(root_fd)
-              raise ExecutionFailure("capability target changed during rooted observation") from exc
-          '''
-          new = '''        return root_fd, target_fd
-              except InvalidRequest:
-              if target_fd is not None:
-                  os.close(target_fd)
-              os.close(root_fd)
-              raise
-          except OSError as exc:
-              if target_fd is not None:
-                  os.close(target_fd)
-              os.close(root_fd)
-              raise ExecutionFailure("capability target changed during rooted observation") from exc
-          '''
-          if old not in text:
-              raise SystemExit('pinned open cleanup seam changed')
-          path.write_text(text.replace(old, new, 1))
+          for signature, replacement, label in (
+              (
+                  "def read_regular(root: Path, target: str, *, max_bytes: int) -> bytes:\n    root_fd, parent_fd, name = _open_parent(root, target)\n",
+                  "def read_regular(\n    root: Path,\n    target: str,\n    *,\n    max_bytes: int,\n    expected_root_identity: tuple[int, int] | None = None,\n) -> bytes:\n    root_fd, parent_fd, name = _open_parent(\n        root, target, expected_root_identity=expected_root_identity\n    )\n",
+                  "read signature",
+              ),
+              (
+                  "def list_directory(root: Path, target: str) -> list[dict[str, object]]:\n    root_fd = _open_root(root)\n",
+                  "def list_directory(\n    root: Path,\n    target: str,\n    *,\n    expected_root_identity: tuple[int, int] | None = None,\n) -> list[dict[str, object]]:\n    root_fd = _open_root(root, expected_identity=expected_root_identity)\n",
+                  "list signature",
+              ),
+              (
+                  "def atomic_write(root: Path, target: str, content: bytes) -> None:\n    root_fd, parent_fd, name = _open_parent(root, target)\n",
+                  "def atomic_write(\n    root: Path,\n    target: str,\n    content: bytes,\n    *,\n    expected_root_identity: tuple[int, int] | None = None,\n) -> None:\n    root_fd, parent_fd, name = _open_parent(\n        root, target, expected_root_identity=expected_root_identity\n    )\n",
+                  "atomic signature",
+              ),
+              (
+                  "def exclusive_create(root: Path, target: str, content: bytes) -> None:\n    root_fd, parent_fd, name = _open_parent(root, target)\n",
+                  "def exclusive_create(\n    root: Path,\n    target: str,\n    content: bytes,\n    *,\n    expected_root_identity: tuple[int, int] | None = None,\n) -> None:\n    root_fd, parent_fd, name = _open_parent(\n        root, target, expected_root_identity=expected_root_identity\n    )\n",
+                  "exclusive signature",
+              ),
+          ):
+              text = replace_once(text, signature, replacement, label)
 
-          path = Path('src/ai_capital/product/capability_operator.py')
+          text = replace_once(
+              text,
+              "def _open_parent(root: Path, target: str) -> tuple[int, int, str]:\n    root_fd = _open_root(root)\n",
+              "def _open_parent(\n    root: Path,\n    target: str,\n    *,\n    expected_root_identity: tuple[int, int] | None = None,\n) -> tuple[int, int, str]:\n    root_fd = _open_root(root, expected_identity=expected_root_identity)\n",
+              "parent signature",
+          )
+          text = replace_once(
+              text,
+              "        descriptor = os.open(\n            name,\n            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, \"O_BINARY\", 0),\n            dir_fd=parent_fd,\n        )\n",
+              "        descriptor = os.open(\n            name,\n            os.O_RDONLY\n            | os.O_NOFOLLOW\n            | getattr(os, \"O_NONBLOCK\", 0)\n            | getattr(os, \"O_BINARY\", 0),\n            dir_fd=parent_fd,\n        )\n",
+              "read nonblock",
+          )
+          text = replace_once(
+              text,
+              "def open_pinned(\n    root: Path,\n    target: str,\n    *,\n    allow_directory: bool,\n) -> tuple[int, int]:\n    \"\"\"Return (root_fd, target_fd) pinned beneath root for subprocess observation.\"\"\"\n    root_fd = _open_root(root)\n",
+              "def open_pinned(\n    root: Path,\n    target: str,\n    *,\n    allow_directory: bool,\n    expected_root_identity: tuple[int, int] | None = None,\n) -> tuple[int, int]:\n    \"\"\"Return (root_fd, target_fd) pinned beneath root for subprocess observation.\"\"\"\n    root_fd = _open_root(root, expected_identity=expected_root_identity)\n",
+              "pinned signature",
+          )
+          text = replace_once(
+              text,
+              "        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, \"O_BINARY\", 0)\n",
+              "        flags = (\n            os.O_RDONLY\n            | os.O_NOFOLLOW\n            | getattr(os, \"O_NONBLOCK\", 0)\n            | getattr(os, \"O_BINARY\", 0)\n        )\n",
+              "pinned nonblock",
+          )
+          text = replace_once(
+              text,
+              "        return root_fd, target_fd\n    except OSError as exc:\n        if target_fd is not None:\n            os.close(target_fd)\n        os.close(root_fd)\n        raise ExecutionFailure(\"capability target changed during rooted observation\") from exc\n",
+              "        return root_fd, target_fd\n    except InvalidRequest:\n        if target_fd is not None:\n            os.close(target_fd)\n        os.close(root_fd)\n        raise\n    except OSError as exc:\n        if target_fd is not None:\n            os.close(target_fd)\n        os.close(root_fd)\n        raise ExecutionFailure(\"capability target changed during rooted observation\") from exc\n",
+              "pinned cleanup",
+          )
+          path.write_text(text)
+
+          path = Path("src/ai_capital/product/capability_executors.py")
           text = path.read_text()
-          old = '''                if record.state == "completed":
-                      assert record.result is not None
-                      return record.result
-                  return self._recover_pending_request(record)
-          '''
-          new = '''                if record.state == "completed":
-                      assert record.result is not None
-                      if record.result.get("state") == "approval_required":
-                          return self._recover_pending_request(record)
-                      return record.result
-                  return self._recover_pending_request(record)
-          '''
-          if old not in text:
-              raise SystemExit('request replay seam changed')
-          path.write_text(text.replace(old, new, 1))
+          text = replace_once(text, "    read_regular,\n)", "    read_regular,\n)\n", "rooted import stable") if False else text
+          text = replace_once(
+              text,
+              "        artifact_root: Path,\n        before_dispatch: Callable[[], None] | None = None,\n",
+              "        artifact_root: Path,\n        workspace_root_identity: tuple[int, int],\n        artifact_root_identity: tuple[int, int],\n        before_dispatch: Callable[[], None] | None = None,\n",
+              "executor signature",
+          )
+          text = replace_once(text, "        self._workspace_root = workspace_root.resolve()\n", "        self._workspace_root = Path(workspace_root)\n", "workspace lexical root")
+          text = replace_once(text, "        self._artifact_root = artifact_root.resolve()\n", "        self._artifact_root = Path(artifact_root)\n", "artifact lexical root")
+          text = replace_once(text, "        self._workspace_root.mkdir(parents=True, exist_ok=True)\n", "", "remove workspace mkdir")
+          text = replace_once(text, "        self._artifact_root.mkdir(parents=True, exist_ok=True)\n", "", "remove artifact mkdir")
+          text = replace_once(
+              text,
+              "        self._before_dispatch = before_dispatch\n",
+              "        if not self._workspace_root.is_absolute() or not self._artifact_root.is_absolute():\n            raise InvalidRequest(\"product capability roots must be absolute\")\n        self._workspace_root_identity = workspace_root_identity\n        self._artifact_root_identity = artifact_root_identity\n        self._before_dispatch = before_dispatch\n",
+              "executor identities",
+          )
+          text = replace_once(
+              text,
+              "            max_bytes=_MAX_OBSERVATION_BYTES,\n        )\n",
+              "            max_bytes=_MAX_OBSERVATION_BYTES,\n            expected_root_identity=self._workspace_root_identity,\n        )\n",
+              "workspace read identity",
+          )
+          text = replace_once(
+              text,
+              "        entries = list_directory(self._workspace_root, target)\n",
+              "        entries = list_directory(\n            self._workspace_root,\n            target,\n            expected_root_identity=self._workspace_root_identity,\n        )\n",
+              "workspace list identity",
+          )
+          text = replace_once(
+              text,
+              "        atomic_write(self._workspace_root, target, exact)\n",
+              "        atomic_write(\n            self._workspace_root,\n            target,\n            exact,\n            expected_root_identity=self._workspace_root_identity,\n        )\n",
+              "workspace write identity",
+          )
+          text = replace_once(
+              text,
+              "            allow_directory=allow_directory,\n        )\n",
+              "            allow_directory=allow_directory,\n            expected_root_identity=self._workspace_root_identity,\n        )\n",
+              "command identity",
+          )
+          text = replace_once(
+              text,
+              "            allow_directory=True,\n        )\n        git_fd: int | None = None\n",
+              "            allow_directory=True,\n            expected_root_identity=self._workspace_root_identity,\n        )\n        git_fd: int | None = None\n",
+              "git identity",
+          )
+          # The second direct read is structured JSON.
+          marker = "        exact = read_regular(\n            self._workspace_root,\n            target,\n            max_bytes=_MAX_OBSERVATION_BYTES,\n        )\n"
+          if marker in text:
+              text = text.replace(
+                  marker,
+                  "        exact = read_regular(\n            self._workspace_root,\n            target,\n            max_bytes=_MAX_OBSERVATION_BYTES,\n            expected_root_identity=self._workspace_root_identity,\n        )\n",
+                  1,
+              )
+          elif "        exact = read_regular(" not in text:
+              raise SystemExit("json read identity: seam changed")
+          text = replace_once(
+              text,
+              "        exclusive_create(self._artifact_root, target, exact)\n",
+              "        exclusive_create(\n            self._artifact_root,\n            target,\n            exact,\n            expected_root_identity=self._artifact_root_identity,\n        )\n",
+              "artifact identity",
+          )
+          path.write_text(text)
+
+          path = Path("src/ai_capital/product/capability_operator.py")
+          text = path.read_text()
+          text = replace_once(
+              text,
+              "from .reliability import ProductRequestRecord, ProductRequestRepository\n",
+              "from .reliability import ProductRequestRecord, ProductRequestRepository\nfrom .rooted_io import root_identity\n",
+              "operator rooted import",
+          )
+          text = replace_once(
+              text,
+              "        _prepare_capability_root(self._workspace_root)\n        _prepare_capability_root(self._artifact_root)\n\n        self._actors = ActorRepository(programs)\n",
+              "        _prepare_capability_root(self._workspace_root)\n        _prepare_capability_root(self._artifact_root)\n        self._workspace_root_identity = root_identity(self._workspace_root)\n        self._artifact_root_identity = root_identity(self._artifact_root)\n\n        self._actors = ActorRepository(programs)\n",
+              "operator root identities",
+          )
+          text = replace_once(
+              text,
+              "                if record.state == \"completed\":\n                    assert record.result is not None\n                    return record.result\n                return self._recover_pending_request(record)\n",
+              "                if record.state == \"completed\":\n                    assert record.result is not None\n                    if record.result.get(\"state\") == \"approval_required\":\n                        return self._recover_pending_request(record)\n                    return record.result\n                return self._recover_pending_request(record)\n",
+              "approval restart recovery",
+          )
+          text = replace_once(
+              text,
+              "            artifact_root=self._artifact_root,\n            before_dispatch=lambda: self._require_program_ready(program_id),\n",
+              "            artifact_root=self._artifact_root,\n            workspace_root_identity=self._workspace_root_identity,\n            artifact_root_identity=self._artifact_root_identity,\n            before_dispatch=lambda: self._require_program_ready(program_id),\n",
+              "executor identity arguments",
+          )
+          path.write_text(text)
           PY
 
           cat > tests/test_h2_reliability_review.py <<'PY'
@@ -158,17 +220,11 @@ jobs:
                   with ProgramRepository(database) as programs:
                       programs.create(Program("p-1", 0, "H2.7 review remediation"))
                       programs.transition("p-1", ProgramStatus.ACTIVE, expected_revision=0)
-                      ActorRepository(programs).register(
-                          Actor("a-1", 0, "worker", "configured-binding")
-                      )
+                      ActorRepository(programs).register(Actor("a-1", 0, "worker", "configured-binding"))
                   return database, workspace, artifacts
 
               def _open(self, database: Path, workspace: Path, artifacts: Path):
-                  return LocalCapabilityOperator.open(
-                      database,
-                      workspace_root=workspace,
-                      artifact_root=artifacts,
-                  )
+                  return LocalCapabilityOperator.open(database, workspace_root=workspace, artifact_root=artifacts)
 
               @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
               def test_workspace_read_rejects_fifo_without_blocking(self):
@@ -177,18 +233,9 @@ jobs:
                       database, workspace, artifacts = self._fixture(root)
                       os.mkfifo(workspace / "pipe")
                       with self._open(database, workspace, artifacts) as operator:
-                          operator.grant(
-                              actor_id="a-1",
-                              capability_id="workspace.read",
-                              resource_scope=("pipe",),
-                          )
+                          operator.grant(actor_id="a-1", capability_id="workspace.read", resource_scope=("pipe",))
                           started = time.monotonic()
-                          result = operator.invoke(
-                              program_id="p-1",
-                              actor_id="a-1",
-                              capability_id="workspace.read",
-                              arguments={"path": "pipe"},
-                          )
+                          result = operator.invoke(program_id="p-1", actor_id="a-1", capability_id="workspace.read", arguments={"path": "pipe"})
                           elapsed = time.monotonic() - started
                       self.assertLess(elapsed, 2)
                       self.assertEqual(result["operation"]["execution_outcome"], "failed")
@@ -204,19 +251,10 @@ jobs:
                       outside = root / "outside"
                       outside.mkdir()
                       with self._open(database, workspace, artifacts) as operator:
-                          operator.grant(
-                              actor_id="a-1",
-                              capability_id="workspace.write",
-                              resource_scope=("escape.txt",),
-                          )
+                          operator.grant(actor_id="a-1", capability_id="workspace.write", resource_scope=("escape.txt",))
                           workspace.rename(pinned)
                           workspace.symlink_to(outside, target_is_directory=True)
-                          result = operator.invoke(
-                              program_id="p-1",
-                              actor_id="a-1",
-                              capability_id="workspace.write",
-                              arguments={"path": "escape.txt", "content": "must stay confined"},
-                          )
+                          result = operator.invoke(program_id="p-1", actor_id="a-1", capability_id="workspace.write", arguments={"path": "escape.txt", "content": "must stay confined"})
                       self.assertEqual(result["operation"]["execution_outcome"], "failed")
                       self.assertFalse((outside / "escape.txt").exists())
                       self.assertFalse((pinned / "escape.txt").exists())
@@ -227,19 +265,8 @@ jobs:
                       database, workspace, artifacts = self._fixture(root)
                       arguments = {"path": "approved.txt", "content": "approved once\n"}
                       with self._open(database, workspace, artifacts) as operator:
-                          operator.grant(
-                              actor_id="a-1",
-                              capability_id="workspace.write",
-                              resource_scope=("approved.txt",),
-                              approval_required=True,
-                          )
-                          pending = operator.invoke(
-                              program_id="p-1",
-                              actor_id="a-1",
-                              capability_id="workspace.write",
-                              arguments=arguments,
-                              request_id="req-approved-restart",
-                          )
+                          operator.grant(actor_id="a-1", capability_id="workspace.write", resource_scope=("approved.txt",), approval_required=True)
+                          pending = operator.invoke(program_id="p-1", actor_id="a-1", capability_id="workspace.write", arguments=arguments, request_id="req-approved-restart")
                       decision_id = pending["decision"]["decision_id"]
                       with LocalProgramOperator.open(database) as programs:
                           approved = programs.approve(decision_id)
@@ -247,36 +274,16 @@ jobs:
 
                       with self._open(database, workspace, artifacts) as operator:
                           context = operator._authority_store.get_decision(decision_id)
-                          authority = operator._authority.issue_execution_authority(
-                              decision_id=decision_id,
-                              approval_id=approval_id,
-                          )
-                          operation = operator._journal.create_intent(
-                              program_id=context.program_id,
-                              actor_id=context.actor_id,
-                              resolution=context.resolution,
-                              authority_receipt_ref=authority.receipt_id,
-                          )
-                          operator._authority.consume_execution_authority(
-                              receipt_id=authority.receipt_id
-                          )
+                          authority = operator._authority.issue_execution_authority(decision_id=decision_id, approval_id=approval_id)
+                          operation = operator._journal.create_intent(program_id=context.program_id, actor_id=context.actor_id, resolution=context.resolution, authority_receipt_ref=authority.receipt_id)
+                          operator._authority.consume_execution_authority(receipt_id=authority.receipt_id)
                           operator._journal.mark_admitted(operation.operation_id)
                           operator._journal.mark_running(operation.operation_id)
                           operation_id = operation.operation_id
 
                       with self._open(database, workspace, artifacts) as operator:
-                          replay = operator.invoke(
-                              program_id="p-1",
-                              actor_id="a-1",
-                              capability_id="workspace.write",
-                              arguments=arguments,
-                              request_id="req-approved-restart",
-                          )
-                          count = int(
-                              operator._programs._db.execute(
-                                  "SELECT COUNT(*) FROM operation_projections"
-                              ).fetchone()[0]
-                          )
+                          replay = operator.invoke(program_id="p-1", actor_id="a-1", capability_id="workspace.write", arguments=arguments, request_id="req-approved-restart")
+                          count = int(operator._programs._db.execute("SELECT COUNT(*) FROM operation_projections").fetchone()[0])
                       self.assertEqual(replay["state"], "executed")
                       self.assertEqual(replay["operation"]["operation_id"], operation_id)
                       self.assertEqual(replay["operation"]["effect_status"], "indeterminate")
@@ -289,9 +296,10 @@ jobs:
               unittest.main()
           PY
 
-      - name: Commit remediation
+      - name: Validate and push remediation
         shell: bash
         run: |
+          PYTHONPATH=src python -m pytest -q tests/test_h2_reliability_review.py tests/test_h2_reliability_hardening.py tests/test_h2_product_capability_review.py tests/test_h2_product_capability_security.py
           git diff --check
           git config user.name "AI Capital Maintainer"
           git config user.email "55954113+Alajmah@users.noreply.github.com"
