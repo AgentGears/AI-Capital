@@ -229,9 +229,31 @@ class ProductRequestRepository:
         with self._programs._transaction():
             current = self.get(request_id)
             if current.state == "completed":
-                if canonical_json(current.result) != result_json:
+                if canonical_json(current.result) == result_json:
+                    return current
+                prior_state = None if current.result is None else current.result.get("state")
+                next_state = result.get("state")
+                if prior_state != "approval_required" or next_state != "executed":
                     raise PersistenceConflict("completed product request result changed")
-                return current
+                cursor = self._programs._db.execute(
+                    """
+                    UPDATE product_capability_requests
+                    SET result_json = ?, result_digest = ?, updated_at = ?
+                    WHERE request_id = ? AND state = 'completed' AND result_digest = ?
+                    """,
+                    (
+                        result_json,
+                        result_digest,
+                        utc_now(),
+                        request_id,
+                        canonical_digest(current.result),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise PersistenceConflict(
+                        "product request changed during approved completion"
+                    )
+                return self.get(request_id)
             cursor = self._programs._db.execute(
                 """
                 UPDATE product_capability_requests
