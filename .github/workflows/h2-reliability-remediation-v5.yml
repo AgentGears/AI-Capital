@@ -1,0 +1,143 @@
+name: H2.7 Final Component Remediation
+
+on:
+  push:
+    branches:
+      - h2-reliability-remediation-v5
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: h2-reliability-hardening
+          fetch-depth: 0
+      - name: Apply final-component guard
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/ai_capital/product/rooted_io.py")
+          text = path.read_text()
+          old = '''        if current is not None and stat.S_ISLNK(current.st_mode):
+              raise InvalidRequest("capability target cannot be a symlink")
+
+          descriptor = os.open(
+          '''
+          new = '''        if current is not None and stat.S_ISLNK(current.st_mode):
+              raise InvalidRequest("capability target cannot be a symlink")
+          expected_target_identity = (
+              None
+              if current is None
+              else (int(current.st_dev), int(current.st_ino), int(current.st_mode))
+          )
+
+          descriptor = os.open(
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f"initial target seam changed: {text.count(old)}")
+          text = text.replace(old, new, 1)
+          old = '''        os.fsync(descriptor)
+          os.close(descriptor)
+          descriptor = None
+          os.replace(
+          '''
+          new = '''        os.fsync(descriptor)
+          os.close(descriptor)
+          descriptor = None
+          try:
+              before_commit = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+          except FileNotFoundError:
+              before_commit = None
+          before_commit_identity = (
+              None
+              if before_commit is None
+              else (
+                  int(before_commit.st_dev),
+                  int(before_commit.st_ino),
+                  int(before_commit.st_mode),
+              )
+          )
+          if before_commit_identity != expected_target_identity:
+              raise InvalidRequest(
+                  "capability target changed before rooted materialization commit"
+              )
+          os.replace(
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f"precommit target seam changed: {text.count(old)}")
+          path.write_text(text.replace(old, new, 1))
+
+          path = Path("tests/test_h2_reliability_review.py")
+          text = path.read_text()
+          text = text.replace(
+              "import unittest\n",
+              "import unittest\nfrom unittest.mock import patch\n",
+              1,
+          )
+          text = text.replace(
+              "from ai_capital.product import LocalCapabilityOperator, LocalProgramOperator\n",
+              "from ai_capital.product import LocalCapabilityOperator, LocalProgramOperator\nfrom ai_capital.product import rooted_io\n",
+              1,
+          )
+          marker = '''    def test_approved_request_recovers_running_operation_after_restart(self):
+          '''
+          test = '''    def test_workspace_write_rejects_final_component_replacement_before_commit(self):
+              with tempfile.TemporaryDirectory() as directory:
+                  root = Path(directory)
+                  database, workspace, artifacts = self._fixture(root)
+                  target = workspace / "race.txt"
+                  target.write_text("initial\\n")
+                  original_write_all = rooted_io._write_all
+                  swapped = False
+
+                  def replace_target_after_temp_write(descriptor: int, content: bytes) -> None:
+                      nonlocal swapped
+                      original_write_all(descriptor, content)
+                      if not swapped:
+                          replacement = workspace / "replacement.txt"
+                          replacement.write_text("concurrent\\n")
+                          os.replace(replacement, target)
+                          swapped = True
+
+                  with self._open(database, workspace, artifacts) as operator:
+                      operator.grant(
+                          actor_id="a-1",
+                          capability_id="workspace.write",
+                          resource_scope=("race.txt",),
+                      )
+                      with patch(
+                          "ai_capital.product.rooted_io._write_all",
+                          side_effect=replace_target_after_temp_write,
+                      ):
+                          result = operator.invoke(
+                              program_id="p-1",
+                              actor_id="a-1",
+                              capability_id="workspace.write",
+                              arguments={"path": "race.txt", "content": "authorized\\n"},
+                          )
+                  self.assertEqual(result["operation"]["execution_outcome"], "failed")
+                  self.assertEqual(target.read_text(), "concurrent\\n")
+                  self.assertFalse(any(item.name.endswith(".tmp") for item in workspace.iterdir()))
+
+          '''
+          if text.count(marker) != 1:
+              raise SystemExit(f"review test insertion seam changed: {text.count(marker)}")
+          path.write_text(text.replace(marker, test + marker, 1))
+          PY
+      - name: Validate and push
+        shell: bash
+        run: |
+          python -m pip install pytest
+          PYTHONPATH=src python -m pytest -q tests/test_h2_reliability_review.py tests/test_h2_reliability_hardening.py tests/test_h2_product_capabilities.py
+          git diff --check
+          git config user.name "AI Capital Maintainer"
+          git config user.email "55954113+Alajmah@users.noreply.github.com"
+          git add src/ai_capital/product/rooted_io.py tests/test_h2_reliability_review.py
+          git commit -m "H2.7: reject final-component replacement before commit"
+          git push origin HEAD:h2-reliability-hardening
