@@ -11,6 +11,7 @@ from typing import Any, TextIO
 
 from .kernel.errors import AICapitalError, InvalidRequest
 from .product.actor_provider import LocalActorProviderOperator
+from .product.capability_operator import LocalCapabilityOperator
 from .product.program_operator import LocalProgramOperator
 from .product.provider_operator import LocalProviderOperator
 from .product.workspace_operator import LocalWorkspaceOperator
@@ -24,6 +25,14 @@ _PROVIDER_COMMANDS = {
     "provider-history",
 }
 _ACTOR_PROVIDER_COMMANDS = {"actor-provider", "actor-rebind"}
+_CAPABILITY_COMMANDS = {
+    "capabilities",
+    "capability-grant",
+    "capability-grants",
+    "capability-revoke",
+    "capability-invoke",
+    "capability-execute-approved",
+}
 _WORKSPACE_COMMANDS = {
     "snapshot",
     "snapshots",
@@ -132,6 +141,41 @@ def _parser() -> argparse.ArgumentParser:
     actor_rebind.add_argument("--expected-generation", required=True, type=int)
     actor_rebind.add_argument("--expected-provider-revision", required=True, type=int)
 
+    commands.add_parser(
+        "capabilities", help="List the governed local product Capability profile."
+    )
+    capability_grant = commands.add_parser(
+        "capability-grant", help="Issue an explicit Actor Capability Grant."
+    )
+    capability_grant.add_argument("actor_id")
+    capability_grant.add_argument("capability_id")
+    capability_grant.add_argument("--resource-scope", action="append", required=True)
+    capability_grant.add_argument("--approval-required", action="store_true")
+    capability_grant.add_argument("--expires-at")
+    capability_grants = commands.add_parser(
+        "capability-grants", help="List active Capability Grants for an Actor."
+    )
+    capability_grants.add_argument("actor_id")
+    capability_revoke = commands.add_parser(
+        "capability-revoke", help="Revoke one Capability Grant."
+    )
+    capability_revoke.add_argument("grant_id")
+    capability_invoke = commands.add_parser(
+        "capability-invoke",
+        help="Resolve, authorize, and invoke one typed product Capability.",
+    )
+    capability_invoke.add_argument("program_id")
+    capability_invoke.add_argument("actor_id")
+    capability_invoke.add_argument("capability_id")
+    capability_invoke.add_argument("--arguments-json", default="{}")
+    capability_invoke.add_argument("--request-id")
+    capability_execute = commands.add_parser(
+        "capability-execute-approved",
+        help="Execute one previously approved ASK decision through fresh authority.",
+    )
+    capability_execute.add_argument("decision_id")
+    capability_execute.add_argument("approval_id")
+
     snapshot = commands.add_parser(
         "snapshot", help="Capture the local workspace for one exact Program revision."
     )
@@ -186,14 +230,18 @@ def _write_json(stream: TextIO, value: Any) -> None:
     stream.write("\n")
 
 
-def _settings(payload: str) -> dict[str, object]:
+def _json_object(payload: str, *, field: str) -> dict[str, object]:
     try:
         value = json.loads(payload)
     except json.JSONDecodeError as exc:
-        raise InvalidRequest("settings-json must contain valid JSON") from exc
+        raise InvalidRequest(f"{field} must contain valid JSON") from exc
     if type(value) is not dict:
-        raise InvalidRequest("settings-json must contain a JSON object")
+        raise InvalidRequest(f"{field} must contain a JSON object")
     return value
+
+
+def _settings(payload: str) -> dict[str, object]:
+    return _json_object(payload, field="settings-json")
 
 
 def _program_command(args: argparse.Namespace) -> Any:
@@ -278,6 +326,38 @@ def _actor_provider_command(args: argparse.Namespace) -> Any:
     raise AssertionError(f"unhandled Actor provider command: {args.command}")
 
 
+def _capability_command(args: argparse.Namespace) -> Any:
+    with LocalCapabilityOperator.open(args.database) as operator:
+        if args.command == "capabilities":
+            return operator.capabilities()
+        if args.command == "capability-grant":
+            return operator.grant(
+                actor_id=args.actor_id,
+                capability_id=args.capability_id,
+                resource_scope=tuple(args.resource_scope),
+                approval_required=args.approval_required,
+                expires_at=args.expires_at,
+            )
+        if args.command == "capability-grants":
+            return operator.grants(args.actor_id)
+        if args.command == "capability-revoke":
+            return operator.revoke_grant(args.grant_id)
+        if args.command == "capability-invoke":
+            return operator.invoke(
+                program_id=args.program_id,
+                actor_id=args.actor_id,
+                capability_id=args.capability_id,
+                arguments=_json_object(args.arguments_json, field="arguments-json"),
+                request_id=args.request_id,
+            )
+        if args.command == "capability-execute-approved":
+            return operator.execute_approved(
+                decision_id=args.decision_id,
+                approval_id=args.approval_id,
+            )
+    raise AssertionError(f"unhandled capability command: {args.command}")
+
+
 def _workspace_command(args: argparse.Namespace) -> Any:
     with LocalWorkspaceOperator.open(args.database) as operator:
         if args.command == "snapshot":
@@ -344,6 +424,8 @@ def main(
             result = _provider_command(args)
         elif args.command in _ACTOR_PROVIDER_COMMANDS:
             result = _actor_provider_command(args)
+        elif args.command in _CAPABILITY_COMMANDS:
+            result = _capability_command(args)
         elif args.command in _WORKSPACE_COMMANDS:
             result = _workspace_command(args)
         else:
