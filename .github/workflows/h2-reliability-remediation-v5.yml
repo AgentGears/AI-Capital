@@ -23,70 +23,61 @@ jobs:
           from pathlib import Path
 
           path = Path("src/ai_capital/product/rooted_io.py")
-          text = path.read_text()
-          old = '''        if current is not None and stat.S_ISLNK(current.st_mode):
-              raise InvalidRequest("capability target cannot be a symlink")
+          lines = path.read_text().splitlines()
+          start = lines.index("def atomic_write(")
+          end = lines.index("def exclusive_create(")
+          block = lines[start:end]
 
-          descriptor = os.open(
-          '''
-          new = '''        if current is not None and stat.S_ISLNK(current.st_mode):
-              raise InvalidRequest("capability target cannot be a symlink")
-          expected_target_identity = (
-              None
-              if current is None
-              else (int(current.st_dev), int(current.st_ino), int(current.st_mode))
-          )
+          target_line = '        if current is not None and stat.S_ISLNK(current.st_mode):'
+          local = block.index(target_line)
+          insert_at = start + local + 2
+          identity_lines = [
+              '        expected_target_identity = (',
+              '            None',
+              '            if current is None',
+              '            else (int(current.st_dev), int(current.st_ino), int(current.st_mode))',
+              '        )',
+          ]
+          lines[insert_at:insert_at] = identity_lines
 
-          descriptor = os.open(
-          '''
-          if text.count(old) != 1:
-              raise SystemExit(f"initial target seam changed: {text.count(old)}")
-          text = text.replace(old, new, 1)
-          old = '''        os.fsync(descriptor)
-          os.close(descriptor)
-          descriptor = None
-          os.replace(
-          '''
-          new = '''        os.fsync(descriptor)
-          os.close(descriptor)
-          descriptor = None
-          try:
-              before_commit = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-          except FileNotFoundError:
-              before_commit = None
-          before_commit_identity = (
-              None
-              if before_commit is None
-              else (
-                  int(before_commit.st_dev),
-                  int(before_commit.st_ino),
-                  int(before_commit.st_mode),
-              )
-          )
-          if before_commit_identity != expected_target_identity:
-              raise InvalidRequest(
-                  "capability target changed before rooted materialization commit"
-              )
-          os.replace(
-          '''
-          if text.count(old) != 1:
-              raise SystemExit(f"precommit target seam changed: {text.count(old)}")
-          path.write_text(text.replace(old, new, 1))
+          start = lines.index("def atomic_write(")
+          end = lines.index("def exclusive_create(")
+          block = lines[start:end]
+          local = block.index('        descriptor = None')
+          insert_at = start + local + 1
+          guard_lines = [
+              '        try:',
+              '            before_commit = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)',
+              '        except FileNotFoundError:',
+              '            before_commit = None',
+              '        before_commit_identity = (',
+              '            None',
+              '            if before_commit is None',
+              '            else (',
+              '                int(before_commit.st_dev),',
+              '                int(before_commit.st_ino),',
+              '                int(before_commit.st_mode),',
+              '            )',
+              '        )',
+              '        if before_commit_identity != expected_target_identity:',
+              '            raise InvalidRequest(',
+              '                "capability target changed before rooted materialization commit"',
+              '            )',
+          ]
+          lines[insert_at:insert_at] = guard_lines
+          path.write_text("\n".join(lines) + "\n")
 
           path = Path("tests/test_h2_reliability_review.py")
           text = path.read_text()
-          text = text.replace(
-              "import unittest\n",
-              "import unittest\nfrom unittest.mock import patch\n",
-              1,
-          )
-          text = text.replace(
-              "from ai_capital.product import LocalCapabilityOperator, LocalProgramOperator\n",
-              "from ai_capital.product import LocalCapabilityOperator, LocalProgramOperator\nfrom ai_capital.product import rooted_io\n",
-              1,
-          )
-          marker = '''    def test_approved_request_recovers_running_operation_after_restart(self):
-          '''
+          if "from unittest.mock import patch\n" not in text:
+              text = text.replace("import unittest\n", "import unittest\nfrom unittest.mock import patch\n", 1)
+          if "from ai_capital.product import rooted_io\n" not in text:
+              text = text.replace(
+                  "from ai_capital.product import LocalCapabilityOperator, LocalProgramOperator\n",
+                  "from ai_capital.product import LocalCapabilityOperator, LocalProgramOperator\nfrom ai_capital.product import rooted_io\n",
+                  1,
+              )
+          marker = "    def test_approved_request_recovers_running_operation_after_restart(self):\n"
           test = '''    def test_workspace_write_rejects_final_component_replacement_before_commit(self):
               with tempfile.TemporaryDirectory() as directory:
                   root = Path(directory)
@@ -126,9 +117,11 @@ jobs:
                   self.assertFalse(any(item.name.endswith(".tmp") for item in workspace.iterdir()))
 
           '''
-          if text.count(marker) != 1:
-              raise SystemExit(f"review test insertion seam changed: {text.count(marker)}")
-          path.write_text(text.replace(marker, test + marker, 1))
+          if "test_workspace_write_rejects_final_component_replacement_before_commit" not in text:
+              if text.count(marker) != 1:
+                  raise SystemExit(f"review test insertion seam changed: {text.count(marker)}")
+              text = text.replace(marker, test + marker, 1)
+          path.write_text(text)
           PY
       - name: Validate and push
         shell: bash
