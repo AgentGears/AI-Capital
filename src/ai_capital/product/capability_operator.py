@@ -640,7 +640,16 @@ class LocalCapabilityOperator:
             authority_receipt_id=authority_receipt_id,
             executor=executor,
         )
-        return self._result_for_operation(operation, decision)
+        result = self._result_for_operation(operation, decision)
+        try:
+            record = self._requests.get(resolution.request_id)
+        except InvalidRequest:
+            return result
+        decision_id = decision.get("decision_id") if type(decision) is dict else None
+        if record.decision_id != decision_id:
+            return result
+        completed = self._requests.complete(resolution.request_id, result)
+        return completed.result or result
 
     def _link_operation(self, operation: Operation):
         current = self._programs.get(operation.program_id)
