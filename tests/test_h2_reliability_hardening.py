@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from ai_capital.kernel.actor_store import ActorRepository
 from ai_capital.kernel.durable_program import ProgramRepository
-from ai_capital.kernel.enums import EffectStatus, ExecutionOutcome, ProgramStatus
+from ai_capital.kernel.enums import ProgramStatus
 from ai_capital.kernel.errors import AuthorityDenied, ExecutionFailure, ExecutionTimeout, InvalidRequest
 from ai_capital.kernel.models import Actor, Program
 from ai_capital.product import LocalCapabilityOperator
@@ -128,6 +128,92 @@ class H2ReliabilityHardeningTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(count, 1)
             self.assertEqual((artifacts / "result.txt").read_text(), "created once\n")
+
+    def test_pre_h2_7_request_identity_is_migrated_without_repeating_effect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    resource_scope=("legacy.txt",),
+                )
+                first = operator.invoke(
+                    program_id="p-1",
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    arguments={"path": "legacy.txt", "content": "legacy once\n"},
+                    request_id="req-legacy",
+                )
+                with operator._programs._transaction():
+                    operator._programs._db.execute(
+                        "DELETE FROM product_capability_requests WHERE request_id = ?",
+                        ("req-legacy",),
+                    )
+                decisions = int(
+                    operator._programs._db.execute(
+                        "SELECT COUNT(*) FROM authority_decisions"
+                    ).fetchone()[0]
+                )
+                operations = int(
+                    operator._programs._db.execute(
+                        "SELECT COUNT(*) FROM operation_projections"
+                    ).fetchone()[0]
+                )
+            with self._open(database, workspace, artifacts) as operator:
+                replay = operator.invoke(
+                    program_id="p-1",
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    arguments={"path": "legacy.txt", "content": "legacy once\n"},
+                    request_id="req-legacy",
+                )
+                self.assertEqual(
+                    int(
+                        operator._programs._db.execute(
+                            "SELECT COUNT(*) FROM authority_decisions"
+                        ).fetchone()[0]
+                    ),
+                    decisions,
+                )
+                self.assertEqual(
+                    int(
+                        operator._programs._db.execute(
+                            "SELECT COUNT(*) FROM operation_projections"
+                        ).fetchone()[0]
+                    ),
+                    operations,
+                )
+            self.assertEqual(first, replay)
+            self.assertEqual((workspace / "legacy.txt").read_text(), "legacy once\n")
+
+    def test_rejected_preconditions_do_not_leave_product_request_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            with self._open(database, workspace, artifacts) as operator:
+                current = operator._programs.get("p-1")
+                operator._programs.transition(
+                    "p-1",
+                    ProgramStatus.CANCELLED,
+                    expected_revision=current.revision,
+                )
+                with self.assertRaises(AuthorityDenied):
+                    operator.invoke(
+                        program_id="p-1",
+                        actor_id="a-1",
+                        capability_id="workspace.write",
+                        arguments={"path": "blocked.txt", "content": "blocked"},
+                        request_id="req-precondition",
+                    )
+                count = int(
+                    operator._programs._db.execute(
+                        "SELECT COUNT(*) FROM product_capability_requests"
+                    ).fetchone()[0]
+                )
+            self.assertEqual(count, 0)
+            self.assertFalse((workspace / "blocked.txt").exists())
 
     def test_request_identity_reuse_with_different_payload_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
