@@ -379,9 +379,9 @@ class H2ReliabilityHardeningTests(unittest.TestCase):
             real_open_parent = rooted_io._open_parent
             swapped = False
 
-            def swap_after_pin(base: Path, target: str):
+            def swap_after_pin(base: Path, target: str, **kwargs):
                 nonlocal swapped
-                result = real_open_parent(base, target)
+                result = real_open_parent(base, target, **kwargs)
                 if not swapped:
                     original_parent.rename(pinned)
                     original_parent.symlink_to(outside, target_is_directory=True)

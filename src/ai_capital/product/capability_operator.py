@@ -26,6 +26,7 @@ from .capability_catalog import (
 )
 from .capability_executors import ProductCapabilityExecutor
 from .reliability import ProductRequestRecord, ProductRequestRepository
+from .rooted_io import root_identity
 
 
 _ROOT_BINDING_ID = "local-product-capability-roots-v1"
@@ -206,6 +207,8 @@ class LocalCapabilityOperator:
         )
         _prepare_capability_root(self._workspace_root)
         _prepare_capability_root(self._artifact_root)
+        self._workspace_root_identity = root_identity(self._workspace_root)
+        self._artifact_root_identity = root_identity(self._artifact_root)
 
         self._actors = ActorRepository(programs)
         self._capabilities = CapabilityRepository(programs)
@@ -537,6 +540,8 @@ class LocalCapabilityOperator:
                 record = self._requests.begin(request_id, payload)
                 if record.state == "completed":
                     assert record.result is not None
+                    if record.result.get("state") == "approval_required":
+                        return self._recover_pending_request(record)
                     return record.result
                 return self._recover_pending_request(record)
 
@@ -633,6 +638,8 @@ class LocalCapabilityOperator:
             resolution.capability_id,
             workspace_root=self._workspace_root,
             artifact_root=self._artifact_root,
+            workspace_root_identity=self._workspace_root_identity,
+            artifact_root_identity=self._artifact_root_identity,
             before_dispatch=lambda: self._require_program_ready(program_id),
         )
         operation = self._host.execute_authorized(

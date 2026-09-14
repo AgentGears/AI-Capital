@@ -37,9 +37,15 @@ def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
     )
 
 
-def _open_root(root: Path) -> int:
+def _open_root(
+    root: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> int:
     _require_platform_support()
-    root = root.resolve()
+    root = Path(root)
+    if not root.is_absolute():
+        raise ExecutionFailure("capability root must be absolute for rooted access")
     try:
         before = os.lstat(root)
         descriptor = os.open(
@@ -54,10 +60,23 @@ def _open_root(root: Path) -> int:
         or not stat.S_ISDIR(before.st_mode)
         or not stat.S_ISDIR(opened.st_mode)
         or not _same_identity(before, opened)
+        or (
+            expected_identity is not None
+            and (int(opened.st_dev), int(opened.st_ino)) != expected_identity
+        )
     ):
         os.close(descriptor)
         raise ExecutionFailure("capability root changed during rooted access")
     return descriptor
+
+
+def root_identity(root: Path) -> tuple[int, int]:
+    descriptor = _open_root(root)
+    try:
+        info = os.fstat(descriptor)
+        return int(info.st_dev), int(info.st_ino)
+    finally:
+        os.close(descriptor)
 
 
 def _parts(target: str) -> tuple[str, ...]:
@@ -83,8 +102,13 @@ def _open_directory_from(root_fd: int, parts: Iterable[str]) -> int:
         raise ExecutionFailure("capability path changed during rooted access") from exc
 
 
-def _open_parent(root: Path, target: str) -> tuple[int, int, str]:
-    root_fd = _open_root(root)
+def _open_parent(
+    root: Path,
+    target: str,
+    *,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> tuple[int, int, str]:
+    root_fd = _open_root(root, expected_identity=expected_root_identity)
     parts = _parts(target)
     if not parts:
         os.close(root_fd)
@@ -123,13 +147,24 @@ def _read_bounded(descriptor: int, *, max_bytes: int) -> bytes:
     return bytes(content)
 
 
-def read_regular(root: Path, target: str, *, max_bytes: int) -> bytes:
-    root_fd, parent_fd, name = _open_parent(root, target)
+def read_regular(
+    root: Path,
+    target: str,
+    *,
+    max_bytes: int,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> bytes:
+    root_fd, parent_fd, name = _open_parent(
+        root, target, expected_root_identity=expected_root_identity
+    )
     descriptor: int | None = None
     try:
         descriptor = os.open(
             name,
-            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0),
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_BINARY", 0),
             dir_fd=parent_fd,
         )
         info = os.fstat(descriptor)
@@ -149,8 +184,13 @@ def read_regular(root: Path, target: str, *, max_bytes: int) -> bytes:
         os.close(root_fd)
 
 
-def list_directory(root: Path, target: str) -> list[dict[str, object]]:
-    root_fd = _open_root(root)
+def list_directory(
+    root: Path,
+    target: str,
+    *,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> list[dict[str, object]]:
+    root_fd = _open_root(root, expected_identity=expected_root_identity)
     directory_fd: int | None = None
     try:
         directory_fd = _open_directory_from(root_fd, _parts(target))
@@ -177,8 +217,16 @@ def list_directory(root: Path, target: str) -> list[dict[str, object]]:
         os.close(root_fd)
 
 
-def atomic_write(root: Path, target: str, content: bytes) -> None:
-    root_fd, parent_fd, name = _open_parent(root, target)
+def atomic_write(
+    root: Path,
+    target: str,
+    content: bytes,
+    *,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> None:
+    root_fd, parent_fd, name = _open_parent(
+        root, target, expected_root_identity=expected_root_identity
+    )
     temporary = f".{name}.{secrets.token_hex(12)}.tmp"
     descriptor: int | None = None
     created = False
@@ -231,8 +279,16 @@ def atomic_write(root: Path, target: str, content: bytes) -> None:
         os.close(root_fd)
 
 
-def exclusive_create(root: Path, target: str, content: bytes) -> None:
-    root_fd, parent_fd, name = _open_parent(root, target)
+def exclusive_create(
+    root: Path,
+    target: str,
+    content: bytes,
+    *,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> None:
+    root_fd, parent_fd, name = _open_parent(
+        root, target, expected_root_identity=expected_root_identity
+    )
     descriptor: int | None = None
     created = False
     try:
@@ -273,9 +329,10 @@ def open_pinned(
     target: str,
     *,
     allow_directory: bool,
+    expected_root_identity: tuple[int, int] | None = None,
 ) -> tuple[int, int]:
     """Return (root_fd, target_fd) pinned beneath root for subprocess observation."""
-    root_fd = _open_root(root)
+    root_fd = _open_root(root, expected_identity=expected_root_identity)
     if target == ".":
         return root_fd, os.dup(root_fd)
     parts = _parts(target)
@@ -283,7 +340,12 @@ def open_pinned(
     target_fd: int | None = None
     try:
         parent_fd = _open_directory_from(root_fd, parts[:-1])
-        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0)
+        flags = (
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
         if allow_directory:
             # Do not require O_DIRECTORY: stat decides whether regular or directory is admitted.
             pass
@@ -294,6 +356,11 @@ def open_pinned(
         ):
             raise InvalidRequest("command.observe target has unsupported file type")
         return root_fd, target_fd
+    except InvalidRequest:
+        if target_fd is not None:
+            os.close(target_fd)
+        os.close(root_fd)
+        raise
     except OSError as exc:
         if target_fd is not None:
             os.close(target_fd)

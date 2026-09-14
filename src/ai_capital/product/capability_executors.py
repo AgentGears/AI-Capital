@@ -155,13 +155,17 @@ class ProductCapabilityExecutor:
         *,
         workspace_root: Path,
         artifact_root: Path,
+        workspace_root_identity: tuple[int, int] | None = None,
+        artifact_root_identity: tuple[int, int] | None = None,
         before_dispatch: Callable[[], None] | None = None,
     ):
         self._capability_id = capability_id
-        self._workspace_root = workspace_root.resolve()
-        self._artifact_root = artifact_root.resolve()
-        self._workspace_root.mkdir(parents=True, exist_ok=True)
-        self._artifact_root.mkdir(parents=True, exist_ok=True)
+        self._workspace_root = Path(workspace_root)
+        self._artifact_root = Path(artifact_root)
+        if not self._workspace_root.is_absolute() or not self._artifact_root.is_absolute():
+            raise InvalidRequest("product capability roots must be absolute")
+        self._workspace_root_identity = workspace_root_identity
+        self._artifact_root_identity = artifact_root_identity
         self._before_dispatch = before_dispatch
 
     def _trusted_executable(self, name: str) -> str:
@@ -241,6 +245,7 @@ class ProductCapabilityExecutor:
             self._workspace_root,
             target,
             max_bytes=_MAX_OBSERVATION_BYTES,
+            expected_root_identity=self._workspace_root_identity,
         )
         try:
             text = content.decode("utf-8")
@@ -263,7 +268,11 @@ class ProductCapabilityExecutor:
             effect_class=EffectClass.OBSERVE,
         )
         target = _canonical_relative(effect.target, allow_root=True)
-        entries = list_directory(self._workspace_root, target)
+        entries = list_directory(
+            self._workspace_root,
+            target,
+            expected_root_identity=self._workspace_root_identity,
+        )
         return _success({"path": target, "entries": entries}, observational=True)
 
     def _workspace_write(self, effect: ResolvedEffect) -> ExecutionObservation:
@@ -277,7 +286,12 @@ class ProductCapabilityExecutor:
             raise InvalidRequest("workspace.write content is invalid")
         target = _canonical_relative(effect.target, allow_root=False)
         exact = content.encode("utf-8")
-        atomic_write(self._workspace_root, target, exact)
+        atomic_write(
+            self._workspace_root,
+            target,
+            exact,
+            expected_root_identity=self._workspace_root_identity,
+        )
         return _success(
             {
                 "path": target,
@@ -321,6 +335,7 @@ class ProductCapabilityExecutor:
             self._workspace_root,
             operand,
             allow_directory=allow_directory,
+            expected_root_identity=self._workspace_root_identity,
         )
         try:
             cwd = descriptor_path(root_fd)
@@ -410,6 +425,7 @@ class ProductCapabilityExecutor:
             self._workspace_root,
             target,
             allow_directory=True,
+            expected_root_identity=self._workspace_root_identity,
         )
         git_fd: int | None = None
         try:
@@ -511,6 +527,7 @@ class ProductCapabilityExecutor:
             self._workspace_root,
             target,
             max_bytes=_MAX_OBSERVATION_BYTES,
+            expected_root_identity=self._workspace_root_identity,
         )
         try:
             canonical = canonical_json(json.loads(exact.decode("utf-8")))
@@ -542,7 +559,12 @@ class ProductCapabilityExecutor:
             raise InvalidRequest("structured.json.write requires valid finite JSON") from exc
         exact = canonical.encode("utf-8")
         target = _canonical_relative(effect.target, allow_root=False)
-        atomic_write(self._workspace_root, target, exact)
+        atomic_write(
+            self._workspace_root,
+            target,
+            exact,
+            expected_root_identity=self._workspace_root_identity,
+        )
         return _success(
             {
                 "path": target,
@@ -563,7 +585,12 @@ class ProductCapabilityExecutor:
             raise InvalidRequest("artifact.write content is invalid")
         target = canonical_artifact_path(effect.target)
         exact = content.encode("utf-8")
-        exclusive_create(self._artifact_root, target, exact)
+        exclusive_create(
+            self._artifact_root,
+            target,
+            exact,
+            expected_root_identity=self._artifact_root_identity,
+        )
         return _success(
             {
                 "path": target,
