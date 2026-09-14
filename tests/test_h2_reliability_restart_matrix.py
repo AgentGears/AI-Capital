@@ -207,7 +207,7 @@ class H2ReliabilityRestartMatrixTests(unittest.TestCase):
             )
             self.assertEqual(
                 lifecycle["pending_reconciliation_refs"],
-                [operation.operation_id],
+                (operation.operation_id,),
             )
 
 
