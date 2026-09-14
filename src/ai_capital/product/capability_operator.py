@@ -379,6 +379,19 @@ class LocalCapabilityOperator:
             "arguments": arguments,
         }
 
+    @classmethod
+    def _request_payload_from_context(cls, context) -> dict[str, Any]:
+        resolution = to_canonical_data(context.resolution)
+        arguments = resolution.get("arguments")
+        if type(arguments) is not dict:
+            raise IntegrityViolation("AuthorityDecision request arguments are invalid")
+        return cls._request_payload(
+            program_id=context.program_id,
+            actor_id=context.actor_id,
+            capability_id=context.resolution.capability_id,
+            arguments=arguments,
+        )
+
     def _decision_for_request(self, request_id: str):
         matches = []
         rows = self._programs._db.execute(
@@ -506,6 +519,8 @@ class LocalCapabilityOperator:
         capability_id = self._require_text(capability_id, field="capability_id")
         if type(arguments) is not dict:
             raise InvalidRequest("arguments must be an object")
+
+        payload: dict[str, Any] | None = None
         if request_id is not None:
             request_id = self._require_text(request_id, field="request_id")
             payload = self._request_payload(
@@ -518,11 +533,25 @@ class LocalCapabilityOperator:
                 prior = self._requests.get(request_id)
             except InvalidRequest:
                 prior = None
-            record = self._requests.begin(request_id, payload)
             if prior is not None:
+                record = self._requests.begin(request_id, payload)
                 if record.state == "completed":
                     assert record.result is not None
                     return record.result
+                return self._recover_pending_request(record)
+
+            legacy = self._decision_for_request(request_id)
+            if legacy is not None:
+                legacy_payload = self._request_payload_from_context(legacy)
+                if payload != legacy_payload:
+                    raise InvalidRequest(
+                        "request_id is already bound to a different invocation payload"
+                    )
+                record = self._requests.begin(request_id, legacy_payload)
+                record = self._requests.bind_decision(
+                    request_id,
+                    legacy.decision.decision_id,
+                )
                 return self._recover_pending_request(record)
 
         self._require_program_ready(program_id)
@@ -532,6 +561,10 @@ class LocalCapabilityOperator:
             arguments=arguments,
             request_id=request_id,
         )
+        if request_id is not None:
+            assert payload is not None
+            self._requests.begin(request_id, payload)
+
         context = self._authority.decide(
             program_id=program_id,
             actor_id=actor_id,
