@@ -83,7 +83,7 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
                         resource_scope=(".",),
                     )
                     with patch(
-                        "ai_capital.product.capability_executors.subprocess.run",
+                        "ai_capital.product.capability_executors.run_bounded_process",
                         return_value=completed,
                     ) as run:
                         result = operator.invoke(
@@ -101,11 +101,13 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
             self.assertIn("--no-ext-diff", argv)
             self.assertIn("--no-textconv", argv)
             self.assertIn("--ignore-submodules=all", argv)
-            self.assertFalse(run.call_args.kwargs["shell"])
             environment = run.call_args.kwargs["env"]
             self.assertNotIn("GIT_DIR", environment)
             self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
             self.assertEqual(environment["HOME"], environment["XDG_CONFIG_HOME"])
+            self.assertTrue(Path(run.call_args.kwargs["executable"]).is_absolute())
+            self.assertEqual(run.call_args.kwargs["max_output_bytes"], 1024 * 1024)
+            self.assertTrue(run.call_args.kwargs["pass_fds"])
 
     def test_git_observe_rejects_repository_filter_configuration_before_subprocess(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -125,7 +127,7 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
                     resource_scope=(".",),
                 )
                 with patch(
-                    "ai_capital.product.capability_executors.subprocess.run"
+                    "ai_capital.product.capability_executors.run_bounded_process"
                 ) as run:
                     result = operator.invoke(
                         program_id="p-1",
@@ -164,7 +166,7 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
                             resource_scope=(".",),
                         )
                         with patch(
-                            "ai_capital.product.capability_executors.subprocess.run"
+                            "ai_capital.product.capability_executors.run_bounded_process"
                         ) as run:
                             result = operator.invoke(
                                 program_id="p-1",
@@ -237,7 +239,7 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
                     resource_scope=("cat pipe",),
                 )
                 with patch(
-                    "ai_capital.product.capability_executors.subprocess.run"
+                    "ai_capital.product.capability_executors.run_bounded_process"
                 ) as run:
                     result = operator.invoke(
                         program_id="p-1",
