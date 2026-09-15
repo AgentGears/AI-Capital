@@ -78,45 +78,48 @@ jobs:
                   1,
               )
           marker = "    def test_approved_request_recovers_running_operation_after_restart(self):\n"
-          test = '''    def test_workspace_write_rejects_final_component_replacement_before_commit(self):
-              with tempfile.TemporaryDirectory() as directory:
-                  root = Path(directory)
-                  database, workspace, artifacts = self._fixture(root)
-                  target = workspace / "race.txt"
-                  target.write_text("initial\\n")
-                  original_write_all = rooted_io._write_all
-                  swapped = False
-
-                  def replace_target_after_temp_write(descriptor: int, content: bytes) -> None:
-                      nonlocal swapped
-                      original_write_all(descriptor, content)
-                      if not swapped:
-                          replacement = workspace / "replacement.txt"
-                          replacement.write_text("concurrent\\n")
-                          os.replace(replacement, target)
-                          swapped = True
-
-                  with self._open(database, workspace, artifacts) as operator:
-                      operator.grant(
-                          actor_id="a-1",
-                          capability_id="workspace.write",
-                          resource_scope=("race.txt",),
-                      )
-                      with patch(
-                          "ai_capital.product.rooted_io._write_all",
-                          side_effect=replace_target_after_temp_write,
-                      ):
-                          result = operator.invoke(
-                              program_id="p-1",
-                              actor_id="a-1",
-                              capability_id="workspace.write",
-                              arguments={"path": "race.txt", "content": "authorized\\n"},
-                          )
-                  self.assertEqual(result["operation"]["execution_outcome"], "failed")
-                  self.assertEqual(target.read_text(), "concurrent\\n")
-                  self.assertFalse(any(item.name.endswith(".tmp") for item in workspace.iterdir()))
-
-          '''
+          test_lines = [
+              "    def test_workspace_write_rejects_final_component_replacement_before_commit(self):",
+              "        with tempfile.TemporaryDirectory() as directory:",
+              "            root = Path(directory)",
+              "            database, workspace, artifacts = self._fixture(root)",
+              "            target = workspace / \"race.txt\"",
+              "            target.write_text(\"initial\\n\")",
+              "            original_write_all = rooted_io._write_all",
+              "            swapped = False",
+              "",
+              "            def replace_target_after_temp_write(descriptor: int, content: bytes) -> None:",
+              "                nonlocal swapped",
+              "                original_write_all(descriptor, content)",
+              "                if not swapped:",
+              "                    replacement = workspace / \"replacement.txt\"",
+              "                    replacement.write_text(\"concurrent\\n\")",
+              "                    os.replace(replacement, target)",
+              "                    swapped = True",
+              "",
+              "            with self._open(database, workspace, artifacts) as operator:",
+              "                operator.grant(",
+              "                    actor_id=\"a-1\",",
+              "                    capability_id=\"workspace.write\",",
+              "                    resource_scope=(\"race.txt\",),",
+              "                )",
+              "                with patch(",
+              "                    \"ai_capital.product.rooted_io._write_all\",",
+              "                    side_effect=replace_target_after_temp_write,",
+              "                ):",
+              "                    result = operator.invoke(",
+              "                        program_id=\"p-1\",",
+              "                        actor_id=\"a-1\",",
+              "                        capability_id=\"workspace.write\",",
+              "                        arguments={\"path\": \"race.txt\", \"content\": \"authorized\\n\"},",
+              "                    )",
+              "            self.assertEqual(result[\"operation\"][\"execution_outcome\"], \"failed\")",
+              "            self.assertEqual(target.read_text(), \"concurrent\\n\")",
+              "            self.assertFalse(any(item.name.endswith(\".tmp\") for item in workspace.iterdir()))",
+              "",
+              "",
+          ]
+          test = "\n".join(test_lines)
           if "test_workspace_write_rejects_final_component_replacement_before_commit" not in text:
               if text.count(marker) != 1:
                   raise SystemExit(f"review test insertion seam changed: {text.count(marker)}")
