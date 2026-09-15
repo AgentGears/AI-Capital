@@ -320,6 +320,7 @@ class H2ReliabilityHardeningTests(unittest.TestCase):
                     )
             self.assertEqual(result["operation"]["execution_outcome"], "cancelled")
             self.assertEqual(result["operation"]["effect_status"], "absent")
+            self.assertIsNone(result["operation"]["started_at"])
             self.assertFalse((workspace / "cancelled.txt").exists())
 
     def test_workspace_read_enforces_product_byte_limit(self):

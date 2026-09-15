@@ -13,7 +13,7 @@ from ..kernel.capability_broker import CapabilityBroker, CapabilityHandlerRegist
 from ..kernel.capability_store import CapabilityRepository, capability_descriptor
 from ..kernel.durable_program import ProgramRepository
 from ..kernel.enums import AuthorityDecisionKind, ExecutionOutcome, ProgramStatus
-from ..kernel.errors import AuthorityDenied, IntegrityViolation, InvalidRequest
+from ..kernel.errors import AuthorityDenied, ExecutionCancelled, IntegrityViolation, InvalidRequest
 from ..kernel.events import utc_now
 from ..kernel.models import CapabilityRequest, Grant, Operation
 from ..kernel.operation_journal import OperationHost, OperationJournal
@@ -367,6 +367,12 @@ class LocalCapabilityOperator:
         if control.paused:
             raise AuthorityDenied("capability invocation is blocked while Program is paused")
 
+    def _require_dispatch_ready(self, program_id: str) -> None:
+        try:
+            self._require_program_ready(program_id)
+        except AuthorityDenied as exc:
+            raise ExecutionCancelled("Program is not runnable at dispatch boundary") from exc
+
     @staticmethod
     def _request_payload(
         *,
@@ -640,12 +646,12 @@ class LocalCapabilityOperator:
             artifact_root=self._artifact_root,
             workspace_root_identity=self._workspace_root_identity,
             artifact_root_identity=self._artifact_root_identity,
-            before_dispatch=lambda: self._require_program_ready(program_id),
         )
         operation = self._host.execute_authorized(
             resolution=resolution,
             authority_receipt_id=authority_receipt_id,
             executor=executor,
+            before_dispatch=lambda: self._require_dispatch_ready(program_id),
         )
         result = self._result_for_operation(operation, decision)
         try:
