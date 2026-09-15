@@ -239,6 +239,11 @@ def atomic_write(
             raise InvalidRequest("capability target must be a regular file")
         if current is not None and stat.S_ISLNK(current.st_mode):
             raise InvalidRequest("capability target cannot be a symlink")
+        expected_target_identity = (
+            None
+            if current is None
+            else (int(current.st_dev), int(current.st_ino), int(current.st_mode))
+        )
 
         descriptor = os.open(
             temporary,
@@ -252,6 +257,23 @@ def atomic_write(
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
+        try:
+            before_commit = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            before_commit = None
+        before_commit_identity = (
+            None
+            if before_commit is None
+            else (
+                int(before_commit.st_dev),
+                int(before_commit.st_ino),
+                int(before_commit.st_mode),
+            )
+        )
+        if before_commit_identity != expected_target_identity:
+            raise InvalidRequest(
+                "capability target changed before rooted materialization commit"
+            )
         os.replace(
             temporary,
             name,
