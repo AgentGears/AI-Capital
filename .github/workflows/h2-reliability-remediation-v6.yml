@@ -1,0 +1,157 @@
+name: H2.7 Host Dispatch Boundary Remediation
+
+on:
+  push:
+    branches:
+      - h2-reliability-remediation-v6
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: h2-reliability-hardening
+          fetch-depth: 0
+      - name: Apply Host dispatch boundary remediation
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          path = Path("src/ai_capital/kernel/operation_journal.py")
+          text = path.read_text()
+          text = once(
+              text,
+              "from typing import Protocol\n",
+              "from typing import Callable, Protocol\n",
+              "Callable import",
+          )
+          marker = "    @staticmethod\n    def _reconciliation_status(effect_status: EffectStatus) -> ReconciliationStatus:\n"
+          method = '''    def cancel_before_dispatch(self, operation_id: str, *, error_code: str) -> Operation:
+              current = self.get(operation_id)
+              if current.execution_outcome is not ExecutionOutcome.NOT_STARTED:
+                  raise IntegrityViolation("pre-dispatch cancellation requires a not-started Operation")
+              resolution = self.resolution(operation_id)
+              effect_status = (
+                  EffectStatus.NOT_APPLICABLE
+                  if resolution.resolved_effect.effect_class is EffectClass.OBSERVE
+                  else EffectStatus.ABSENT
+              )
+              observation = ExecutionObservation(
+                  execution_outcome=ExecutionOutcome.CANCELLED,
+                  effect_status=effect_status,
+                  output={},
+                  error_code=error_code,
+              )
+              receipt = self._execution_receipt(current, observation)
+              updated = replace(
+                  current,
+                  execution_outcome=ExecutionOutcome.CANCELLED,
+                  effect_status=effect_status,
+                  reconciliation_status=ReconciliationStatus.NOT_REQUIRED,
+                  finished_at=receipt.observed_at,
+                  receipt_refs=current.receipt_refs + (receipt.receipt_id,),
+              )
+              return self._commit_projection(
+                  previous=current,
+                  updated=updated,
+                  event_type="operation.finished",
+                  receipt=receipt,
+                  receipt_id=receipt.receipt_id,
+                  receipt_type="execution",
+              )
+
+'''
+          text = once(text, marker, method + marker, "cancel before dispatch method")
+          text = once(
+              text,
+              "        executor: EffectExecutor,\n        idempotency_key: str | None = None,\n",
+              "        executor: EffectExecutor,\n        before_dispatch: Callable[[], None] | None = None,\n        idempotency_key: str | None = None,\n",
+              "Host dispatch callback signature",
+          )
+          text = once(
+              text,
+              "        self._journal.mark_admitted(operation.operation_id)\n        running = self._journal.mark_running(operation.operation_id)\n",
+              '''        self._journal.mark_admitted(operation.operation_id)
+              if before_dispatch is not None:
+                  try:
+                      before_dispatch()
+                  except ExecutionCancelled:
+                      return self._journal.cancel_before_dispatch(
+                          operation.operation_id,
+                          error_code="execution_cancelled_before_dispatch",
+                      )
+                  except Exception:
+                      self._journal.fail_before_dispatch(
+                          operation.operation_id,
+                          error_code="pre_dispatch_check_failed",
+                      )
+                      raise
+              running = self._journal.mark_running(operation.operation_id)
+''',
+              "Host dispatch gate",
+          )
+          path.write_text(text)
+
+          path = Path("src/ai_capital/product/capability_operator.py")
+          text = path.read_text()
+          text = once(
+              text,
+              "from ..kernel.errors import AuthorityDenied, IntegrityViolation, InvalidRequest\n",
+              "from ..kernel.errors import AuthorityDenied, ExecutionCancelled, IntegrityViolation, InvalidRequest\n",
+              "ExecutionCancelled import",
+          )
+          marker = "    @staticmethod\n    def _request_payload(\n"
+          helper = '''    def _require_dispatch_ready(self, program_id: str) -> None:
+              try:
+                  self._require_program_ready(program_id)
+              except AuthorityDenied as exc:
+                  raise ExecutionCancelled("Program is not runnable at dispatch boundary") from exc
+
+'''
+          text = once(text, marker, helper + marker, "dispatch ready helper")
+          text = once(
+              text,
+              "            artifact_root_identity=self._artifact_root_identity,\n            before_dispatch=lambda: self._require_program_ready(program_id),\n        )\n",
+              "            artifact_root_identity=self._artifact_root_identity,\n        )\n",
+              "remove executor dispatch gate",
+          )
+          text = once(
+              text,
+              "            authority_receipt_id=authority_receipt_id,\n            executor=executor,\n        )\n",
+              "            authority_receipt_id=authority_receipt_id,\n            executor=executor,\n            before_dispatch=lambda: self._require_dispatch_ready(program_id),\n        )\n",
+              "bind Host dispatch gate",
+          )
+          path.write_text(text)
+
+          path = Path("tests/test_h2_reliability_hardening.py")
+          text = path.read_text()
+          text = once(
+              text,
+              "            self.assertEqual(result[\"operation\"][\"execution_outcome\"], \"cancelled\")\n            self.assertEqual(result[\"operation\"][\"effect_status\"], \"absent\")\n            self.assertFalse((workspace / \"cancelled.txt\").exists())\n",
+              "            self.assertEqual(result[\"operation\"][\"execution_outcome\"], \"cancelled\")\n            self.assertEqual(result[\"operation\"][\"effect_status\"], \"absent\")\n            self.assertIsNone(result[\"operation\"][\"started_at\"])\n            self.assertFalse((workspace / \"cancelled.txt\").exists())\n",
+              "dispatch boundary regression",
+          )
+          path.write_text(text)
+          PY
+      - name: Validate and push
+        shell: bash
+        run: |
+          python -m pip install pytest
+          PYTHONPATH=src python -m pytest -q tests/test_h2_reliability_hardening.py tests/test_h2_reliability_restart_matrix.py tests/test_k5_operation_journal.py tests/test_h2_product_capabilities.py
+          git diff --check
+          git config user.name "AI Capital Maintainer"
+          git config user.email "55954113+Alajmah@users.noreply.github.com"
+          git add src/ai_capital/kernel/operation_journal.py src/ai_capital/product/capability_operator.py tests/test_h2_reliability_hardening.py
+          git commit -m "H2.7: enforce Host pre-dispatch stop gate"
+          git push origin HEAD:h2-reliability-hardening
