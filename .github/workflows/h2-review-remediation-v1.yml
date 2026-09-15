@@ -24,6 +24,16 @@ jobs:
         run: |
           git fetch origin h2-review-remediation-v1
           git show origin/h2-review-remediation-v1:.github/scripts/h2_review_remediate_v1.py > /tmp/h2_review_remediate_v1.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('/tmp/h2_review_remediate_v1.py')
+          text = path.read_text()
+          old = "test = '''    @unittest.skipIf(shutil.which(\"git\") is None, \"git is unavailable\")"
+          new = "test = r'''    @unittest.skipIf(shutil.which(\"git\") is None, \"git is unavailable\")"
+          if old not in text:
+              raise SystemExit('Git regression string marker missing')
+          path.write_text(text.replace(old, new, 1))
+          PY
           python /tmp/h2_review_remediate_v1.py
       - run: python -m pip install -q pytest
       - name: Targeted regressions
