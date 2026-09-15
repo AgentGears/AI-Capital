@@ -471,6 +471,19 @@ class LocalCapabilityOperator:
             return self._requests.complete(request_id, result).result or result
 
         if context is not None:
+            issued_authority = self._authority_store.unconsumed_execution_authority_for_decision(
+                context.decision.decision_id
+            )
+            if issued_authority is not None:
+                self._require_program_ready(context.program_id)
+                return self._execute(
+                    program_id=context.program_id,
+                    resolution=context.resolution,
+                    authority_receipt_id=issued_authority.receipt_id,
+                    decision=to_canonical_data(context.decision),
+                )
+
+        if context is not None:
             base = {
                 "decision": to_canonical_data(context.decision),
                 "resolution": to_canonical_data(context.resolution),

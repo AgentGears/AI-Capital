@@ -103,6 +103,68 @@ class H2ReliabilityReviewTests(unittest.TestCase):
             self.assertEqual(target.read_text(), "concurrent\n")
             self.assertFalse(any(item.name.endswith(".tmp") for item in workspace.iterdir()))
 
+    def test_approved_request_recovers_issued_authority_before_operation_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            arguments = {"path": "approved-issued.txt", "content": "approved once\n"}
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    resource_scope=("approved-issued.txt",),
+                    approval_required=True,
+                )
+                pending = operator.invoke(
+                    program_id="p-1",
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    arguments=arguments,
+                    request_id="req-approved-issued-restart",
+                )
+            decision_id = pending["decision"]["decision_id"]
+            with LocalProgramOperator.open(database) as programs:
+                approved = programs.approve(decision_id)
+                approval_id = approved["approval"]["receipt"]["approval_id"]
+
+            with self._open(database, workspace, artifacts) as operator:
+                issued = operator._authority.issue_execution_authority(
+                    decision_id=decision_id,
+                    approval_id=approval_id,
+                )
+                issued_id = issued.receipt_id
+                self.assertEqual(
+                    int(
+                        operator._programs._db.execute(
+                            "SELECT COUNT(*) FROM operation_projections"
+                        ).fetchone()[0]
+                    ),
+                    0,
+                )
+
+            with self._open(database, workspace, artifacts) as operator:
+                replay = operator.invoke(
+                    program_id="p-1",
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    arguments=arguments,
+                    request_id="req-approved-issued-restart",
+                )
+                authorities = operator._programs._db.execute(
+                    "SELECT receipt_id, consumed_at FROM execution_authority_receipts"
+                ).fetchall()
+                operation_count = int(
+                    operator._programs._db.execute(
+                        "SELECT COUNT(*) FROM operation_projections"
+                    ).fetchone()[0]
+                )
+            self.assertEqual(replay["state"], "executed")
+            self.assertEqual(len(authorities), 1)
+            self.assertEqual(str(authorities[0]["receipt_id"]), issued_id)
+            self.assertIsNotNone(authorities[0]["consumed_at"])
+            self.assertEqual(operation_count, 1)
+            self.assertEqual((workspace / "approved-issued.txt").read_text(), "approved once\n")
+
     def test_approved_request_recovers_running_operation_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
