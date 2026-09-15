@@ -161,23 +161,27 @@ class H2ReliabilityReviewTests(unittest.TestCase):
             self.assertEqual(target.read_text(), "concurrent\n")
             self.assertFalse(any(item.name.endswith(".tmp") for item in workspace.iterdir()))
 
-    def test_workspace_write_preserves_commit_point_replacement(self):
+    def test_workspace_write_preserves_latest_replacement_without_rollback(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database, workspace, artifacts = self._fixture(root)
             target = workspace / "commit-race.txt"
             target.write_text("initial\n")
-            real_exchange = rooted_io._rename_exchange
+            original_write_all = rooted_io._write_all
             injected = False
 
-            def replace_at_commit(parent_fd: int, left: str, right: str) -> None:
+            def replace_path_twice(descriptor: int, content: bytes) -> None:
                 nonlocal injected
-                if not injected:
-                    replacement = workspace / "concurrent.txt"
-                    replacement.write_text("concurrent\n")
-                    os.replace(replacement, target)
-                    injected = True
-                real_exchange(parent_fd, left, right)
+                original_write_all(descriptor, content)
+                if injected:
+                    return
+                first = workspace / "concurrent-one.txt"
+                first.write_text("concurrent-one\n")
+                os.replace(first, target)
+                second = workspace / "concurrent-two.txt"
+                second.write_text("concurrent-two\n")
+                os.replace(second, target)
+                injected = True
 
             with self._open(database, workspace, artifacts) as operator:
                 operator.grant(
@@ -186,8 +190,8 @@ class H2ReliabilityReviewTests(unittest.TestCase):
                     resource_scope=("commit-race.txt",),
                 )
                 with patch(
-                    "ai_capital.product.rooted_io._rename_exchange",
-                    side_effect=replace_at_commit,
+                    "ai_capital.product.rooted_io._write_all",
+                    side_effect=replace_path_twice,
                 ):
                     result = operator.invoke(
                         program_id="p-1",
@@ -196,7 +200,8 @@ class H2ReliabilityReviewTests(unittest.TestCase):
                         arguments={"path": "commit-race.txt", "content": "authorized\n"},
                     )
             self.assertEqual(result["operation"]["execution_outcome"], "failed")
-            self.assertEqual(target.read_text(), "concurrent\n")
+            self.assertEqual(result["operation"]["effect_status"], "indeterminate")
+            self.assertEqual(target.read_text(), "concurrent-two\n")
             self.assertFalse(any(item.name.endswith(".tmp") for item in workspace.iterdir()))
 
     def test_approved_request_recovers_issued_authority_before_operation_after_restart(self):

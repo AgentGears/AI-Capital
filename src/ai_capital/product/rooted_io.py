@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ctypes
 import os
 from pathlib import Path, PurePosixPath
 import secrets
@@ -246,36 +245,6 @@ def _stat_identity(info: os.stat_result) -> tuple[int, int, int]:
     return int(info.st_dev), int(info.st_ino), int(info.st_mode)
 
 
-def _rename_exchange(parent_fd: int, left: str, right: str) -> None:
-    if os.name == "nt":
-        raise ExecutionFailure(
-            "atomic existing-target materialization is unavailable on this platform"
-        )
-    library = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(library, "renameat2", None)
-    if renameat2 is None:
-        raise ExecutionFailure(
-            "atomic existing-target materialization is unavailable on this platform"
-        )
-    renameat2.argtypes = [
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    ]
-    renameat2.restype = ctypes.c_int
-    if renameat2(
-        parent_fd,
-        os.fsencode(left),
-        parent_fd,
-        os.fsencode(right),
-        2,
-    ) != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
-
-
 def atomic_write(
     root: Path,
     target: str,
@@ -283,11 +252,18 @@ def atomic_write(
     *,
     expected_root_identity: tuple[int, int] | None = None,
 ) -> None:
+    """Materialize a rooted write without ever replacing an unvalidated concurrent target.
+
+    New targets commit with an atomic no-overwrite hard link. Existing targets are
+    pinned by descriptor and updated through that descriptor; a concurrent path
+    replacement therefore remains untouched and causes the Operation to fail
+    indeterminate at final verification rather than being exchanged or rolled back.
+    """
     root_fd, parent_fd, name = _open_parent(
         root, target, expected_root_identity=expected_root_identity
     )
-    temporary = f".{name}.{secrets.token_hex(12)}.tmp"
     descriptor: int | None = None
+    temporary: str | None = None
     temporary_owned = False
     try:
         try:
@@ -298,29 +274,25 @@ def atomic_write(
             raise InvalidRequest("capability target cannot be a symlink")
         if current is not None and not stat.S_ISREG(current.st_mode):
             raise InvalidRequest("capability target must be a regular file")
-        expected_target_identity = (
-            None if current is None else _stat_identity(current)
-        )
 
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_NOFOLLOW
-            | getattr(os, "O_BINARY", 0),
-            _PRIVATE_FILE_MODE,
-            dir_fd=parent_fd,
-        )
-        temporary_owned = True
-        _write_all(descriptor, content)
-        os.fchmod(descriptor, _PRIVATE_FILE_MODE)
-        os.fsync(descriptor)
-        temporary_identity = _stat_identity(os.fstat(descriptor))
-        os.close(descriptor)
-        descriptor = None
-
-        if expected_target_identity is None:
+        if current is None:
+            temporary = f".{name}.{secrets.token_hex(12)}.tmp"
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | getattr(os, "O_BINARY", 0),
+                _PRIVATE_FILE_MODE,
+                dir_fd=parent_fd,
+            )
+            temporary_owned = True
+            _write_all(descriptor, content)
+            os.fchmod(descriptor, _PRIVATE_FILE_MODE)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
             try:
                 os.link(
                     temporary,
@@ -338,54 +310,63 @@ def atomic_write(
             os.fsync(parent_fd)
             return
 
-        _rename_exchange(parent_fd, temporary, name)
-        temporary_owned = False
-        displaced = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
-        committed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        displaced_identity = _stat_identity(displaced)
-        committed_identity = _stat_identity(committed)
-        if (
-            displaced_identity == expected_target_identity
-            and committed_identity == temporary_identity
-        ):
-            os.unlink(temporary, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-            return
+        expected_identity = _stat_identity(current)
+        descriptor = os.open(
+            name,
+            os.O_RDWR
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_BINARY", 0),
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _stat_identity(opened) != expected_identity:
+            raise ExecutionFailure("capability target changed before rooted materialization")
 
-        # The atomic exchange preserves the displaced concurrent target at the
-        # temporary name. Roll back only while both exchange participants still
-        # have the identities captured immediately after the commit point.
-        rollback_target = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        rollback_displaced = os.stat(
-            temporary, dir_fd=parent_fd, follow_symlinks=False
-        )
+        before_write = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if (
-            _stat_identity(rollback_target) != committed_identity
-            or _stat_identity(rollback_displaced) != displaced_identity
+            stat.S_ISLNK(before_write.st_mode)
+            or not stat.S_ISREG(before_write.st_mode)
+            or _stat_identity(before_write) != expected_identity
         ):
-            raise ExecutionFailure(
-                "capability target changed during atomic materialization rollback"
-            )
-        _rename_exchange(parent_fd, temporary, name)
-        temporary_owned = True
-        restored = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        restored_temporary = os.stat(
-            temporary, dir_fd=parent_fd, follow_symlinks=False
+            raise ExecutionFailure("capability target changed before rooted materialization")
+
+        # From this point an interruption can leave an effect on the pinned inode;
+        # OperationHost therefore records any exception as indeterminate. Crucially,
+        # a later path replacement is never opened, renamed, unlinked, or overwritten.
+        os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        _write_all(descriptor, content)
+        os.fchmod(descriptor, _PRIVATE_FILE_MODE)
+        os.fsync(descriptor)
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        materialized = _read_bounded(descriptor, max_bytes=len(content))
+        verified = os.fstat(descriptor)
+        committed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        same_object = (
+            verified.st_dev == opened.st_dev
+            and verified.st_ino == opened.st_ino
+            and committed.st_dev == verified.st_dev
+            and committed.st_ino == verified.st_ino
         )
-        if (
-            _stat_identity(restored) != displaced_identity
-            or _stat_identity(restored_temporary) != committed_identity
-        ):
-            temporary_owned = False
+        stable_commit = (
+            same_object
+            and stat.S_ISREG(verified.st_mode)
+            and stat.S_ISREG(committed.st_mode)
+            and materialized == content
+            and verified.st_size == len(content)
+            and committed.st_size == verified.st_size
+            and committed.st_mtime_ns == verified.st_mtime_ns
+            and committed.st_ctime_ns == verified.st_ctime_ns
+            and stat.S_IMODE(verified.st_mode) == _PRIVATE_FILE_MODE
+            and stat.S_IMODE(committed.st_mode) == _PRIVATE_FILE_MODE
+        )
+        if not stable_commit:
             raise ExecutionFailure(
-                "capability target changed during atomic materialization rollback"
+                "capability target changed during rooted materialization commit"
             )
-        os.unlink(temporary, dir_fd=parent_fd)
-        temporary_owned = False
         os.fsync(parent_fd)
-        raise InvalidRequest(
-            "capability target changed at rooted materialization commit"
-        )
     except InvalidRequest:
         raise
     except ExecutionFailure:
@@ -400,14 +381,13 @@ def atomic_write(
                 os.close(descriptor)
             except OSError:
                 pass
-        if temporary_owned:
+        if temporary_owned and temporary is not None:
             try:
                 os.unlink(temporary, dir_fd=parent_fd)
             except OSError:
                 pass
         os.close(parent_fd)
         os.close(root_fd)
-
 
 def exclusive_create(
     root: Path,
