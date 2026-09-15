@@ -205,6 +205,35 @@ class H2ReliabilityRestartMatrixTests(unittest.TestCase):
                 "host_interrupted_after_dispatch_boundary",
             )
 
+    def test_restart_repairs_already_terminal_orphan_operation_link_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RestartFixture(directory, capability_id="workspace.write")
+            operation, authority = fixture.authorize("req-terminal-orphan")
+            fixture.authority.consume_execution_authority(receipt_id=authority.receipt_id)
+            fixture.journal.mark_admitted(operation.operation_id)
+            terminal = fixture.journal.fail_before_dispatch(
+                operation.operation_id,
+                error_code="fixture_terminal_before_dispatch",
+            )
+            self.assertIs(terminal.execution_outcome, ExecutionOutcome.FAILED)
+            database = fixture.database
+            fixture.close()
+
+            with LocalProgramOperator.open(database) as operator:
+                linked = operator._programs.get("p-1")
+                linked_revision = linked.revision
+                self.assertEqual(
+                    linked.operation_refs.count(operation.operation_id),
+                    1,
+                )
+            with LocalProgramOperator.open(database) as operator:
+                reopened = operator._programs.get("p-1")
+                self.assertEqual(reopened.revision, linked_revision)
+                self.assertEqual(
+                    reopened.operation_refs.count(operation.operation_id),
+                    1,
+                )
+
     def test_restart_running_mutation_surfaces_reconciliation_after_reopen(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = RestartFixture(directory, capability_id="workspace.write")

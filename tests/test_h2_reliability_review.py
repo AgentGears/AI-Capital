@@ -40,6 +40,91 @@ class H2ReliabilityReviewTests(unittest.TestCase):
     def _open(self, database: Path, workspace: Path, artifacts: Path):
         return LocalCapabilityOperator.open(database, workspace_root=workspace, artifact_root=artifacts)
 
+    def test_concurrent_duplicate_process_is_serialized_by_product_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            arguments = {"path": "concurrent.txt", "content": "once\n"}
+            contender_script = r"""
+import sys
+from pathlib import Path
+from ai_capital.kernel.errors import PersistenceConflict
+from ai_capital.product import LocalCapabilityOperator
+
+database, workspace, artifacts = (Path(value) for value in sys.argv[1:4])
+try:
+    with LocalCapabilityOperator.open(
+        database,
+        workspace_root=workspace,
+        artifact_root=artifacts,
+    ) as operator:
+        operator.invoke(
+            program_id="p-1",
+            actor_id="a-1",
+            capability_id="workspace.write",
+            arguments={"path": "concurrent.txt", "content": "once\n"},
+            request_id="req-concurrent-process",
+        )
+except PersistenceConflict:
+    raise SystemExit(0)
+raise SystemExit(9)
+"""
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    resource_scope=("concurrent.txt",),
+                )
+                contender = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        contender_script,
+                        str(database),
+                        str(workspace),
+                        str(artifacts),
+                    ],
+                    env=dict(os.environ),
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(
+                    contender.returncode,
+                    0,
+                    msg=f"stdout={contender.stdout!r} stderr={contender.stderr!r}",
+                )
+                first = operator.invoke(
+                    program_id="p-1",
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    arguments=arguments,
+                    request_id="req-concurrent-process",
+                )
+                operation_count = int(
+                    operator._programs._db.execute(
+                        "SELECT COUNT(*) FROM operation_projections"
+                    ).fetchone()[0]
+                )
+            with self._open(database, workspace, artifacts) as operator:
+                replay = operator.invoke(
+                    program_id="p-1",
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    arguments=arguments,
+                    request_id="req-concurrent-process",
+                )
+                replay_count = int(
+                    operator._programs._db.execute(
+                        "SELECT COUNT(*) FROM operation_projections"
+                    ).fetchone()[0]
+                )
+            self.assertEqual(first, replay)
+            self.assertEqual(operation_count, 1)
+            self.assertEqual(replay_count, 1)
+            self.assertEqual((workspace / "concurrent.txt").read_text(), "once\n")
+
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
     def test_workspace_read_rejects_fifo_without_blocking(self):
         with tempfile.TemporaryDirectory() as directory:
