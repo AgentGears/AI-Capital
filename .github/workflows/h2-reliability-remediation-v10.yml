@@ -22,6 +22,11 @@ jobs:
           git fetch origin h2-reliability-remediation-v10
           git show origin/h2-reliability-remediation-v10:.github/h2-reliability-remediation-v10.py > /tmp/h2-reliability-remediation-v10.py
           python /tmp/h2-reliability-remediation-v10.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/ai_capital/product/git_repository_guard.py')
+          path.write_text(path.read_text().rstrip() + '\n')
+          PY
       - name: Validate and push
         shell: bash
         run: |
