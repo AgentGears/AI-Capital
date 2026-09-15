@@ -20,6 +20,8 @@ class LocalProgramOperator:
         self._programs = programs
         self._controls = ProgramControlRepository(programs)
         self._operations = OperationJournal(programs)
+        if owns_repository:
+            self._operations.recover_interrupted()
         self._audit: LocalAuditOperator | None = None
         self._owns_repository = owns_repository
         self._closed = False

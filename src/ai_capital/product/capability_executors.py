@@ -19,7 +19,7 @@ from ..kernel.errors import AuthorityDenied, ExecutionFailure, ExecutionTimeout,
 from ..kernel.models import ResolvedEffect
 from ..kernel.operation_journal import ExecutionObservation
 from ..kernel.serialization import canonical_json
-from .git_repository_guard import validate_git_repository
+from .git_repository_guard import validate_git_directory_fd
 from .process_observation import run_bounded_process
 from .rooted_io import (
     atomic_write,
@@ -432,7 +432,6 @@ class ProductCapabilityExecutor:
             if not stat.S_ISDIR(os.fstat(repository_fd).st_mode):
                 raise InvalidRequest("git.observe target must be a directory")
             repository_path = descriptor_path(repository_fd)
-            validate_git_repository(Path(repository_path))
             try:
                 git_fd = os.open(
                     ".git",
@@ -441,6 +440,7 @@ class ProductCapabilityExecutor:
                 )
             except OSError as exc:
                 raise InvalidRequest("git.observe requires stable local Git metadata") from exc
+            validate_git_directory_fd(git_fd)
             git_path = descriptor_path(git_fd)
             operation = effect.parameters.get("operation")
             safe_git = [

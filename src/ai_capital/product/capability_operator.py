@@ -224,6 +224,8 @@ class LocalCapabilityOperator:
         )
         self._controls = ProgramControlRepository(programs)
         self._journal = OperationJournal(programs)
+        if owns_repository:
+            self._journal.recover_interrupted()
         self._host = OperationHost(self._journal, self._authority)
         self._requests = ProductRequestRepository(programs)
         if not binding_exists:

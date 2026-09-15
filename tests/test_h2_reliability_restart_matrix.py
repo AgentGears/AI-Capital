@@ -186,10 +186,9 @@ class H2ReliabilityRestartMatrixTests(unittest.TestCase):
             database = fixture.database
             fixture.close()
 
-            with ProgramRepository(database) as programs:
-                journal = OperationJournal(programs)
-                journal.recover_interrupted()
-                recovered = journal.get(operation.operation_id)
+            with LocalProgramOperator.open(database) as operator:
+                view = operator.show("p-1")
+                recovered = operator._operations.get(operation.operation_id)
             self.assertIs(recovered.execution_outcome, ExecutionOutcome.FAILED)
             self.assertIs(recovered.effect_status, EffectStatus.INDETERMINATE)
             self.assertIs(
@@ -197,8 +196,6 @@ class H2ReliabilityRestartMatrixTests(unittest.TestCase):
                 ReconciliationStatus.PENDING,
             )
 
-            with LocalProgramOperator.open(database) as operator:
-                view = operator.show("p-1")
             lifecycle = view["lifecycle"]
             self.assertEqual(lifecycle["execution_state"], "reconciling")
             self.assertEqual(

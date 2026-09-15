@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 import tempfile
 import time
@@ -10,9 +11,11 @@ from unittest.mock import patch
 from ai_capital.kernel.actor_store import ActorRepository
 from ai_capital.kernel.durable_program import ProgramRepository
 from ai_capital.kernel.enums import ProgramStatus
+from ai_capital.kernel.errors import ExecutionTimeout
 from ai_capital.kernel.models import Actor, Program
 from ai_capital.product import LocalCapabilityOperator, LocalProgramOperator
 from ai_capital.product import rooted_io
+from ai_capital.product.process_observation import run_bounded_process
 
 
 @unittest.skipIf(os.name == "nt", "descriptor-rooted reliability requires POSIX")
@@ -46,6 +49,61 @@ class H2ReliabilityReviewTests(unittest.TestCase):
             self.assertLess(elapsed, 2)
             self.assertEqual(result["operation"]["execution_outcome"], "failed")
             self.assertEqual(result["operation"]["effect_status"], "not_applicable")
+
+    def test_workspace_read_rejects_in_place_mutation_during_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            target = workspace / "changing.txt"
+            target.write_text("before\n")
+            real_read = rooted_io._read_bounded
+
+            def read_then_mutate(descriptor: int, *, max_bytes: int) -> bytes:
+                content = real_read(descriptor, max_bytes=max_bytes)
+                target.write_text("after!\n")
+                return content
+
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="workspace.read",
+                    resource_scope=("changing.txt",),
+                )
+                with patch(
+                    "ai_capital.product.rooted_io._read_bounded",
+                    side_effect=read_then_mutate,
+                ):
+                    result = operator.invoke(
+                        program_id="p-1",
+                        actor_id="a-1",
+                        capability_id="workspace.read",
+                        arguments={"path": "changing.txt"},
+                    )
+            self.assertEqual(result["operation"]["execution_outcome"], "failed")
+            self.assertEqual(result["operation"]["effect_status"], "not_applicable")
+
+    def test_timeout_kills_descendant_after_leader_exits(self):
+        child = (
+            "import signal,time;"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+            "time.sleep(10)"
+        )
+        leader = (
+            "import subprocess,sys,time;"
+            "subprocess.Popen([sys.executable,'-c',sys.argv[1]]);"
+            "time.sleep(10)"
+        )
+        started = time.monotonic()
+        with self.assertRaises(ExecutionTimeout):
+            run_bounded_process(
+                [sys.executable, "-c", leader, child],
+                executable=sys.executable,
+                cwd=Path.cwd(),
+                env=dict(os.environ),
+                timeout_seconds=0.1,
+                max_output_bytes=1024,
+            )
+        self.assertLess(time.monotonic() - started, 3)
 
     def test_workspace_root_swap_to_symlink_fails_closed(self):
         if not hasattr(os, "symlink"):
@@ -98,6 +156,44 @@ class H2ReliabilityReviewTests(unittest.TestCase):
                         actor_id="a-1",
                         capability_id="workspace.write",
                         arguments={"path": "race.txt", "content": "authorized\n"},
+                    )
+            self.assertEqual(result["operation"]["execution_outcome"], "failed")
+            self.assertEqual(target.read_text(), "concurrent\n")
+            self.assertFalse(any(item.name.endswith(".tmp") for item in workspace.iterdir()))
+
+    def test_workspace_write_preserves_commit_point_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            target = workspace / "commit-race.txt"
+            target.write_text("initial\n")
+            real_exchange = rooted_io._rename_exchange
+            injected = False
+
+            def replace_at_commit(parent_fd: int, left: str, right: str) -> None:
+                nonlocal injected
+                if not injected:
+                    replacement = workspace / "concurrent.txt"
+                    replacement.write_text("concurrent\n")
+                    os.replace(replacement, target)
+                    injected = True
+                real_exchange(parent_fd, left, right)
+
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    resource_scope=("commit-race.txt",),
+                )
+                with patch(
+                    "ai_capital.product.rooted_io._rename_exchange",
+                    side_effect=replace_at_commit,
+                ):
+                    result = operator.invoke(
+                        program_id="p-1",
+                        actor_id="a-1",
+                        capability_id="workspace.write",
+                        arguments={"path": "commit-race.txt", "content": "authorized\n"},
                     )
             self.assertEqual(result["operation"]["execution_outcome"], "failed")
             self.assertEqual(target.read_text(), "concurrent\n")
@@ -196,6 +292,14 @@ class H2ReliabilityReviewTests(unittest.TestCase):
             self.assertEqual(replay["operation"]["reconciliation_status"], "pending")
             self.assertEqual(count, 1)
             self.assertFalse((workspace / "approved.txt").exists())
+
+
+class H2WindowsQualificationTests(unittest.TestCase):
+    def test_root_identity_defers_unsupported_rooted_io_until_invocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(rooted_io.os, "name", "nt"):
+                self.assertIsNone(rooted_io.root_identity(root))
 
 
 if __name__ == "__main__":

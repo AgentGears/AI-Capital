@@ -24,32 +24,57 @@ class BoundedProcessResult:
     stderr: str
 
 
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        if os.name != "nt":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
+    if os.name == "nt":
+        if process.poll() is not None:
+            return
+        try:
             process.terminate()
-    except (OSError, ProcessLookupError):
-        pass
-    try:
-        process.wait(timeout=_TERMINATION_GRACE_SECONDS)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        if os.name != "nt":
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            process.wait(timeout=_TERMINATION_GRACE_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
             process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            process.wait(timeout=_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise ExecutionFailure("observation subprocess could not be terminated") from exc
+        return
+
+    process_group_id = process.pid
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
     except (OSError, ProcessLookupError):
         pass
-    try:
-        process.wait(timeout=_TERMINATION_GRACE_SECONDS)
-    except subprocess.TimeoutExpired as exc:
-        raise ExecutionFailure("observation subprocess could not be terminated") from exc
+    deadline = time.monotonic() + _TERMINATION_GRACE_SECONDS
+    while _process_group_exists(process_group_id) and time.monotonic() < deadline:
+        time.sleep(_POLL_SECONDS)
+    if _process_group_exists(process_group_id):
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    if process.poll() is None:
+        try:
+            process.wait(timeout=_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise ExecutionFailure("observation subprocess could not be terminated") from exc
 
 
 def run_bounded_process(
@@ -129,7 +154,11 @@ def run_bounded_process(
     deadline = time.monotonic() + timeout_seconds
     timed_out = False
     try:
-        while process.poll() is None:
+        while True:
+            leader_done = process.poll() is not None
+            readers_done = not stdout_reader.is_alive() and not stderr_reader.is_alive()
+            if leader_done and readers_done:
+                break
             if overflow.is_set():
                 _terminate_process_group(process)
                 break
@@ -139,7 +168,7 @@ def run_bounded_process(
                 break
             time.sleep(_POLL_SECONDS)
     finally:
-        if process.poll() is None:
+        if process.poll() is None or stdout_reader.is_alive() or stderr_reader.is_alive():
             _terminate_process_group(process)
         stdout_reader.join(timeout=_TERMINATION_GRACE_SECONDS)
         stderr_reader.join(timeout=_TERMINATION_GRACE_SECONDS)

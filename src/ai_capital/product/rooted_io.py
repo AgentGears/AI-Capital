@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 from pathlib import Path, PurePosixPath
 import secrets
@@ -22,7 +23,7 @@ def _require_platform_support() -> None:
         raise ExecutionFailure(
             "race-resistant rooted file operations are unavailable on this platform"
         )
-    required = (os.open, os.stat, os.unlink)
+    required = (os.open, os.stat, os.unlink, os.link)
     if any(function not in os.supports_dir_fd for function in required):
         raise ExecutionFailure(
             "race-resistant rooted file operations are unavailable on this platform"
@@ -70,7 +71,9 @@ def _open_root(
     return descriptor
 
 
-def root_identity(root: Path) -> tuple[int, int]:
+def root_identity(root: Path) -> tuple[int, int] | None:
+    if os.name == "nt":
+        return None
     descriptor = _open_root(root)
     try:
         info = os.fstat(descriptor)
@@ -159,6 +162,9 @@ def read_regular(
     )
     descriptor: int | None = None
     try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise InvalidRequest("capability observation target must be a regular file")
         descriptor = os.open(
             name,
             os.O_RDONLY
@@ -167,12 +173,31 @@ def read_regular(
             | getattr(os, "O_BINARY", 0),
             dir_fd=parent_fd,
         )
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            raise InvalidRequest("capability observation target must be a regular file")
-        if info.st_size > max_bytes:
+        opened_before = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_before.st_mode) or not _same_identity(
+            before, opened_before
+        ):
+            raise ExecutionFailure("capability file changed during rooted read")
+        if opened_before.st_size > max_bytes:
             raise ExecutionFailure("observation exceeds product byte limit")
-        return _read_bounded(descriptor, max_bytes=max_bytes)
+        content = _read_bounded(descriptor, max_bytes=max_bytes)
+        opened_after = os.fstat(descriptor)
+        after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISREG(after.st_mode)
+            or not _same_identity(opened_before, opened_after)
+            or not _same_identity(opened_after, after)
+            or opened_before.st_size != opened_after.st_size
+            or opened_before.st_mtime_ns != opened_after.st_mtime_ns
+            or opened_before.st_ctime_ns != opened_after.st_ctime_ns
+            or after.st_size != opened_after.st_size
+            or after.st_mtime_ns != opened_after.st_mtime_ns
+            or after.st_ctime_ns != opened_after.st_ctime_ns
+            or len(content) != opened_after.st_size
+        ):
+            raise ExecutionFailure("capability file changed during rooted read")
+        return content
     except FileNotFoundError as exc:
         raise InvalidRequest(f"capability path does not exist: {target}") from exc
     except OSError as exc:
@@ -217,6 +242,40 @@ def list_directory(
         os.close(root_fd)
 
 
+def _stat_identity(info: os.stat_result) -> tuple[int, int, int]:
+    return int(info.st_dev), int(info.st_ino), int(info.st_mode)
+
+
+def _rename_exchange(parent_fd: int, left: str, right: str) -> None:
+    if os.name == "nt":
+        raise ExecutionFailure(
+            "atomic existing-target materialization is unavailable on this platform"
+        )
+    library = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(library, "renameat2", None)
+    if renameat2 is None:
+        raise ExecutionFailure(
+            "atomic existing-target materialization is unavailable on this platform"
+        )
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        parent_fd,
+        os.fsencode(left),
+        parent_fd,
+        os.fsencode(right),
+        2,
+    ) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
 def atomic_write(
     root: Path,
     target: str,
@@ -229,70 +288,119 @@ def atomic_write(
     )
     temporary = f".{name}.{secrets.token_hex(12)}.tmp"
     descriptor: int | None = None
-    created = False
+    temporary_owned = False
     try:
         try:
             current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
             current = None
-        if current is not None and not stat.S_ISREG(current.st_mode):
-            raise InvalidRequest("capability target must be a regular file")
         if current is not None and stat.S_ISLNK(current.st_mode):
             raise InvalidRequest("capability target cannot be a symlink")
+        if current is not None and not stat.S_ISREG(current.st_mode):
+            raise InvalidRequest("capability target must be a regular file")
         expected_target_identity = (
-            None
-            if current is None
-            else (int(current.st_dev), int(current.st_ino), int(current.st_mode))
+            None if current is None else _stat_identity(current)
         )
 
         descriptor = os.open(
             temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0),
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_BINARY", 0),
             _PRIVATE_FILE_MODE,
             dir_fd=parent_fd,
         )
-        created = True
+        temporary_owned = True
         _write_all(descriptor, content)
         os.fchmod(descriptor, _PRIVATE_FILE_MODE)
         os.fsync(descriptor)
+        temporary_identity = _stat_identity(os.fstat(descriptor))
         os.close(descriptor)
         descriptor = None
-        try:
-            before_commit = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            before_commit = None
-        before_commit_identity = (
-            None
-            if before_commit is None
-            else (
-                int(before_commit.st_dev),
-                int(before_commit.st_ino),
-                int(before_commit.st_mode),
-            )
+
+        if expected_target_identity is None:
+            try:
+                os.link(
+                    temporary,
+                    name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise InvalidRequest(
+                    "capability target changed before rooted materialization commit"
+                ) from exc
+            os.unlink(temporary, dir_fd=parent_fd)
+            temporary_owned = False
+            os.fsync(parent_fd)
+            return
+
+        _rename_exchange(parent_fd, temporary, name)
+        temporary_owned = False
+        displaced = os.stat(temporary, dir_fd=parent_fd, follow_symlinks=False)
+        committed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        displaced_identity = _stat_identity(displaced)
+        committed_identity = _stat_identity(committed)
+        if (
+            displaced_identity == expected_target_identity
+            and committed_identity == temporary_identity
+        ):
+            os.unlink(temporary, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            return
+
+        # The atomic exchange preserves the displaced concurrent target at the
+        # temporary name. Roll back only while both exchange participants still
+        # have the identities captured immediately after the commit point.
+        rollback_target = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        rollback_displaced = os.stat(
+            temporary, dir_fd=parent_fd, follow_symlinks=False
         )
-        if before_commit_identity != expected_target_identity:
-            raise InvalidRequest(
-                "capability target changed before rooted materialization commit"
+        if (
+            _stat_identity(rollback_target) != committed_identity
+            or _stat_identity(rollback_displaced) != displaced_identity
+        ):
+            raise ExecutionFailure(
+                "capability target changed during atomic materialization rollback"
             )
-        os.replace(
-            temporary,
-            name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
+        _rename_exchange(parent_fd, temporary, name)
+        temporary_owned = True
+        restored = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        restored_temporary = os.stat(
+            temporary, dir_fd=parent_fd, follow_symlinks=False
         )
-        created = False
+        if (
+            _stat_identity(restored) != displaced_identity
+            or _stat_identity(restored_temporary) != committed_identity
+        ):
+            temporary_owned = False
+            raise ExecutionFailure(
+                "capability target changed during atomic materialization rollback"
+            )
+        os.unlink(temporary, dir_fd=parent_fd)
+        temporary_owned = False
         os.fsync(parent_fd)
+        raise InvalidRequest(
+            "capability target changed at rooted materialization commit"
+        )
     except InvalidRequest:
         raise
+    except ExecutionFailure:
+        raise
     except OSError as exc:
-        raise ExecutionFailure("capability write failed during rooted materialization") from exc
+        raise ExecutionFailure(
+            "capability write failed during rooted materialization"
+        ) from exc
     finally:
         if descriptor is not None:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
-        if created:
+        if temporary_owned:
             try:
                 os.unlink(temporary, dir_fd=parent_fd)
             except OSError:
