@@ -11,6 +11,7 @@ from ..kernel.operation_journal import OperationJournal
 from ..kernel.program_control import ProgramControl, ProgramControlRepository
 from ..kernel.serialization import to_canonical_data
 from .audit_operator import LocalAuditOperator
+from .reliability import link_durable_operations
 
 
 class LocalProgramOperator:
@@ -22,6 +23,7 @@ class LocalProgramOperator:
         self._operations = OperationJournal(programs)
         if owns_repository:
             self._operations.recover_interrupted()
+            link_durable_operations(programs, self._operations)
         self._audit: LocalAuditOperator | None = None
         self._owns_repository = owns_repository
         self._closed = False

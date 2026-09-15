@@ -25,7 +25,11 @@ from .capability_catalog import (
     install_product_capabilities,
 )
 from .capability_executors import ProductCapabilityExecutor
-from .reliability import ProductRequestRecord, ProductRequestRepository
+from .reliability import (
+    ProductRequestRecord,
+    ProductRequestRepository,
+    link_durable_operations,
+)
 from .rooted_io import root_identity
 
 
@@ -226,6 +230,7 @@ class LocalCapabilityOperator:
         self._journal = OperationJournal(programs)
         if owns_repository:
             self._journal.recover_interrupted()
+            link_durable_operations(programs, self._journal)
         self._host = OperationHost(self._journal, self._authority)
         self._requests = ProductRequestRepository(programs)
         if not binding_exists:

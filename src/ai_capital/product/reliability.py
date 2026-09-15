@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ..kernel.durable_program import ProgramRepository
 from ..kernel.errors import IntegrityViolation, InvalidRequest, PersistenceConflict
 from ..kernel.events import utc_now
+from ..kernel.models import Operation
+from ..kernel.operation_journal import OperationJournal
 from ..kernel.serialization import canonical_digest, canonical_json
 
 
@@ -276,3 +278,34 @@ class ProductRequestRepository:
             """
         ).fetchall()
         return tuple(self._decode(row) for row in rows)
+
+
+def link_durable_operations(
+    programs: ProgramRepository,
+    operations: OperationJournal,
+) -> tuple[Operation, ...]:
+    """Idempotently repair Program links for authenticated durable Operations."""
+    rows = programs._db.execute(
+        "SELECT operation_id FROM operation_projections ORDER BY operation_id"
+    ).fetchall()
+    linked: list[Operation] = []
+    for row in rows:
+        operation = operations.get(str(row["operation_id"]))
+        current = programs.get(operation.program_id)
+        if operation.operation_id in current.operation_refs:
+            continue
+        programs._commit_change(
+            program_id=current.program_id,
+            expected_revision=current.revision,
+            event_type="program.revised",
+            mutate=lambda program, operation_id=operation.operation_id: replace(
+                program,
+                revision=program.revision + 1,
+                operation_refs=program.operation_refs + (operation_id,),
+            ),
+            event_id=None,
+            occurred_at=None,
+            recorded_at=None,
+        )
+        linked.append(operation)
+    return tuple(linked)

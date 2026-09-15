@@ -18,6 +18,7 @@ from ai_capital.kernel.enums import (
     ProgramStatus,
     ReconciliationStatus,
 )
+from ai_capital.kernel.errors import PersistenceConflict
 from ai_capital.kernel.models import Actor, CapabilityRequest, Grant, Program
 from ai_capital.kernel.operation_journal import OperationJournal
 from ai_capital.product.program_operator import LocalProgramOperator
@@ -125,6 +126,34 @@ class H2ReliabilityRestartMatrixTests(unittest.TestCase):
             )
             self.assertEqual(receipt.error_code, "host_interrupted_before_admission")
 
+    def test_restart_before_admission_cannot_reuse_execution_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RestartFixture(directory, capability_id="workspace.write")
+            operation, authority = fixture.authorize("req-authority-once")
+            resolution = fixture.journal.resolution(operation.operation_id)
+            database = fixture.database
+            fixture.close()
+
+            with ProgramRepository(database) as programs:
+                journal = OperationJournal(programs)
+                journal.recover_interrupted()
+                with self.assertRaisesRegex(
+                    PersistenceConflict,
+                    "execution authority already has a durable Operation intent",
+                ):
+                    journal.create_intent(
+                        program_id="p-1",
+                        actor_id="a-1",
+                        resolution=resolution,
+                        authority_receipt_ref=authority.receipt_id,
+                    )
+                operation_count = int(
+                    programs._db.execute(
+                        "SELECT COUNT(*) FROM operation_projections"
+                    ).fetchone()[0]
+                )
+            self.assertEqual(operation_count, 1)
+
     def test_restart_after_admission_before_dispatch_records_absent_effect(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = RestartFixture(directory, capability_id="workspace.write")
@@ -189,6 +218,16 @@ class H2ReliabilityRestartMatrixTests(unittest.TestCase):
             with LocalProgramOperator.open(database) as operator:
                 view = operator.show("p-1")
                 recovered = operator._operations.get(operation.operation_id)
+                linked_program = operator._programs.get("p-1")
+                linked_revision = linked_program.revision
+                self.assertIn(operation.operation_id, linked_program.operation_refs)
+            with LocalProgramOperator.open(database) as operator:
+                reopened = operator._programs.get("p-1")
+                self.assertEqual(reopened.revision, linked_revision)
+                self.assertEqual(
+                    reopened.operation_refs.count(operation.operation_id),
+                    1,
+                )
             self.assertIs(recovered.execution_outcome, ExecutionOutcome.FAILED)
             self.assertIs(recovered.effect_status, EffectStatus.INDETERMINATE)
             self.assertIs(

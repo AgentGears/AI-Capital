@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 import tempfile
@@ -15,6 +17,9 @@ from ai_capital.kernel.errors import ExecutionTimeout
 from ai_capital.kernel.models import Actor, Program
 from ai_capital.product import LocalCapabilityOperator, LocalProgramOperator
 from ai_capital.product import rooted_io
+from ai_capital.product.git_repository_guard import (
+    validate_git_directory_fd as real_validate_git_directory_fd,
+)
 from ai_capital.product.process_observation import run_bounded_process
 
 
@@ -203,6 +208,56 @@ class H2ReliabilityReviewTests(unittest.TestCase):
             self.assertEqual(result["operation"]["effect_status"], "indeterminate")
             self.assertEqual(target.read_text(), "concurrent-two\n")
             self.assertFalse(any(item.name.endswith(".tmp") for item in workspace.iterdir()))
+
+    @unittest.skipIf(shutil.which("git") is None, "git is unavailable")
+    def test_git_observe_blocks_helper_added_after_metadata_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            (workspace / ".gitattributes").write_text("*.txt filter=late\n")
+            tracked = workspace / "tracked.txt"
+            tracked.write_text("base\n")
+            subprocess.run(
+                ["git", "add", ".gitattributes", "tracked.txt"],
+                cwd=workspace,
+                check=True,
+            )
+            tracked.write_text("changed\n")
+            sentinel = root / "helper-ran"
+            config = workspace / ".git" / "config"
+            validations = 0
+
+            def validate_then_mutate(descriptor: int) -> None:
+                nonlocal validations
+                validations += 1
+                real_validate_git_directory_fd(descriptor)
+                if validations == 1:
+                    with config.open("a", encoding="utf-8") as stream:
+                        stream.write(
+                            f'\n[filter "late"]\n\tclean = touch {sentinel}\n'
+                        )
+
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="git.observe",
+                    resource_scope=(".",),
+                )
+                with patch(
+                    "ai_capital.product.capability_executors.validate_git_directory_fd",
+                    side_effect=validate_then_mutate,
+                ):
+                    result = operator.invoke(
+                        program_id="p-1",
+                        actor_id="a-1",
+                        capability_id="git.observe",
+                        arguments={"path": ".", "operation": "diff"},
+                    )
+            self.assertGreaterEqual(validations, 2)
+            self.assertEqual(result["operation"]["execution_outcome"], "failed")
+            self.assertEqual(result["operation"]["effect_status"], "not_applicable")
+            self.assertFalse(sentinel.exists())
 
     def test_approved_request_recovers_issued_authority_before_operation_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:

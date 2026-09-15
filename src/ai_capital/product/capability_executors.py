@@ -445,6 +445,7 @@ class ProductCapabilityExecutor:
             operation = effect.parameters.get("operation")
             safe_git = [
                 "git",
+                "--no-pager",
                 f"--git-dir={git_path}",
                 f"--work-tree={repository_path}",
                 "-c",
@@ -460,11 +461,14 @@ class ProductCapabilityExecutor:
                     "status",
                     "--short",
                     "--branch",
+                    "--no-ahead-behind",
                     "--ignore-submodules=all",
                 ],
                 "diff": [
                     *safe_git,
-                    "diff",
+                    "diff-files",
+                    "--raw",
+                    "--no-renames",
                     "--no-ext-diff",
                     "--no-textconv",
                     "--ignore-submodules=all",
@@ -483,11 +487,18 @@ class ProductCapabilityExecutor:
                         "HOME": isolated_home,
                         "XDG_CONFIG_HOME": isolated_home,
                         "GIT_CONFIG_NOSYSTEM": "1",
+                        "GIT_CONFIG_SYSTEM": os.devnull,
+                        "GIT_CONFIG_GLOBAL": os.devnull,
                         "GIT_ATTR_NOSYSTEM": "1",
                         "GIT_PAGER": "",
                         "PAGER": "",
                         "GIT_OPTIONAL_LOCKS": "0",
                         "GIT_TERMINAL_PROMPT": "0",
+                        "GIT_NO_LAZY_FETCH": "1",
+                        "GIT_ALLOW_PROTOCOL": "",
+                        "GIT_PROTOCOL_FROM_USER": "0",
+                        "GIT_NO_REPLACE_OBJECTS": "1",
+                        "GIT_COMMON_DIR": git_path,
                     }
                 )
                 completed = run_bounded_process(
@@ -499,6 +510,7 @@ class ProductCapabilityExecutor:
                     max_output_bytes=_MAX_OBSERVATION_BYTES,
                     pass_fds=(root_fd, repository_fd, git_fd),
                 )
+                validate_git_directory_fd(git_fd)
         finally:
             if git_fd is not None:
                 close_descriptors(git_fd)

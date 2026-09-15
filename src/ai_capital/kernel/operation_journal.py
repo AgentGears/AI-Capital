@@ -31,7 +31,7 @@ from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "operation_journal"
-_COMPONENT_SCHEMA_VERSION = 3
+_COMPONENT_SCHEMA_VERSION = 4
 
 
 def _host_idempotency_key(
@@ -197,6 +197,12 @@ class OperationJournal:
                 )
                 self._host_store._db.execute(
                     """
+                    CREATE UNIQUE INDEX operations_authority_receipt
+                        ON operation_projections(authority_receipt_ref)
+                    """
+                )
+                self._host_store._db.execute(
+                    """
                     CREATE TABLE operation_receipts (
                         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                         receipt_id TEXT NOT NULL UNIQUE,
@@ -265,6 +271,32 @@ class OperationJournal:
                         requested_event_id TEXT NOT NULL UNIQUE,
                         binding_digest TEXT NOT NULL
                     )
+                    """
+                )
+                self._host_store._db.execute(
+                    "UPDATE component_schema SET version = ? WHERE component = ?",
+                    (3, _COMPONENT),
+                )
+                version = 3
+
+            if version == 3:
+                duplicate_authority = self._host_store._db.execute(
+                    """
+                    SELECT authority_receipt_ref
+                    FROM operation_projections
+                    GROUP BY authority_receipt_ref
+                    HAVING COUNT(*) > 1
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if duplicate_authority is not None:
+                    raise IntegrityViolation(
+                        "execution authority is bound to multiple Operation intents"
+                    )
+                self._host_store._db.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS operations_authority_receipt
+                        ON operation_projections(authority_receipt_ref)
                     """
                 )
                 self._host_store._db.execute(
@@ -540,6 +572,17 @@ class OperationJournal:
         validate_operation_semantics(operation)
         try:
             with self._host_store._transaction():
+                existing_authority = self._host_store._db.execute(
+                    """
+                    SELECT operation_id FROM operation_projections
+                    WHERE authority_receipt_ref = ? LIMIT 1
+                    """,
+                    (authority_receipt_ref,),
+                ).fetchone()
+                if existing_authority is not None:
+                    raise PersistenceConflict(
+                        "execution authority already has a durable Operation intent"
+                    )
                 event = self._append_event(
                     "operation.requested",
                     {"operation": operation, "resolution": resolution},
