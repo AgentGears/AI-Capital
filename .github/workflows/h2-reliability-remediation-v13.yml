@@ -1,0 +1,48 @@
+name: H2.7 rooted parent identity remediation v13
+
+on:
+  push:
+    branches:
+      - h2-reliability-remediation-v13
+
+permissions:
+  contents: write
+
+jobs:
+  remediate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: h2-reliability-hardening
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply rooted parent identity remediation
+        run: |
+          git fetch origin h2-reliability-remediation-v13
+          git show origin/h2-reliability-remediation-v13:.github/scripts/h2_reliability_remediation_v13.py > /tmp/h2_reliability_remediation_v13.py
+          python /tmp/h2_reliability_remediation_v13.py
+      - name: Install test runner
+        run: python -m pip install -q pytest
+      - name: Targeted rooted reliability regressions
+        run: |
+          PYTHONPATH=src python -m pytest -q \
+            tests/test_h2_reliability_review.py \
+            tests/test_h2_reliability_hardening.py \
+            tests/test_h2_product_capabilities.py \
+            tests/test_h2_product_capability_review.py \
+            tests/test_h2_product_capability_security.py \
+            tests/test_h2_git_observation_guard.py
+      - name: Diff and full suite
+        run: |
+          git diff --check
+          PYTHONPATH=src python -m pytest -q
+      - name: Commit qualified remediation
+        run: |
+          git config user.name "AI Capital Automation"
+          git config user.email "ai-capital@users.noreply.github.com"
+          git add src/ai_capital/product/rooted_io.py tests/test_h2_reliability_review.py
+          git commit -m "H2.7: verify rooted parent identity at commit"
+          git push origin HEAD:h2-reliability-hardening
