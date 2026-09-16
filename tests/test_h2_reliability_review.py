@@ -256,6 +256,53 @@ raise SystemExit(9)
             self.assertEqual(result["operation"]["execution_outcome"], "failed")
             self.assertEqual(result["operation"]["effect_status"], "not_applicable")
 
+    def test_workspace_read_rejects_relinked_inode_under_replaced_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            original_parent = workspace / "dir"
+            original_parent.mkdir()
+            target = original_parent / "value.txt"
+            target.write_text("stable\n")
+            pinned_parent = workspace / "pinned-dir"
+            real_read = rooted_io._read_bounded
+            injected = False
+
+            def read_then_reparent(descriptor: int, *, max_bytes: int) -> bytes:
+                nonlocal injected
+                content = real_read(descriptor, max_bytes=max_bytes)
+                if not injected:
+                    original_parent.rename(pinned_parent)
+                    original_parent.mkdir()
+                    os.link(pinned_parent / "value.txt", original_parent / "value.txt")
+                    injected = True
+                return content
+
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="workspace.read",
+                    resource_scope=("dir/value.txt",),
+                )
+                with patch(
+                    "ai_capital.product.rooted_io._read_bounded",
+                    side_effect=read_then_reparent,
+                ):
+                    result = operator.invoke(
+                        program_id="p-1",
+                        actor_id="a-1",
+                        capability_id="workspace.read",
+                        arguments={"path": "dir/value.txt"},
+                    )
+            self.assertEqual(result["operation"]["execution_outcome"], "failed")
+            self.assertEqual(result["operation"]["effect_status"], "not_applicable")
+            self.assertTrue(
+                os.path.samefile(
+                    pinned_parent / "value.txt",
+                    original_parent / "value.txt",
+                )
+            )
+
     def test_workspace_new_target_replacement_before_final_validation_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
