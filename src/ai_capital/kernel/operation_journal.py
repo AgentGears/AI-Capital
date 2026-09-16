@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Callable, Protocol
 from uuid import uuid4
 
 from .authority import AuthorityEngine
@@ -31,7 +31,7 @@ from .serialization import canonical_digest, canonical_json, to_canonical_data
 
 
 _COMPONENT = "operation_journal"
-_COMPONENT_SCHEMA_VERSION = 3
+_COMPONENT_SCHEMA_VERSION = 4
 
 
 def _host_idempotency_key(
@@ -197,6 +197,12 @@ class OperationJournal:
                 )
                 self._host_store._db.execute(
                     """
+                    CREATE UNIQUE INDEX operations_authority_receipt
+                        ON operation_projections(authority_receipt_ref)
+                    """
+                )
+                self._host_store._db.execute(
+                    """
                     CREATE TABLE operation_receipts (
                         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                         receipt_id TEXT NOT NULL UNIQUE,
@@ -265,6 +271,32 @@ class OperationJournal:
                         requested_event_id TEXT NOT NULL UNIQUE,
                         binding_digest TEXT NOT NULL
                     )
+                    """
+                )
+                self._host_store._db.execute(
+                    "UPDATE component_schema SET version = ? WHERE component = ?",
+                    (3, _COMPONENT),
+                )
+                version = 3
+
+            if version == 3:
+                duplicate_authority = self._host_store._db.execute(
+                    """
+                    SELECT authority_receipt_ref
+                    FROM operation_projections
+                    GROUP BY authority_receipt_ref
+                    HAVING COUNT(*) > 1
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if duplicate_authority is not None:
+                    raise IntegrityViolation(
+                        "execution authority is bound to multiple Operation intents"
+                    )
+                self._host_store._db.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS operations_authority_receipt
+                        ON operation_projections(authority_receipt_ref)
                     """
                 )
                 self._host_store._db.execute(
@@ -540,6 +572,17 @@ class OperationJournal:
         validate_operation_semantics(operation)
         try:
             with self._host_store._transaction():
+                existing_authority = self._host_store._db.execute(
+                    """
+                    SELECT operation_id FROM operation_projections
+                    WHERE authority_receipt_ref = ? LIMIT 1
+                    """,
+                    (authority_receipt_ref,),
+                ).fetchone()
+                if existing_authority is not None:
+                    raise PersistenceConflict(
+                        "execution authority already has a durable Operation intent"
+                    )
                 event = self._append_event(
                     "operation.requested",
                     {"operation": operation, "resolution": resolution},
@@ -772,6 +815,40 @@ class OperationJournal:
         updated = replace(
             current,
             execution_outcome=ExecutionOutcome.FAILED,
+            effect_status=effect_status,
+            reconciliation_status=ReconciliationStatus.NOT_REQUIRED,
+            finished_at=receipt.observed_at,
+            receipt_refs=current.receipt_refs + (receipt.receipt_id,),
+        )
+        return self._commit_projection(
+            previous=current,
+            updated=updated,
+            event_type="operation.finished",
+            receipt=receipt,
+            receipt_id=receipt.receipt_id,
+            receipt_type="execution",
+        )
+
+    def cancel_before_dispatch(self, operation_id: str, *, error_code: str) -> Operation:
+        current = self.get(operation_id)
+        if current.execution_outcome is not ExecutionOutcome.NOT_STARTED:
+            raise IntegrityViolation("pre-dispatch cancellation requires a not-started Operation")
+        resolution = self.resolution(operation_id)
+        effect_status = (
+            EffectStatus.NOT_APPLICABLE
+            if resolution.resolved_effect.effect_class is EffectClass.OBSERVE
+            else EffectStatus.ABSENT
+        )
+        observation = ExecutionObservation(
+            execution_outcome=ExecutionOutcome.CANCELLED,
+            effect_status=effect_status,
+            output={},
+            error_code=error_code,
+        )
+        receipt = self._execution_receipt(current, observation)
+        updated = replace(
+            current,
+            execution_outcome=ExecutionOutcome.CANCELLED,
             effect_status=effect_status,
             reconciliation_status=ReconciliationStatus.NOT_REQUIRED,
             finished_at=receipt.observed_at,
@@ -1033,6 +1110,7 @@ class OperationHost:
         resolution: CapabilityResolution,
         authority_receipt_id: str,
         executor: EffectExecutor,
+        before_dispatch: Callable[[], None] | None = None,
         idempotency_key: str | None = None,
     ) -> Operation:
         if idempotency_key is not None and not bool(
@@ -1069,6 +1147,20 @@ class OperationHost:
             raise
 
         self._journal.mark_admitted(operation.operation_id)
+        if before_dispatch is not None:
+            try:
+                before_dispatch()
+            except ExecutionCancelled:
+                return self._journal.cancel_before_dispatch(
+                    operation.operation_id,
+                    error_code="execution_cancelled_before_dispatch",
+                )
+            except Exception:
+                self._journal.fail_before_dispatch(
+                    operation.operation_id,
+                    error_code="pre_dispatch_check_failed",
+                )
+                raise
         running = self._journal.mark_running(operation.operation_id)
         effect = resolution.resolved_effect
         backend_idempotency_key = self._journal.idempotency_key(operation.operation_id)

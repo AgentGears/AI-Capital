@@ -12,8 +12,8 @@ from ..kernel.authority_store import AuthorityRepository
 from ..kernel.capability_broker import CapabilityBroker, CapabilityHandlerRegistry
 from ..kernel.capability_store import CapabilityRepository, capability_descriptor
 from ..kernel.durable_program import ProgramRepository
-from ..kernel.enums import AuthorityDecisionKind, ProgramStatus
-from ..kernel.errors import AuthorityDenied, InvalidRequest
+from ..kernel.enums import AuthorityDecisionKind, ExecutionOutcome, ProgramStatus
+from ..kernel.errors import AuthorityDenied, ExecutionCancelled, IntegrityViolation, InvalidRequest
 from ..kernel.events import utc_now
 from ..kernel.models import CapabilityRequest, Grant, Operation
 from ..kernel.operation_journal import OperationHost, OperationJournal
@@ -25,6 +25,12 @@ from .capability_catalog import (
     install_product_capabilities,
 )
 from .capability_executors import ProductCapabilityExecutor
+from .reliability import (
+    ProductRequestRecord,
+    ProductRequestRepository,
+    link_durable_operations,
+)
+from .rooted_io import root_identity
 
 
 _ROOT_BINDING_ID = "local-product-capability-roots-v1"
@@ -205,6 +211,8 @@ class LocalCapabilityOperator:
         )
         _prepare_capability_root(self._workspace_root)
         _prepare_capability_root(self._artifact_root)
+        self._workspace_root_identity = root_identity(self._workspace_root)
+        self._artifact_root_identity = root_identity(self._artifact_root)
 
         self._actors = ActorRepository(programs)
         self._capabilities = CapabilityRepository(programs)
@@ -220,7 +228,11 @@ class LocalCapabilityOperator:
         )
         self._controls = ProgramControlRepository(programs)
         self._journal = OperationJournal(programs)
+        if owns_repository:
+            self._journal.recover_interrupted()
+            link_durable_operations(programs, self._journal)
         self._host = OperationHost(self._journal, self._authority)
+        self._requests = ProductRequestRepository(programs)
         if not binding_exists:
             _persist_root_binding(
                 programs,
@@ -362,6 +374,146 @@ class LocalCapabilityOperator:
         if control.paused:
             raise AuthorityDenied("capability invocation is blocked while Program is paused")
 
+    def _require_dispatch_ready(self, program_id: str) -> None:
+        try:
+            self._require_program_ready(program_id)
+        except AuthorityDenied as exc:
+            raise ExecutionCancelled("Program is not runnable at dispatch boundary") from exc
+
+    @staticmethod
+    def _request_payload(
+        *,
+        program_id: str,
+        actor_id: str,
+        capability_id: str,
+        arguments: dict[str, object],
+    ) -> dict[str, Any]:
+        return {
+            "program_id": program_id,
+            "actor_id": actor_id,
+            "capability_id": capability_id,
+            "arguments": arguments,
+        }
+
+    @classmethod
+    def _request_payload_from_context(cls, context) -> dict[str, Any]:
+        resolution = to_canonical_data(context.resolution)
+        arguments = resolution.get("arguments")
+        if type(arguments) is not dict:
+            raise IntegrityViolation("AuthorityDecision request arguments are invalid")
+        return cls._request_payload(
+            program_id=context.program_id,
+            actor_id=context.actor_id,
+            capability_id=context.resolution.capability_id,
+            arguments=arguments,
+        )
+
+    def _decision_for_request(self, request_id: str):
+        matches = []
+        rows = self._programs._db.execute(
+            "SELECT decision_id FROM authority_decisions ORDER BY decision_id"
+        ).fetchall()
+        for row in rows:
+            context = self._authority_store.get_decision(str(row["decision_id"]))
+            if context.resolution.request_id == request_id:
+                matches.append(context)
+        if len(matches) > 1:
+            raise IntegrityViolation("product request maps to multiple Authority decisions")
+        return None if not matches else matches[0]
+
+    def _operation_for_request(self, request_id: str) -> Operation | None:
+        matches: list[Operation] = []
+        rows = self._programs._db.execute(
+            "SELECT operation_id FROM operation_projections ORDER BY operation_id"
+        ).fetchall()
+        for row in rows:
+            operation_id = str(row["operation_id"])
+            if self._journal.resolution(operation_id).request_id == request_id:
+                matches.append(self._journal.get(operation_id))
+        if len(matches) > 1:
+            raise IntegrityViolation("product request maps to multiple Operations")
+        return None if not matches else matches[0]
+
+    def _result_for_operation(self, operation: Operation, decision: object) -> dict[str, Any]:
+        program = self._link_operation(operation)
+        receipt = self._journal.execution_receipt(operation.operation_id)
+        resolution = self._journal.resolution(operation.operation_id)
+        return {
+            "state": "executed",
+            "decision": decision,
+            "resolution": to_canonical_data(resolution),
+            "operation": to_canonical_data(operation),
+            "execution_receipt": to_canonical_data(receipt),
+            "program_revision": program.revision,
+        }
+
+    def _recover_pending_request(self, record: ProductRequestRecord) -> dict[str, Any]:
+        request_id = record.request_id
+        context = (
+            self._authority_store.get_decision(record.decision_id)
+            if record.decision_id is not None
+            else self._decision_for_request(request_id)
+        )
+        if context is not None and record.decision_id is None:
+            record = self._requests.bind_decision(
+                request_id,
+                context.decision.decision_id,
+            )
+
+        operation = self._operation_for_request(request_id)
+        if operation is not None and operation.execution_outcome in {
+            ExecutionOutcome.NOT_STARTED,
+            ExecutionOutcome.RUNNING,
+        }:
+            self._journal.recover_interrupted()
+            operation = self._journal.get(operation.operation_id)
+
+        if operation is not None:
+            if context is None:
+                raise IntegrityViolation("Operation request lacks AuthorityDecision context")
+            result = self._result_for_operation(
+                operation,
+                to_canonical_data(context.decision),
+            )
+            return self._requests.complete(request_id, result).result or result
+
+        if context is not None:
+            issued_authority = self._authority_store.unconsumed_execution_authority_for_decision(
+                context.decision.decision_id
+            )
+            if issued_authority is not None:
+                self._require_program_ready(context.program_id)
+                return self._execute(
+                    program_id=context.program_id,
+                    resolution=context.resolution,
+                    authority_receipt_id=issued_authority.receipt_id,
+                    decision=to_canonical_data(context.decision),
+                )
+
+        if context is not None:
+            base = {
+                "decision": to_canonical_data(context.decision),
+                "resolution": to_canonical_data(context.resolution),
+            }
+            if context.decision.decision is AuthorityDecisionKind.DENY:
+                result = {**base, "state": "denied", "operation": None}
+            elif context.decision.decision is AuthorityDecisionKind.ASK:
+                result = {**base, "state": "approval_required", "operation": None}
+            else:
+                result = {
+                    **base,
+                    "state": "interrupted",
+                    "reason_code": "interrupted_before_operation_admission",
+                    "operation": None,
+                }
+        else:
+            result = {
+                "state": "interrupted",
+                "reason_code": "interrupted_before_authority_decision",
+                "operation": None,
+            }
+        return self._requests.complete(request_id, result).result or result
+
     def _resolve(
         self,
         *,
@@ -396,6 +548,43 @@ class LocalCapabilityOperator:
         capability_id = self._require_text(capability_id, field="capability_id")
         if type(arguments) is not dict:
             raise InvalidRequest("arguments must be an object")
+
+        payload: dict[str, Any] | None = None
+        if request_id is not None:
+            request_id = self._require_text(request_id, field="request_id")
+            payload = self._request_payload(
+                program_id=program_id,
+                actor_id=actor_id,
+                capability_id=capability_id,
+                arguments=arguments,
+            )
+            try:
+                prior = self._requests.get(request_id)
+            except InvalidRequest:
+                prior = None
+            if prior is not None:
+                record = self._requests.begin(request_id, payload)
+                if record.state == "completed":
+                    assert record.result is not None
+                    if record.result.get("state") == "approval_required":
+                        return self._recover_pending_request(record)
+                    return record.result
+                return self._recover_pending_request(record)
+
+            legacy = self._decision_for_request(request_id)
+            if legacy is not None:
+                legacy_payload = self._request_payload_from_context(legacy)
+                if payload != legacy_payload:
+                    raise InvalidRequest(
+                        "request_id is already bound to a different invocation payload"
+                    )
+                record = self._requests.begin(request_id, legacy_payload)
+                record = self._requests.bind_decision(
+                    request_id,
+                    legacy.decision.decision_id,
+                )
+                return self._recover_pending_request(record)
+
         self._require_program_ready(program_id)
         self._actors.get(actor_id)
         resolution = self._resolve(
@@ -403,27 +592,43 @@ class LocalCapabilityOperator:
             arguments=arguments,
             request_id=request_id,
         )
+        if request_id is not None:
+            assert payload is not None
+            self._requests.begin(request_id, payload)
+
         context = self._authority.decide(
             program_id=program_id,
             actor_id=actor_id,
             resolution=resolution,
         )
+        if request_id is not None:
+            self._requests.bind_decision(request_id, context.decision.decision_id)
         base = {
             "decision": to_canonical_data(context.decision),
             "resolution": to_canonical_data(resolution),
         }
         if context.decision.decision is AuthorityDecisionKind.DENY:
-            return {**base, "state": "denied", "operation": None}
+            result = {**base, "state": "denied", "operation": None}
+            if request_id is not None:
+                self._requests.complete(request_id, result)
+            return result
         if context.decision.decision is AuthorityDecisionKind.ASK:
-            return {**base, "state": "approval_required", "operation": None}
+            result = {**base, "state": "approval_required", "operation": None}
+            if request_id is not None:
+                self._requests.complete(request_id, result)
+            return result
         authority_receipt = self._authority.issue_execution_authority(
             decision_id=context.decision.decision_id,
         )
-        return self._execute(
+        result = self._execute(
+            program_id=program_id,
             resolution=resolution,
             authority_receipt_id=authority_receipt.receipt_id,
             decision=base["decision"],
         )
+        if request_id is not None:
+            self._requests.complete(request_id, result)
+        return result
 
     def execute_approved(
         self,
@@ -441,6 +646,7 @@ class LocalCapabilityOperator:
             approval_id=approval_id,
         )
         return self._execute(
+            program_id=context.program_id,
             resolution=context.resolution,
             authority_receipt_id=authority_receipt.receipt_id,
             decision=to_canonical_data(context.decision),
@@ -449,6 +655,7 @@ class LocalCapabilityOperator:
     def _execute(
         self,
         *,
+        program_id: str,
         resolution,
         authority_receipt_id: str,
         decision: object,
@@ -457,22 +664,25 @@ class LocalCapabilityOperator:
             resolution.capability_id,
             workspace_root=self._workspace_root,
             artifact_root=self._artifact_root,
+            workspace_root_identity=self._workspace_root_identity,
+            artifact_root_identity=self._artifact_root_identity,
         )
         operation = self._host.execute_authorized(
             resolution=resolution,
             authority_receipt_id=authority_receipt_id,
             executor=executor,
+            before_dispatch=lambda: self._require_dispatch_ready(program_id),
         )
-        program = self._link_operation(operation)
-        receipt = self._journal.execution_receipt(operation.operation_id)
-        return {
-            "state": "executed",
-            "decision": decision,
-            "resolution": to_canonical_data(resolution),
-            "operation": to_canonical_data(operation),
-            "execution_receipt": to_canonical_data(receipt),
-            "program_revision": program.revision,
-        }
+        result = self._result_for_operation(operation, decision)
+        try:
+            record = self._requests.get(resolution.request_id)
+        except InvalidRequest:
+            return result
+        decision_id = decision.get("decision_id") if type(decision) is dict else None
+        if record.decision_id != decision_id:
+            return result
+        completed = self._requests.complete(resolution.request_id, result)
+        return completed.result or result
 
     def _link_operation(self, operation: Operation):
         current = self._programs.get(operation.program_id)

@@ -184,7 +184,7 @@ class H2ProductCapabilitySecurityTests(unittest.TestCase):
                         resource_scope=("cat note.txt",),
                     )
                     with patch(
-                        "ai_capital.product.capability_executors.subprocess.run",
+                        "ai_capital.product.capability_executors.run_bounded_process",
                         return_value=completed,
                     ) as run:
                         result = operator.invoke(
@@ -199,7 +199,7 @@ class H2ProductCapabilitySecurityTests(unittest.TestCase):
             self.assertNotEqual(executable, fake.resolve())
             self.assertNotIn(workspace.resolve(), executable.parents)
             self.assertNotIn("PATH", run.call_args.kwargs["env"])
-            self.assertFalse(run.call_args.kwargs["shell"])
+            self.assertTrue(run.call_args.kwargs["pass_fds"])
 
     def test_git_observe_uses_trusted_executable_without_inherited_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -218,7 +218,7 @@ class H2ProductCapabilitySecurityTests(unittest.TestCase):
                         resource_scope=(".",),
                     )
                     with patch(
-                        "ai_capital.product.capability_executors.subprocess.run",
+                        "ai_capital.product.capability_executors.run_bounded_process",
                         return_value=completed,
                     ) as run:
                         result = operator.invoke(
@@ -233,7 +233,7 @@ class H2ProductCapabilitySecurityTests(unittest.TestCase):
             self.assertNotEqual(executable, fake.resolve())
             self.assertNotIn(workspace.resolve(), executable.parents)
             self.assertNotIn("PATH", run.call_args.kwargs["env"])
-            self.assertFalse(run.call_args.kwargs["shell"])
+            self.assertTrue(run.call_args.kwargs["pass_fds"])
 
     def test_command_observe_rejects_multiple_operands_under_wildcard_grant(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -250,7 +250,7 @@ class H2ProductCapabilitySecurityTests(unittest.TestCase):
                     resource_scope=("cat allowed/*",),
                 )
                 with patch(
-                    "ai_capital.product.capability_executors.subprocess.run"
+                    "ai_capital.product.capability_executors.run_bounded_process"
                 ) as run:
                     result = operator.invoke(
                         program_id="p-1",
