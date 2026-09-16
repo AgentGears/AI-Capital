@@ -22,8 +22,8 @@ jobs:
       - name: Apply rooted parent identity remediation
         run: |
           git fetch origin h2-reliability-remediation-v13
-          git show origin/h2-reliability-remediation-v13:.github/scripts/h2_reliability_remediation_v13.py > /tmp/h2_reliability_remediation_v13.py
-          python /tmp/h2_reliability_remediation_v13.py
+          git show origin/h2-reliability-remediation-v13:.github/scripts/h2_reliability_remediation_v13b.py > /tmp/h2_reliability_remediation_v13b.py
+          python /tmp/h2_reliability_remediation_v13b.py
       - name: Install test runner
         run: python -m pip install -q pytest
       - name: Targeted rooted reliability regressions
