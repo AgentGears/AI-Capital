@@ -123,6 +123,112 @@ def _open_parent(
     return root_fd, parent_fd, parts[-1]
 
 
+def _descriptor_identity(descriptor: int) -> os.stat_result:
+    try:
+        return os.fstat(descriptor)
+    except OSError as exc:
+        raise ExecutionFailure("capability path changed during rooted access") from exc
+
+
+def _validate_directory_binding(
+    root: Path,
+    parts: tuple[str, ...],
+    *,
+    root_fd: int,
+    directory_fd: int,
+    expected_root_identity: tuple[int, int] | None,
+) -> None:
+    current_root = _open_root(root, expected_identity=expected_root_identity)
+    current_directory: int | None = None
+    try:
+        if not _same_identity(
+            _descriptor_identity(root_fd),
+            _descriptor_identity(current_root),
+        ):
+            raise ExecutionFailure("capability root changed during rooted access")
+        current_directory = _open_directory_from(current_root, parts)
+        if not _same_identity(
+            _descriptor_identity(directory_fd),
+            _descriptor_identity(current_directory),
+        ):
+            raise ExecutionFailure("capability parent changed during rooted access")
+    finally:
+        if current_directory is not None:
+            os.close(current_directory)
+        os.close(current_root)
+
+
+def _validate_parent_binding(
+    root: Path,
+    target: str,
+    *,
+    root_fd: int,
+    parent_fd: int,
+    expected_root_identity: tuple[int, int] | None,
+) -> None:
+    parts = _parts(target)
+    if not parts:
+        raise InvalidRequest("capability file target cannot be the root")
+    _validate_directory_binding(
+        root,
+        parts[:-1],
+        root_fd=root_fd,
+        directory_fd=parent_fd,
+        expected_root_identity=expected_root_identity,
+    )
+
+
+def validate_pinned(
+    root: Path,
+    target: str,
+    *,
+    root_fd: int,
+    target_fd: int,
+    allow_directory: bool,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> None:
+    """Require the current rooted name to still identify the pinned target."""
+    current_root = _open_root(root, expected_identity=expected_root_identity)
+    parent_fd: int | None = None
+    current_target: int | None = None
+    try:
+        if not _same_identity(
+            _descriptor_identity(root_fd),
+            _descriptor_identity(current_root),
+        ):
+            raise ExecutionFailure("capability root changed during rooted access")
+        if target == ".":
+            current_target = os.dup(current_root)
+        else:
+            parts = _parts(target)
+            if not parts:
+                raise InvalidRequest("capability target is invalid")
+            parent_fd = _open_directory_from(current_root, parts[:-1])
+            flags = (
+                os.O_RDONLY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_BINARY", 0)
+            )
+            current_target = os.open(parts[-1], flags, dir_fd=parent_fd)
+        pinned = _descriptor_identity(target_fd)
+        current = _descriptor_identity(current_target)
+        admitted_type = stat.S_ISREG(current.st_mode) or (
+            allow_directory and stat.S_ISDIR(current.st_mode)
+        )
+        if not admitted_type or not _same_identity(pinned, current):
+            raise ExecutionFailure("capability target changed during rooted access")
+    except FileNotFoundError as exc:
+        raise ExecutionFailure("capability target changed during rooted access") from exc
+    except OSError as exc:
+        raise ExecutionFailure("capability target changed during rooted access") from exc
+    finally:
+        if current_target is not None:
+            os.close(current_target)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        os.close(current_root)
+
 def _write_all(descriptor: int, content: bytes) -> None:
     view = memoryview(content)
     while view:
@@ -147,6 +253,7 @@ def _read_bounded(descriptor: int, *, max_bytes: int) -> bytes:
         if len(content) > max_bytes:
             raise ExecutionFailure("observation exceeds product byte limit")
     return bytes(content)
+
 
 
 def read_regular(
@@ -196,6 +303,14 @@ def read_regular(
             or len(content) != opened_after.st_size
         ):
             raise ExecutionFailure("capability file changed during rooted read")
+        validate_pinned(
+            root,
+            target,
+            root_fd=root_fd,
+            target_fd=descriptor,
+            allow_directory=False,
+            expected_root_identity=expected_root_identity,
+        )
         return content
     except FileNotFoundError as exc:
         raise InvalidRequest(f"capability path does not exist: {target}") from exc
@@ -230,6 +345,13 @@ def list_directory(
             else:
                 kind, size = "special", 0
             entries.append({"name": name, "kind": kind, "byte_length": size})
+        _validate_directory_binding(
+            root,
+            _parts(target),
+            root_fd=root_fd,
+            directory_fd=directory_fd,
+            expected_root_identity=expected_root_identity,
+        )
         return entries
     except FileNotFoundError as exc:
         raise InvalidRequest(f"capability path does not exist: {target}") from exc
@@ -240,9 +362,9 @@ def list_directory(
             os.close(directory_fd)
         os.close(root_fd)
 
-
 def _stat_identity(info: os.stat_result) -> tuple[int, int, int]:
     return int(info.st_dev), int(info.st_ino), int(info.st_mode)
+
 
 
 def atomic_write(
@@ -252,13 +374,7 @@ def atomic_write(
     *,
     expected_root_identity: tuple[int, int] | None = None,
 ) -> None:
-    """Materialize a rooted write without ever replacing an unvalidated concurrent target.
-
-    New targets commit with an atomic no-overwrite hard link. Existing targets are
-    pinned by descriptor and updated through that descriptor; a concurrent path
-    replacement therefore remains untouched and causes the Operation to fail
-    indeterminate at final verification rather than being exchanged or rolled back.
-    """
+    """Materialize a rooted write while rejecting stale parent/final bindings."""
     root_fd, parent_fd, name = _open_parent(
         root, target, expected_root_identity=expected_root_identity
     )
@@ -266,6 +382,13 @@ def atomic_write(
     temporary: str | None = None
     temporary_owned = False
     try:
+        _validate_parent_binding(
+            root,
+            target,
+            root_fd=root_fd,
+            parent_fd=parent_fd,
+            expected_root_identity=expected_root_identity,
+        )
         try:
             current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -291,8 +414,13 @@ def atomic_write(
             _write_all(descriptor, content)
             os.fchmod(descriptor, _PRIVATE_FILE_MODE)
             os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = None
+            _validate_parent_binding(
+                root,
+                target,
+                root_fd=root_fd,
+                parent_fd=parent_fd,
+                expected_root_identity=expected_root_identity,
+            )
             try:
                 os.link(
                     temporary,
@@ -308,6 +436,14 @@ def atomic_write(
             os.unlink(temporary, dir_fd=parent_fd)
             temporary_owned = False
             os.fsync(parent_fd)
+            validate_pinned(
+                root,
+                target,
+                root_fd=root_fd,
+                target_fd=descriptor,
+                allow_directory=False,
+                expected_root_identity=expected_root_identity,
+            )
             return
 
         expected_identity = _stat_identity(current)
@@ -330,10 +466,17 @@ def atomic_write(
             or _stat_identity(before_write) != expected_identity
         ):
             raise ExecutionFailure("capability target changed before rooted materialization")
+        _validate_parent_binding(
+            root,
+            target,
+            root_fd=root_fd,
+            parent_fd=parent_fd,
+            expected_root_identity=expected_root_identity,
+        )
 
-        # From this point an interruption can leave an effect on the pinned inode;
-        # OperationHost therefore records any exception as indeterminate. Crucially,
-        # a later path replacement is never opened, renamed, unlinked, or overwritten.
+        # Mutation stays confined to the authorized inode. If its rooted name changes
+        # after this boundary, final validation rejects success rather than touching
+        # the replacement path.
         os.ftruncate(descriptor, 0)
         os.lseek(descriptor, 0, os.SEEK_SET)
         _write_all(descriptor, content)
@@ -367,6 +510,14 @@ def atomic_write(
                 "capability target changed during rooted materialization commit"
             )
         os.fsync(parent_fd)
+        validate_pinned(
+            root,
+            target,
+            root_fd=root_fd,
+            target_fd=descriptor,
+            allow_directory=False,
+            expected_root_identity=expected_root_identity,
+        )
     except InvalidRequest:
         raise
     except ExecutionFailure:
@@ -389,6 +540,7 @@ def atomic_write(
         os.close(parent_fd)
         os.close(root_fd)
 
+
 def exclusive_create(
     root: Path,
     target: str,
@@ -401,7 +553,16 @@ def exclusive_create(
     )
     descriptor: int | None = None
     created = False
+    committed = False
+    created_identity: tuple[int, int, int] | None = None
     try:
+        _validate_parent_binding(
+            root,
+            target,
+            root_fd=root_fd,
+            parent_fd=parent_fd,
+            expected_root_identity=expected_root_identity,
+        )
         descriptor = os.open(
             name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0),
@@ -409,25 +570,43 @@ def exclusive_create(
             dir_fd=parent_fd,
         )
         created = True
+        created_identity = _stat_identity(os.fstat(descriptor))
         _write_all(descriptor, content)
         os.fchmod(descriptor, _PRIVATE_FILE_MODE)
         os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
         os.fsync(parent_fd)
+        validate_pinned(
+            root,
+            target,
+            root_fd=root_fd,
+            target_fd=descriptor,
+            allow_directory=False,
+            expected_root_identity=expected_root_identity,
+        )
+        committed = True
     except FileExistsError as exc:
         raise InvalidRequest("capability create target already exists") from exc
+    except InvalidRequest:
+        raise
+    except ExecutionFailure:
+        raise
     except OSError as exc:
         raise ExecutionFailure("capability create failed during rooted materialization") from exc
     finally:
+        if created and not committed and created_identity is not None:
+            try:
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if _stat_identity(current) == created_identity:
+                    os.unlink(name, dir_fd=parent_fd)
+                    try:
+                        os.fsync(parent_fd)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
         if descriptor is not None:
             try:
                 os.close(descriptor)
-            except OSError:
-                pass
-        if created and descriptor is not None:
-            try:
-                os.unlink(name, dir_fd=parent_fd)
             except OSError:
                 pass
         os.close(parent_fd)
@@ -444,7 +623,16 @@ def open_pinned(
     """Return (root_fd, target_fd) pinned beneath root for subprocess observation."""
     root_fd = _open_root(root, expected_identity=expected_root_identity)
     if target == ".":
-        return root_fd, os.dup(root_fd)
+        target_fd = os.dup(root_fd)
+        validate_pinned(
+            root,
+            target,
+            root_fd=root_fd,
+            target_fd=target_fd,
+            allow_directory=True,
+            expected_root_identity=expected_root_identity,
+        )
+        return root_fd, target_fd
     parts = _parts(target)
     parent_fd: int | None = None
     target_fd: int | None = None
@@ -456,17 +644,27 @@ def open_pinned(
             | getattr(os, "O_NONBLOCK", 0)
             | getattr(os, "O_BINARY", 0)
         )
-        if allow_directory:
-            # Do not require O_DIRECTORY: stat decides whether regular or directory is admitted.
-            pass
         target_fd = os.open(parts[-1], flags, dir_fd=parent_fd)
         info = os.fstat(target_fd)
         if not stat.S_ISREG(info.st_mode) and not (
             allow_directory and stat.S_ISDIR(info.st_mode)
         ):
             raise InvalidRequest("command.observe target has unsupported file type")
+        validate_pinned(
+            root,
+            target,
+            root_fd=root_fd,
+            target_fd=target_fd,
+            allow_directory=allow_directory,
+            expected_root_identity=expected_root_identity,
+        )
         return root_fd, target_fd
     except InvalidRequest:
+        if target_fd is not None:
+            os.close(target_fd)
+        os.close(root_fd)
+        raise
+    except ExecutionFailure:
         if target_fd is not None:
             os.close(target_fd)
         os.close(root_fd)
@@ -479,7 +677,6 @@ def open_pinned(
     finally:
         if parent_fd is not None:
             os.close(parent_fd)
-
 
 def descriptor_path(descriptor: int) -> str:
     for root in (Path("/proc/self/fd"), Path("/dev/fd")):

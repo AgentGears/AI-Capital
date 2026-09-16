@@ -29,6 +29,7 @@ from .rooted_io import (
     list_directory,
     open_pinned,
     read_regular,
+    validate_pinned,
 )
 from .workspace_types import canonical_artifact_path
 
@@ -357,6 +358,14 @@ class ProductCapabilityExecutor:
                 max_output_bytes=_MAX_OBSERVATION_BYTES,
                 pass_fds=(root_fd, target_fd),
             )
+            validate_pinned(
+                self._workspace_root,
+                operand,
+                root_fd=root_fd,
+                target_fd=target_fd,
+                allow_directory=allow_directory,
+                expected_root_identity=self._workspace_root_identity,
+            )
         finally:
             close_descriptors(target_fd, root_fd)
         output = {
@@ -511,6 +520,14 @@ class ProductCapabilityExecutor:
                     pass_fds=(root_fd, repository_fd, git_fd),
                 )
                 validate_git_directory_fd(git_fd)
+                validate_pinned(
+                    self._workspace_root,
+                    target,
+                    root_fd=root_fd,
+                    target_fd=repository_fd,
+                    allow_directory=True,
+                    expected_root_identity=self._workspace_root_identity,
+                )
         finally:
             if git_fd is not None:
                 close_descriptors(git_fd)

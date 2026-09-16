@@ -405,9 +405,9 @@ class H2ReliabilityHardeningTests(unittest.TestCase):
                         capability_id="workspace.write",
                         arguments={"path": "dir/value.txt", "content": "pinned\n"},
                     )
-            self.assertEqual(result["operation"]["execution_outcome"], "succeeded")
+            self.assertEqual(result["operation"]["execution_outcome"], "failed")
             self.assertFalse((outside / "value.txt").exists())
-            self.assertEqual((pinned / "value.txt").read_text(), "pinned\n")
+            self.assertFalse((pinned / "value.txt").exists())
 
     def test_materialized_files_have_explicit_private_mode_and_no_temp_residue(self):
         with tempfile.TemporaryDirectory() as directory:

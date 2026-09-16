@@ -213,6 +213,124 @@ raise SystemExit(9)
             self.assertFalse((outside / "escape.txt").exists())
             self.assertFalse((pinned / "escape.txt").exists())
 
+    def test_workspace_read_rejects_parent_replacement_after_pin(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlinks unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            original_parent = workspace / "dir"
+            original_parent.mkdir()
+            (original_parent / "value.txt").write_text("stable\n")
+            pinned = workspace / "pinned-dir"
+            outside = root / "outside"
+            outside.mkdir()
+            real_open_parent = rooted_io._open_parent
+            swapped = False
+
+            def swap_after_pin(base: Path, target: str, **kwargs):
+                nonlocal swapped
+                result = real_open_parent(base, target, **kwargs)
+                if not swapped:
+                    original_parent.rename(pinned)
+                    original_parent.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+                return result
+
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="workspace.read",
+                    resource_scope=("dir/value.txt",),
+                )
+                with patch(
+                    "ai_capital.product.rooted_io._open_parent",
+                    side_effect=swap_after_pin,
+                ):
+                    result = operator.invoke(
+                        program_id="p-1",
+                        actor_id="a-1",
+                        capability_id="workspace.read",
+                        arguments={"path": "dir/value.txt"},
+                    )
+            self.assertEqual(result["operation"]["execution_outcome"], "failed")
+            self.assertEqual(result["operation"]["effect_status"], "not_applicable")
+
+    def test_workspace_new_target_replacement_before_final_validation_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            target = workspace / "new-race.txt"
+            original_validate = rooted_io.validate_pinned
+            injected = False
+
+            def replace_before_validation(*args, **kwargs):
+                nonlocal injected
+                if not injected and kwargs.get("target_fd") is not None:
+                    replacement = workspace / "replacement.txt"
+                    replacement.write_text("concurrent\n")
+                    os.replace(replacement, target)
+                    injected = True
+                return original_validate(*args, **kwargs)
+
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    resource_scope=("new-race.txt",),
+                )
+                with patch(
+                    "ai_capital.product.rooted_io.validate_pinned",
+                    side_effect=replace_before_validation,
+                ):
+                    result = operator.invoke(
+                        program_id="p-1",
+                        actor_id="a-1",
+                        capability_id="workspace.write",
+                        arguments={"path": "new-race.txt", "content": "authorized\n"},
+                    )
+            self.assertEqual(result["operation"]["execution_outcome"], "failed")
+            self.assertEqual(result["operation"]["effect_status"], "indeterminate")
+            self.assertEqual(target.read_text(), "concurrent\n")
+            self.assertFalse(any(item.name.endswith(".tmp") for item in workspace.iterdir()))
+
+    def test_artifact_create_replacement_before_final_validation_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            target = artifacts / "artifact-race.txt"
+            original_validate = rooted_io.validate_pinned
+            injected = False
+
+            def replace_before_validation(*args, **kwargs):
+                nonlocal injected
+                if not injected and kwargs.get("target_fd") is not None:
+                    replacement = artifacts / "replacement.txt"
+                    replacement.write_text("concurrent\n")
+                    os.replace(replacement, target)
+                    injected = True
+                return original_validate(*args, **kwargs)
+
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="artifact.write",
+                    resource_scope=("artifact-race.txt",),
+                )
+                with patch(
+                    "ai_capital.product.rooted_io.validate_pinned",
+                    side_effect=replace_before_validation,
+                ):
+                    result = operator.invoke(
+                        program_id="p-1",
+                        actor_id="a-1",
+                        capability_id="artifact.write",
+                        arguments={"path": "artifact-race.txt", "content": "authorized\n"},
+                    )
+            self.assertEqual(result["operation"]["execution_outcome"], "failed")
+            self.assertEqual(result["operation"]["effect_status"], "indeterminate")
+            self.assertEqual(target.read_text(), "concurrent\n")
+
     def test_workspace_write_rejects_final_component_replacement_before_commit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
