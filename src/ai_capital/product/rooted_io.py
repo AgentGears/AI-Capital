@@ -407,6 +407,10 @@ def atomic_write(
             raise InvalidRequest("capability target cannot be a symlink")
         if current is not None and not stat.S_ISREG(current.st_mode):
             raise InvalidRequest("capability target must be a regular file")
+        if current is not None and current.st_nlink != 1:
+            raise InvalidRequest(
+                "capability target with multiple hard links is not writable"
+            )
 
         if current is None:
             temporary = f".{name}.{secrets.token_hex(12)}.tmp"
@@ -470,7 +474,11 @@ def atomic_write(
             dir_fd=parent_fd,
         )
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or _stat_identity(opened) != expected_identity:
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _stat_identity(opened) != expected_identity
+            or opened.st_nlink != 1
+        ):
             raise ExecutionFailure("capability target changed before rooted materialization")
 
         before_write = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -478,6 +486,7 @@ def atomic_write(
             stat.S_ISLNK(before_write.st_mode)
             or not stat.S_ISREG(before_write.st_mode)
             or _stat_identity(before_write) != expected_identity
+            or before_write.st_nlink != 1
         ):
             raise ExecutionFailure("capability target changed before rooted materialization")
         _validate_parent_binding(
@@ -487,8 +496,15 @@ def atomic_write(
             parent_fd=parent_fd,
             expected_root_identity=expected_root_identity,
         )
+        pre_mutation = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(pre_mutation.st_mode)
+            or _stat_identity(pre_mutation) != expected_identity
+            or pre_mutation.st_nlink != 1
+        ):
+            raise ExecutionFailure("capability target changed before rooted materialization")
 
-        # Mutation stays confined to the authorized inode. If its rooted name changes
+        # Mutation stays confined to a single-link authorized inode. If its rooted name changes
         # after this boundary, final validation rejects success rather than touching
         # the replacement path.
         os.ftruncate(descriptor, 0)
@@ -511,6 +527,8 @@ def atomic_write(
             same_object
             and stat.S_ISREG(verified.st_mode)
             and stat.S_ISREG(committed.st_mode)
+            and verified.st_nlink == 1
+            and committed.st_nlink == 1
             and materialized == content
             and verified.st_size == len(content)
             and committed.st_size == verified.st_size

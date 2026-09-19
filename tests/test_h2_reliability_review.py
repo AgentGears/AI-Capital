@@ -378,6 +378,34 @@ raise SystemExit(9)
             self.assertEqual(result["operation"]["effect_status"], "indeterminate")
             self.assertEqual(target.read_text(), "concurrent\n")
 
+    def test_workspace_write_rejects_hard_link_alias_outside_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            outside = root / "outside.txt"
+            outside.write_text("outside\n")
+            target = workspace / "alias.txt"
+            os.link(outside, target)
+
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    resource_scope=("alias.txt",),
+                )
+                result = operator.invoke(
+                    program_id="p-1",
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    arguments={"path": "alias.txt", "content": "authorized\n"},
+                )
+
+            self.assertEqual(result["operation"]["execution_outcome"], "failed")
+            self.assertEqual(result["operation"]["effect_status"], "indeterminate")
+            self.assertEqual(outside.read_text(), "outside\n")
+            self.assertEqual(target.read_text(), "outside\n")
+            self.assertTrue(os.path.samefile(outside, target))
+
     def test_workspace_write_rejects_final_component_replacement_before_commit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
