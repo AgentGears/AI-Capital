@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 import hashlib
 import json
 import os
@@ -8,19 +9,28 @@ from pathlib import Path, PurePosixPath
 import shlex
 import shutil
 import stat
-import subprocess
 import tempfile
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from ..kernel.enums import EffectClass, EffectStatus, ExecutionOutcome
-from ..kernel.errors import ExecutionFailure, ExecutionTimeout, InvalidRequest
+from ..kernel.errors import AuthorityDenied, ExecutionFailure, ExecutionTimeout, InvalidRequest
 from ..kernel.models import ResolvedEffect
 from ..kernel.operation_journal import ExecutionObservation
 from ..kernel.serialization import canonical_json
-from .git_repository_guard import validate_git_repository
-from .workspace_capture import _read_stable_regular_file
+from .git_repository_guard import validate_git_directory_fd
+from .process_observation import run_bounded_process
+from .rooted_io import (
+    atomic_write,
+    close_descriptors,
+    descriptor_path,
+    exclusive_create,
+    list_directory,
+    open_pinned,
+    read_regular,
+    validate_pinned,
+)
 from .workspace_types import canonical_artifact_path
 
 
@@ -50,38 +60,6 @@ def _canonical_relative(value: str, *, allow_root: bool) -> str:
     if candidate.as_posix() != value:
         raise InvalidRequest("capability path is not canonical")
     return value
-
-
-def _safe_existing(root: Path, target: str, *, allow_root: bool = True) -> Path:
-    target = _canonical_relative(target, allow_root=allow_root)
-    root = root.resolve()
-    current = root
-    if target == ".":
-        return root
-    parts = PurePosixPath(target).parts
-    for index, part in enumerate(parts):
-        current = current / part
-        try:
-            info = os.lstat(current)
-        except OSError as exc:
-            raise InvalidRequest(f"capability path does not exist: {target}") from exc
-        if stat.S_ISLNK(info.st_mode):
-            raise InvalidRequest("capability path cannot traverse a symlink")
-        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
-            raise InvalidRequest("capability path parent is not a directory")
-    return current
-
-
-def _validate_command_target(path: Path, *, allow_directory: bool) -> None:
-    try:
-        info = os.lstat(path)
-    except OSError as exc:
-        raise InvalidRequest("command.observe target changed during validation") from exc
-    if stat.S_ISREG(info.st_mode):
-        return
-    if allow_directory and stat.S_ISDIR(info.st_mode):
-        return
-    raise InvalidRequest("command.observe target has unsupported file type")
 
 
 def _trusted_search_path(name: str) -> str:
@@ -128,90 +106,6 @@ def _inside(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
-def _safe_write_target(
-    root: Path,
-    target: str,
-    *,
-    artifact: bool = False,
-    create_only: bool = False,
-) -> Path:
-    target = canonical_artifact_path(target) if artifact else _canonical_relative(
-        target, allow_root=False
-    )
-    root = root.resolve()
-    candidate = root.joinpath(*PurePosixPath(target).parts)
-    parent_relative = PurePosixPath(target).parent.as_posix()
-    parent = root if parent_relative == "." else _safe_existing(root, parent_relative)
-    if not parent.is_dir():
-        raise InvalidRequest("capability target parent is not a directory")
-    if candidate.exists() or candidate.is_symlink():
-        if create_only:
-            raise InvalidRequest("capability create target already exists")
-        info = os.lstat(candidate)
-        if stat.S_ISLNK(info.st_mode):
-            raise InvalidRequest("capability target cannot be a symlink")
-        if not stat.S_ISREG(info.st_mode):
-            raise InvalidRequest("capability target must be a regular file")
-    return candidate
-
-
-def _atomic_write(path: Path, content: bytes) -> None:
-    temporary_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary:
-            temporary_name = temporary.name
-            temporary.write(content)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_name, path)
-        temporary_name = None
-    except OSError as exc:
-        raise ExecutionFailure("capability write failed") from exc
-    finally:
-        if temporary_name is not None:
-            try:
-                os.unlink(temporary_name)
-            except OSError:
-                pass
-
-
-def _exclusive_create(path: Path, content: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-    descriptor: int | None = None
-    completed = False
-    try:
-        descriptor = os.open(path, flags, 0o600)
-        view = memoryview(content)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("short artifact create write")
-            view = view[written:]
-        os.fsync(descriptor)
-        completed = True
-    except FileExistsError as exc:
-        raise InvalidRequest("capability create target already exists") from exc
-    except OSError as exc:
-        raise ExecutionFailure("capability create failed") from exc
-    finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        if descriptor is not None and not completed:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-
-
 def _success(
     output: dict[str, object],
     *,
@@ -238,6 +132,19 @@ def _failed(
     )
 
 
+def _cancelled_before_dispatch(effect: ResolvedEffect) -> ExecutionObservation:
+    return ExecutionObservation(
+        ExecutionOutcome.CANCELLED,
+        (
+            EffectStatus.NOT_APPLICABLE
+            if effect.effect_class is EffectClass.OBSERVE
+            else EffectStatus.ABSENT
+        ),
+        {},
+        error_code="program_not_runnable_before_dispatch",
+    )
+
+
 class ProductCapabilityExecutor:
     """Executes one already-authorized local product Capability."""
 
@@ -249,12 +156,18 @@ class ProductCapabilityExecutor:
         *,
         workspace_root: Path,
         artifact_root: Path,
+        workspace_root_identity: tuple[int, int] | None = None,
+        artifact_root_identity: tuple[int, int] | None = None,
+        before_dispatch: Callable[[], None] | None = None,
     ):
         self._capability_id = capability_id
-        self._workspace_root = workspace_root.resolve()
-        self._artifact_root = artifact_root.resolve()
-        self._workspace_root.mkdir(parents=True, exist_ok=True)
-        self._artifact_root.mkdir(parents=True, exist_ok=True)
+        self._workspace_root = Path(workspace_root)
+        self._artifact_root = Path(artifact_root)
+        if not self._workspace_root.is_absolute() or not self._artifact_root.is_absolute():
+            raise InvalidRequest("product capability roots must be absolute")
+        self._workspace_root_identity = workspace_root_identity
+        self._artifact_root_identity = artifact_root_identity
+        self._before_dispatch = before_dispatch
 
     def _trusted_executable(self, name: str) -> str:
         resolved = shutil.which(name, path=_trusted_search_path(name))
@@ -289,6 +202,11 @@ class ProductCapabilityExecutor:
     ) -> ExecutionObservation:
         if idempotency_key is not None:
             raise InvalidRequest("product capability executors do not accept idempotency keys")
+        if self._before_dispatch is not None:
+            try:
+                self._before_dispatch()
+            except AuthorityDenied:
+                return _cancelled_before_dispatch(effect)
         handlers = {
             "workspace.read": self._workspace_read,
             "workspace.list": self._workspace_list,
@@ -323,15 +241,20 @@ class ProductCapabilityExecutor:
             resource_type="workspace_path",
             effect_class=EffectClass.OBSERVE,
         )
-        path = _safe_existing(self._workspace_root, effect.target, allow_root=False)
-        content = _read_stable_regular_file(path, relative=effect.target)
+        target = _canonical_relative(effect.target, allow_root=False)
+        content = read_regular(
+            self._workspace_root,
+            target,
+            max_bytes=_MAX_OBSERVATION_BYTES,
+            expected_root_identity=self._workspace_root_identity,
+        )
         try:
             text = content.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ExecutionFailure("workspace.read requires UTF-8 text") from exc
         return _success(
             {
-                "path": effect.target,
+                "path": target,
                 "content": text,
                 "byte_length": len(content),
                 "sha256": hashlib.sha256(content).hexdigest(),
@@ -345,25 +268,13 @@ class ProductCapabilityExecutor:
             resource_type="workspace_path",
             effect_class=EffectClass.OBSERVE,
         )
-        path = _safe_existing(self._workspace_root, effect.target)
-        if not path.is_dir():
-            raise InvalidRequest("workspace.list target must be a directory")
-        entries: list[dict[str, object]] = []
-        try:
-            for child in sorted(path.iterdir(), key=lambda item: item.name):
-                info = os.lstat(child)
-                if stat.S_ISLNK(info.st_mode):
-                    kind, size = "symlink", 0
-                elif stat.S_ISDIR(info.st_mode):
-                    kind, size = "directory", 0
-                elif stat.S_ISREG(info.st_mode):
-                    kind, size = "file", int(info.st_size)
-                else:
-                    kind, size = "special", 0
-                entries.append({"name": child.name, "kind": kind, "byte_length": size})
-        except OSError as exc:
-            raise ExecutionFailure("workspace.list failed") from exc
-        return _success({"path": effect.target, "entries": entries}, observational=True)
+        target = _canonical_relative(effect.target, allow_root=True)
+        entries = list_directory(
+            self._workspace_root,
+            target,
+            expected_root_identity=self._workspace_root_identity,
+        )
+        return _success({"path": target, "entries": entries}, observational=True)
 
     def _workspace_write(self, effect: ResolvedEffect) -> ExecutionObservation:
         self._require_effect(
@@ -374,12 +285,17 @@ class ProductCapabilityExecutor:
         content = effect.parameters.get("content")
         if type(content) is not str:
             raise InvalidRequest("workspace.write content is invalid")
-        path = _safe_write_target(self._workspace_root, effect.target)
+        target = _canonical_relative(effect.target, allow_root=False)
         exact = content.encode("utf-8")
-        _atomic_write(path, exact)
+        atomic_write(
+            self._workspace_root,
+            target,
+            exact,
+            expected_root_identity=self._workspace_root_identity,
+        )
         return _success(
             {
-                "path": effect.target,
+                "path": target,
                 "byte_length": len(exact),
                 "sha256": hashlib.sha256(exact).hexdigest(),
             }
@@ -397,39 +313,61 @@ class ProductCapabilityExecutor:
         if command == "pwd":
             if operands:
                 raise InvalidRequest("pwd does not accept arguments in the product profile")
+            operand = "."
+            allow_directory = True
         elif command == "ls":
             if len(operands) > 1:
                 raise InvalidRequest("ls accepts at most one path in the product profile")
-            if operands:
-                if operands[0].startswith("-"):
-                    raise InvalidRequest("shell options are not admitted by the product profile")
-                target = _safe_existing(self._workspace_root, operands[0])
-                _validate_command_target(target, allow_directory=True)
+            operand = "." if not operands else operands[0]
+            if operand.startswith("-"):
+                raise InvalidRequest("shell options are not admitted by the product profile")
+            operand = _canonical_relative(operand, allow_root=True)
+            allow_directory = True
         else:
             if len(operands) != 1:
                 raise InvalidRequest(f"{command} accepts exactly one workspace path")
             operand = operands[0]
             if operand.startswith("-"):
                 raise InvalidRequest("shell options are not admitted by the product profile")
-            target = _safe_existing(self._workspace_root, operand, allow_root=False)
-            _validate_command_target(target, allow_directory=command == "stat")
-        executable = self._trusted_executable(command)
+            operand = _canonical_relative(operand, allow_root=False)
+            allow_directory = command == "stat"
+
+        root_fd, target_fd = open_pinned(
+            self._workspace_root,
+            operand,
+            allow_directory=allow_directory,
+            expected_root_identity=self._workspace_root_identity,
+        )
         try:
-            completed = subprocess.run(
-                parts,
-                cwd=self._workspace_root,
-                executable=executable,
-                shell=False,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=_COMMAND_TIMEOUT_SECONDS,
+            cwd = descriptor_path(root_fd)
+            target_path = descriptor_path(target_fd)
+            if command == "pwd":
+                argv = ["pwd"]
+            elif command == "ls" and not operands:
+                argv = ["ls", target_path]
+            elif command == "ls":
+                argv = ["ls", target_path]
+            else:
+                argv = [command, target_path]
+            completed = run_bounded_process(
+                argv,
+                cwd=cwd,
+                executable=self._trusted_executable(command),
                 env=self._process_environment(),
+                timeout_seconds=_COMMAND_TIMEOUT_SECONDS,
+                max_output_bytes=_MAX_OBSERVATION_BYTES,
+                pass_fds=(root_fd, target_fd),
             )
-        except subprocess.TimeoutExpired as exc:
-            raise ExecutionTimeout("read-only command timed out") from exc
-        except OSError as exc:
-            raise ExecutionFailure("read-only command could not be started") from exc
+            validate_pinned(
+                self._workspace_root,
+                operand,
+                root_fd=root_fd,
+                target_fd=target_fd,
+                allow_directory=allow_directory,
+                expected_root_identity=self._workspace_root_identity,
+            )
+        finally:
+            close_descriptors(target_fd, root_fd)
         output = {
             "command": effect.target,
             "returncode": completed.returncode,
@@ -491,68 +429,111 @@ class ProductCapabilityExecutor:
             resource_type="git_repository",
             effect_class=EffectClass.OBSERVE,
         )
-        repository = _safe_existing(self._workspace_root, effect.target)
-        if not repository.is_dir():
-            raise InvalidRequest("git.observe target must be a directory")
-        validate_git_repository(repository)
-        operation = effect.parameters.get("operation")
-        safe_git = [
-            "git",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "log.showSignature=false",
-            "-c",
-            "submodule.recurse=false",
-        ]
-        commands = {
-            "status": [*safe_git, "status", "--short", "--branch", "--ignore-submodules=all"],
-            "diff": [
-                *safe_git,
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--ignore-submodules=all",
-            ],
-            "log": [*safe_git, "log", "-n", "20", "--pretty=format:%H%x09%s"],
-        }
+        target = _canonical_relative(effect.target, allow_root=True)
+        root_fd, repository_fd = open_pinned(
+            self._workspace_root,
+            target,
+            allow_directory=True,
+            expected_root_identity=self._workspace_root_identity,
+        )
+        git_fd: int | None = None
         try:
-            argv = commands[operation]
-        except (KeyError, TypeError) as exc:
-            raise InvalidRequest("git.observe operation is invalid") from exc
-        executable = self._trusted_executable("git")
-        with tempfile.TemporaryDirectory(prefix="ai-capital-git-home-") as isolated_home:
-            environment = self._process_environment()
-            environment.update(
-                {
-                    "HOME": isolated_home,
-                    "XDG_CONFIG_HOME": isolated_home,
-                    "GIT_CONFIG_NOSYSTEM": "1",
-                    "GIT_ATTR_NOSYSTEM": "1",
-                    "GIT_PAGER": "",
-                    "PAGER": "",
-                    "GIT_OPTIONAL_LOCKS": "0",
-                    "GIT_TERMINAL_PROMPT": "0",
-                }
-            )
+            if not stat.S_ISDIR(os.fstat(repository_fd).st_mode):
+                raise InvalidRequest("git.observe target must be a directory")
+            repository_path = descriptor_path(repository_fd)
             try:
-                completed = subprocess.run(
-                    argv,
-                    cwd=repository,
-                    executable=executable,
-                    shell=False,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=_COMMAND_TIMEOUT_SECONDS,
-                    env=environment,
+                git_fd = os.open(
+                    ".git",
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=repository_fd,
                 )
-            except subprocess.TimeoutExpired as exc:
-                raise ExecutionTimeout("git observation timed out") from exc
             except OSError as exc:
-                raise ExecutionFailure("git observation could not be started") from exc
+                raise InvalidRequest("git.observe requires stable local Git metadata") from exc
+            validate_git_directory_fd(git_fd)
+            git_path = descriptor_path(git_fd)
+            operation = effect.parameters.get("operation")
+            safe_git = [
+                "git",
+                "--no-pager",
+                f"--git-dir={git_path}",
+                f"--work-tree={repository_path}",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "log.showSignature=false",
+                "-c",
+                "submodule.recurse=false",
+            ]
+            commands = {
+                "status": [
+                    *safe_git,
+                    "status",
+                    "--short",
+                    "--branch",
+                    "--no-ahead-behind",
+                    "--ignore-submodules=all",
+                ],
+                "diff": [
+                    *safe_git,
+                    "diff-files",
+                    "--raw",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--ignore-submodules=all",
+                ],
+                "log": [*safe_git, "log", "-n", "20", "--pretty=format:%H%x09%s"],
+            }
+            try:
+                argv = commands[operation]
+            except (KeyError, TypeError) as exc:
+                raise InvalidRequest("git.observe operation is invalid") from exc
+            executable = self._trusted_executable("git")
+            with tempfile.TemporaryDirectory(prefix="ai-capital-git-home-") as isolated_home:
+                environment = self._process_environment()
+                environment.update(
+                    {
+                        "HOME": isolated_home,
+                        "XDG_CONFIG_HOME": isolated_home,
+                        "GIT_CONFIG_NOSYSTEM": "1",
+                        "GIT_CONFIG_SYSTEM": os.devnull,
+                        "GIT_CONFIG_GLOBAL": os.devnull,
+                        "GIT_ATTR_NOSYSTEM": "1",
+                        "GIT_PAGER": "",
+                        "PAGER": "",
+                        "GIT_OPTIONAL_LOCKS": "0",
+                        "GIT_TERMINAL_PROMPT": "0",
+                        "GIT_NO_LAZY_FETCH": "1",
+                        "GIT_ALLOW_PROTOCOL": "",
+                        "GIT_PROTOCOL_FROM_USER": "0",
+                        "GIT_NO_REPLACE_OBJECTS": "1",
+                        "GIT_COMMON_DIR": git_path,
+                    }
+                )
+                completed = run_bounded_process(
+                    argv,
+                    cwd=repository_path,
+                    executable=executable,
+                    env=environment,
+                    timeout_seconds=_COMMAND_TIMEOUT_SECONDS,
+                    max_output_bytes=_MAX_OBSERVATION_BYTES,
+                    pass_fds=(root_fd, repository_fd, git_fd),
+                )
+                validate_git_directory_fd(git_fd)
+                validate_pinned(
+                    self._workspace_root,
+                    target,
+                    root_fd=root_fd,
+                    target_fd=repository_fd,
+                    allow_directory=True,
+                    expected_root_identity=self._workspace_root_identity,
+                )
+        finally:
+            if git_fd is not None:
+                close_descriptors(git_fd)
+            close_descriptors(repository_fd, root_fd)
         output = {
-            "path": effect.target,
+            "path": target,
             "operation": operation,
             "returncode": completed.returncode,
             "stdout": completed.stdout,
@@ -570,8 +551,13 @@ class ProductCapabilityExecutor:
             resource_type="structured_data_path",
             effect_class=EffectClass.OBSERVE,
         )
-        path = _safe_existing(self._workspace_root, effect.target, allow_root=False)
-        exact = _read_stable_regular_file(path, relative=effect.target)
+        target = _canonical_relative(effect.target, allow_root=False)
+        exact = read_regular(
+            self._workspace_root,
+            target,
+            max_bytes=_MAX_OBSERVATION_BYTES,
+            expected_root_identity=self._workspace_root_identity,
+        )
         try:
             canonical = canonical_json(json.loads(exact.decode("utf-8")))
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -579,7 +565,7 @@ class ProductCapabilityExecutor:
         canonical_bytes = canonical.encode("utf-8")
         return _success(
             {
-                "path": effect.target,
+                "path": target,
                 "canonical_json": canonical,
                 "byte_length": len(canonical_bytes),
                 "sha256": hashlib.sha256(canonical_bytes).hexdigest(),
@@ -601,11 +587,16 @@ class ProductCapabilityExecutor:
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise InvalidRequest("structured.json.write requires valid finite JSON") from exc
         exact = canonical.encode("utf-8")
-        path = _safe_write_target(self._workspace_root, effect.target)
-        _atomic_write(path, exact)
+        target = _canonical_relative(effect.target, allow_root=False)
+        atomic_write(
+            self._workspace_root,
+            target,
+            exact,
+            expected_root_identity=self._workspace_root_identity,
+        )
         return _success(
             {
-                "path": effect.target,
+                "path": target,
                 "canonical_json": canonical,
                 "byte_length": len(exact),
                 "sha256": hashlib.sha256(exact).hexdigest(),
@@ -621,17 +612,17 @@ class ProductCapabilityExecutor:
         content = effect.parameters.get("content")
         if type(content) is not str:
             raise InvalidRequest("artifact.write content is invalid")
-        path = _safe_write_target(
-            self._artifact_root,
-            effect.target,
-            artifact=True,
-            create_only=True,
-        )
+        target = canonical_artifact_path(effect.target)
         exact = content.encode("utf-8")
-        _exclusive_create(path, exact)
+        exclusive_create(
+            self._artifact_root,
+            target,
+            exact,
+            expected_root_identity=self._artifact_root_identity,
+        )
         return _success(
             {
-                "path": effect.target,
+                "path": target,
                 "byte_length": len(exact),
                 "sha256": hashlib.sha256(exact).hexdigest(),
             }

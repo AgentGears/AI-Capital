@@ -507,6 +507,49 @@ class AuthorityRepository:
         self._validate_receipt_context_binding(receipt, context)
         return receipt
 
+    def unconsumed_execution_authority_for_decision(
+        self,
+        decision_id: str,
+    ) -> ExecutionAuthorityReceipt | None:
+        if type(decision_id) is not str or not decision_id.strip():
+            raise InvalidRequest("decision_id must be non-empty")
+        rows = self._host_store._db.execute(
+            """
+            SELECT receipt_id, single_use_identity, receipt_json, receipt_digest, consumed_at
+            FROM execution_authority_receipts ORDER BY receipt_id
+            """
+        ).fetchall()
+        match: ExecutionAuthorityReceipt | None = None
+        match_consumed = False
+        found = 0
+        for row in rows:
+            try:
+                receipt = record_from_json(ExecutionAuthorityReceipt, row["receipt_json"])
+            except (TypeError, ValueError) as exc:
+                raise IntegrityViolation("execution authority cannot be decoded") from exc
+            if not isinstance(receipt, ExecutionAuthorityReceipt):
+                raise IntegrityViolation("decoded execution authority has wrong type")
+            if receipt.receipt_id != row["receipt_id"]:
+                raise IntegrityViolation("execution authority row identity mismatch")
+            if receipt.single_use_identity != row["single_use_identity"]:
+                raise IntegrityViolation("execution authority single-use identity mismatch")
+            if canonical_digest(receipt) != row["receipt_digest"]:
+                raise IntegrityViolation("execution authority digest mismatch")
+            context = self.get_decision(receipt.decision_id)
+            self._validate_receipt_context_binding(receipt, context)
+            if receipt.decision_id != decision_id:
+                continue
+            found += 1
+            if found > 1:
+                raise IntegrityViolation(
+                    "AuthorityDecision maps to multiple execution-authority receipts"
+                )
+            match = receipt
+            match_consumed = row["consumed_at"] is not None
+        if match is None or match_consumed:
+            return None
+        return match
+
     def consume_execution_authority(self, receipt_id: str) -> None:
         with self._host_store._transaction():
             receipt = self.get_execution_authority(receipt_id)

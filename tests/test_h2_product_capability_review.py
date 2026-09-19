@@ -13,6 +13,7 @@ from ai_capital.kernel.enums import ProgramStatus
 from ai_capital.kernel.errors import InvalidRequest
 from ai_capital.kernel.models import Actor, Program
 from ai_capital.product import LocalCapabilityOperator
+from ai_capital.product.git_repository_guard import validate_git_directory_fd as real_validate_git_directory_fd
 
 
 class H2ProductCapabilityReviewTests(unittest.TestCase):
@@ -83,7 +84,7 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
                         resource_scope=(".",),
                     )
                     with patch(
-                        "ai_capital.product.capability_executors.subprocess.run",
+                        "ai_capital.product.capability_executors.run_bounded_process",
                         return_value=completed,
                     ) as run:
                         result = operator.invoke(
@@ -101,11 +102,65 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
             self.assertIn("--no-ext-diff", argv)
             self.assertIn("--no-textconv", argv)
             self.assertIn("--ignore-submodules=all", argv)
-            self.assertFalse(run.call_args.kwargs["shell"])
             environment = run.call_args.kwargs["env"]
             self.assertNotIn("GIT_DIR", environment)
             self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
             self.assertEqual(environment["HOME"], environment["XDG_CONFIG_HOME"])
+            self.assertTrue(Path(run.call_args.kwargs["executable"]).is_absolute())
+            self.assertEqual(run.call_args.kwargs["max_output_bytes"], 1024 * 1024)
+            self.assertTrue(run.call_args.kwargs["pass_fds"])
+
+    @unittest.skipIf(os.name == "nt", "descriptor-backed Git pinning requires rooted descriptors")
+    def test_git_observe_pins_git_directory_before_validation_race(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            self._minimal_git_dir(workspace)
+            pinned_git = workspace / ".git-pinned"
+            swapped = False
+
+            def validate_then_swap(descriptor: int) -> None:
+                nonlocal swapped
+                real_validate_git_directory_fd(descriptor)
+                if not swapped:
+                    (workspace / ".git").rename(pinned_git)
+                    replacement = workspace / ".git"
+                    replacement.mkdir()
+                    (replacement / "config").write_text(
+                        "[filter \"replacement-driver\"]\n\tclean = cat\n"
+                    )
+                    swapped = True
+
+            completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def observe(argv, **kwargs):
+                git_dir_argument = next(
+                    item for item in argv if item.startswith("--git-dir=")
+                )
+                pinned_path = Path(git_dir_argument.split("=", 1)[1])
+                self.assertTrue(os.path.samefile(pinned_path, pinned_git))
+                return completed
+
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="git.observe",
+                    resource_scope=(".",),
+                )
+                with patch(
+                    "ai_capital.product.capability_executors.validate_git_directory_fd",
+                    side_effect=validate_then_swap,
+                ), patch(
+                    "ai_capital.product.capability_executors.run_bounded_process",
+                    side_effect=observe,
+                ):
+                    result = operator.invoke(
+                        program_id="p-1",
+                        actor_id="a-1",
+                        capability_id="git.observe",
+                        arguments={"path": ".", "operation": "status"},
+                    )
+            self.assertEqual(result["operation"]["execution_outcome"], "succeeded")
 
     def test_git_observe_rejects_repository_filter_configuration_before_subprocess(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -125,7 +180,7 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
                     resource_scope=(".",),
                 )
                 with patch(
-                    "ai_capital.product.capability_executors.subprocess.run"
+                    "ai_capital.product.capability_executors.run_bounded_process"
                 ) as run:
                     result = operator.invoke(
                         program_id="p-1",
@@ -164,7 +219,7 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
                             resource_scope=(".",),
                         )
                         with patch(
-                            "ai_capital.product.capability_executors.subprocess.run"
+                            "ai_capital.product.capability_executors.run_bounded_process"
                         ) as run:
                             result = operator.invoke(
                                 program_id="p-1",
@@ -237,7 +292,7 @@ class H2ProductCapabilityReviewTests(unittest.TestCase):
                     resource_scope=("cat pipe",),
                 )
                 with patch(
-                    "ai_capital.product.capability_executors.subprocess.run"
+                    "ai_capital.product.capability_executors.run_bounded_process"
                 ) as run:
                     result = operator.invoke(
                         program_id="p-1",
