@@ -406,6 +406,47 @@ raise SystemExit(9)
             self.assertEqual(target.read_text(), "outside\n")
             self.assertTrue(os.path.samefile(outside, target))
 
+    def test_workspace_write_detaches_alias_created_at_commit_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            target = workspace / "alias-race.txt"
+            target.write_text("initial\n")
+            outside = root / "outside-race.txt"
+            real_claim = rooted_io._claim_existing_target
+            injected = False
+
+            def link_then_claim(parent_fd: int, name: str, displaced: str) -> None:
+                nonlocal injected
+                if not injected:
+                    os.link(target, outside)
+                    injected = True
+                real_claim(parent_fd, name, displaced)
+
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    resource_scope=("alias-race.txt",),
+                )
+                with patch(
+                    "ai_capital.product.rooted_io._claim_existing_target",
+                    side_effect=link_then_claim,
+                ):
+                    result = operator.invoke(
+                        program_id="p-1",
+                        actor_id="a-1",
+                        capability_id="workspace.write",
+                        arguments={"path": "alias-race.txt", "content": "authorized\n"},
+                    )
+
+            self.assertTrue(injected)
+            self.assertEqual(result["operation"]["execution_outcome"], "succeeded")
+            self.assertEqual(result["operation"]["effect_status"], "confirmed")
+            self.assertEqual(target.read_text(), "authorized\n")
+            self.assertEqual(outside.read_text(), "initial\n")
+            self.assertFalse(os.path.samefile(outside, target))
+
     def test_workspace_write_rejects_final_component_replacement_before_commit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
