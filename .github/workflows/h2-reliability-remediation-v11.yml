@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   remediate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -170,19 +170,31 @@ jobs:
           test_path.write_text(tests)
           PY
 
+      - name: Install test runner
+        run: python -m pip install pytest
+
       - name: Diff check
         run: git diff --check
 
-      - name: Targeted H2.7 review tests
-        run: PYTHONPATH=src pytest -q tests/test_h2_reliability_review.py
+      - name: Focused H2.7 reliability gate
+        run: |
+          PYTHONPATH=src python -m pytest -q \
+            tests/test_h2_reliability_review.py \
+            tests/test_h2_reliability_hardening.py \
+            tests/test_h2_reliability_restart_matrix.py \
+            tests/test_h2_product_capability_review.py \
+            tests/test_h2_product_capability_security.py \
+            tests/test_h2_git_observation_guard.py \
+            tests/test_h2_product_capabilities.py \
+            tests/test_k5_operation_journal.py
 
       - name: Full suite
-        run: PYTHONPATH=src pytest -q
+        run: PYTHONPATH=src python -m pytest -q
 
       - name: Commit and push green remediation
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "AI Capital Maintainer"
+          git config user.email "55954113+Alajmah@users.noreply.github.com"
           git add src/ai_capital/product/rooted_io.py tests/test_h2_reliability_review.py
           git commit -m "H2.7: reject multiply linked write targets"
           git push origin HEAD:h2-reliability-hardening --force-with-lease=refs/heads/h2-reliability-hardening:fcdf76dbe8c8432cd6dcfeb4abed3273d44d89eb
