@@ -1,0 +1,184 @@
+name: H2.7 reliability remediation v11
+
+on:
+  push:
+    branches:
+      - h2-reliability-remediation-v11
+    paths:
+      - .github/workflows/h2-reliability-remediation-v11.yml
+
+permissions:
+  contents: write
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reset to exact implementation candidate
+        run: git checkout -B h2-reliability-hardening fcdf76dbe8c8432cd6dcfeb4abed3273d44d89eb
+
+      - name: Apply hard-link confinement remediation
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          source_path = Path('src/ai_capital/product/rooted_io.py')
+          source = source_path.read_text()
+
+          old = '''        if current is not None and not stat.S_ISREG(current.st_mode):
+              raise InvalidRequest("capability target must be a regular file")
+
+          if current is None:
+          '''.replace('              ', '            ').replace('          ', '        ', 1)
+          new = '''        if current is not None and not stat.S_ISREG(current.st_mode):
+            raise InvalidRequest("capability target must be a regular file")
+        if current is not None and current.st_nlink != 1:
+            raise InvalidRequest(
+                "capability target with multiple hard links is not writable"
+            )
+
+        if current is None:
+'''
+          if old not in source:
+              raise SystemExit('initial regular-file anchor not found')
+          source = source.replace(old, new, 1)
+
+          old = '''        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _stat_identity(opened) != expected_identity:
+            raise ExecutionFailure("capability target changed before rooted materialization")
+
+        before_write = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+'''
+          new = '''        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _stat_identity(opened) != expected_identity
+            or opened.st_nlink != 1
+        ):
+            raise ExecutionFailure("capability target changed before rooted materialization")
+
+        before_write = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+'''
+          if old not in source:
+              raise SystemExit('opened-target anchor not found')
+          source = source.replace(old, new, 1)
+
+          old = '''        if (
+            stat.S_ISLNK(before_write.st_mode)
+            or not stat.S_ISREG(before_write.st_mode)
+            or _stat_identity(before_write) != expected_identity
+        ):
+            raise ExecutionFailure("capability target changed before rooted materialization")
+        _validate_parent_binding(
+            root,
+            target,
+            root_fd=root_fd,
+            parent_fd=parent_fd,
+            expected_root_identity=expected_root_identity,
+        )
+
+        # Mutation stays confined to the authorized inode. If its rooted name changes
+'''
+          new = '''        if (
+            stat.S_ISLNK(before_write.st_mode)
+            or not stat.S_ISREG(before_write.st_mode)
+            or _stat_identity(before_write) != expected_identity
+            or before_write.st_nlink != 1
+        ):
+            raise ExecutionFailure("capability target changed before rooted materialization")
+        _validate_parent_binding(
+            root,
+            target,
+            root_fd=root_fd,
+            parent_fd=parent_fd,
+            expected_root_identity=expected_root_identity,
+        )
+        pre_mutation = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(pre_mutation.st_mode)
+            or _stat_identity(pre_mutation) != expected_identity
+            or pre_mutation.st_nlink != 1
+        ):
+            raise ExecutionFailure("capability target changed before rooted materialization")
+
+        # Mutation stays confined to a single-link authorized inode. If its rooted name changes
+'''
+          if old not in source:
+              raise SystemExit('pre-mutation anchor not found')
+          source = source.replace(old, new, 1)
+
+          old = '''            and stat.S_ISREG(verified.st_mode)
+            and stat.S_ISREG(committed.st_mode)
+            and materialized == content
+'''
+          new = '''            and stat.S_ISREG(verified.st_mode)
+            and stat.S_ISREG(committed.st_mode)
+            and verified.st_nlink == 1
+            and committed.st_nlink == 1
+            and materialized == content
+'''
+          if old not in source:
+              raise SystemExit('stable-commit anchor not found')
+          source = source.replace(old, new, 1)
+          source_path.write_text(source)
+
+          test_path = Path('tests/test_h2_reliability_review.py')
+          tests = test_path.read_text()
+          anchor = '''    def test_workspace_write_rejects_final_component_replacement_before_commit(self):
+'''
+          addition = '''    def test_workspace_write_rejects_hard_link_alias_outside_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, workspace, artifacts = self._fixture(root)
+            outside = root / "outside.txt"
+            outside.write_text("outside\\n")
+            target = workspace / "alias.txt"
+            os.link(outside, target)
+
+            with self._open(database, workspace, artifacts) as operator:
+                operator.grant(
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    resource_scope=("alias.txt",),
+                )
+                result = operator.invoke(
+                    program_id="p-1",
+                    actor_id="a-1",
+                    capability_id="workspace.write",
+                    arguments={"path": "alias.txt", "content": "authorized\\n"},
+                )
+
+            self.assertEqual(result["operation"]["execution_outcome"], "failed")
+            self.assertEqual(result["operation"]["effect_status"], "indeterminate")
+            self.assertEqual(outside.read_text(), "outside\\n")
+            self.assertEqual(target.read_text(), "outside\\n")
+            self.assertTrue(os.path.samefile(outside, target))
+
+'''
+          if anchor not in tests:
+              raise SystemExit('test insertion anchor not found')
+          tests = tests.replace(anchor, addition + anchor, 1)
+          test_path.write_text(tests)
+          PY
+
+      - name: Diff check
+        run: git diff --check
+
+      - name: Targeted H2.7 review tests
+        run: PYTHONPATH=src pytest -q tests/test_h2_reliability_review.py
+
+      - name: Full suite
+        run: PYTHONPATH=src pytest -q
+
+      - name: Commit and push green remediation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/ai_capital/product/rooted_io.py tests/test_h2_reliability_review.py
+          git commit -m "H2.7: reject multiply linked write targets"
+          git push origin HEAD:h2-reliability-hardening --force-with-lease=refs/heads/h2-reliability-hardening:fcdf76dbe8c8432cd6dcfeb4abed3273d44d89eb
