@@ -27,142 +27,146 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              if old not in text:
+                  raise SystemExit(f'{label} anchor not found')
+              return text.replace(old, new, 1)
+
           source_path = Path('src/ai_capital/product/rooted_io.py')
           source = source_path.read_text()
 
-          old = '''        if current is not None and not stat.S_ISREG(current.st_mode):
-              raise InvalidRequest("capability target must be a regular file")
+          old = (
+              '        if current is not None and not stat.S_ISREG(current.st_mode):\n'
+              '            raise InvalidRequest("capability target must be a regular file")\n'
+              '\n'
+              '        if current is None:\n'
+          )
+          new = (
+              '        if current is not None and not stat.S_ISREG(current.st_mode):\n'
+              '            raise InvalidRequest("capability target must be a regular file")\n'
+              '        if current is not None and current.st_nlink != 1:\n'
+              '            raise InvalidRequest(\n'
+              '                "capability target with multiple hard links is not writable"\n'
+              '            )\n'
+              '\n'
+              '        if current is None:\n'
+          )
+          source = replace_once(source, old, new, 'initial regular-file')
 
-          if current is None:
-          '''.replace('              ', '            ').replace('          ', '        ', 1)
-          new = '''        if current is not None and not stat.S_ISREG(current.st_mode):
-            raise InvalidRequest("capability target must be a regular file")
-        if current is not None and current.st_nlink != 1:
-            raise InvalidRequest(
-                "capability target with multiple hard links is not writable"
-            )
+          old = (
+              '        opened = os.fstat(descriptor)\n'
+              '        if not stat.S_ISREG(opened.st_mode) or _stat_identity(opened) != expected_identity:\n'
+              '            raise ExecutionFailure("capability target changed before rooted materialization")\n'
+              '\n'
+              '        before_write = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)\n'
+          )
+          new = (
+              '        opened = os.fstat(descriptor)\n'
+              '        if (\n'
+              '            not stat.S_ISREG(opened.st_mode)\n'
+              '            or _stat_identity(opened) != expected_identity\n'
+              '            or opened.st_nlink != 1\n'
+              '        ):\n'
+              '            raise ExecutionFailure("capability target changed before rooted materialization")\n'
+              '\n'
+              '        before_write = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)\n'
+          )
+          source = replace_once(source, old, new, 'opened target')
 
-        if current is None:
-'''
-          if old not in source:
-              raise SystemExit('initial regular-file anchor not found')
-          source = source.replace(old, new, 1)
+          old = (
+              '        if (\n'
+              '            stat.S_ISLNK(before_write.st_mode)\n'
+              '            or not stat.S_ISREG(before_write.st_mode)\n'
+              '            or _stat_identity(before_write) != expected_identity\n'
+              '        ):\n'
+              '            raise ExecutionFailure("capability target changed before rooted materialization")\n'
+              '        _validate_parent_binding(\n'
+              '            root,\n'
+              '            target,\n'
+              '            root_fd=root_fd,\n'
+              '            parent_fd=parent_fd,\n'
+              '            expected_root_identity=expected_root_identity,\n'
+              '        )\n'
+              '\n'
+              '        # Mutation stays confined to the authorized inode. If its rooted name changes\n'
+          )
+          new = (
+              '        if (\n'
+              '            stat.S_ISLNK(before_write.st_mode)\n'
+              '            or not stat.S_ISREG(before_write.st_mode)\n'
+              '            or _stat_identity(before_write) != expected_identity\n'
+              '            or before_write.st_nlink != 1\n'
+              '        ):\n'
+              '            raise ExecutionFailure("capability target changed before rooted materialization")\n'
+              '        _validate_parent_binding(\n'
+              '            root,\n'
+              '            target,\n'
+              '            root_fd=root_fd,\n'
+              '            parent_fd=parent_fd,\n'
+              '            expected_root_identity=expected_root_identity,\n'
+              '        )\n'
+              '        pre_mutation = os.fstat(descriptor)\n'
+              '        if (\n'
+              '            not stat.S_ISREG(pre_mutation.st_mode)\n'
+              '            or _stat_identity(pre_mutation) != expected_identity\n'
+              '            or pre_mutation.st_nlink != 1\n'
+              '        ):\n'
+              '            raise ExecutionFailure("capability target changed before rooted materialization")\n'
+              '\n'
+              '        # Mutation stays confined to a single-link authorized inode. If its rooted name changes\n'
+          )
+          source = replace_once(source, old, new, 'pre-mutation')
 
-          old = '''        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or _stat_identity(opened) != expected_identity:
-            raise ExecutionFailure("capability target changed before rooted materialization")
-
-        before_write = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-'''
-          new = '''        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or _stat_identity(opened) != expected_identity
-            or opened.st_nlink != 1
-        ):
-            raise ExecutionFailure("capability target changed before rooted materialization")
-
-        before_write = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-'''
-          if old not in source:
-              raise SystemExit('opened-target anchor not found')
-          source = source.replace(old, new, 1)
-
-          old = '''        if (
-            stat.S_ISLNK(before_write.st_mode)
-            or not stat.S_ISREG(before_write.st_mode)
-            or _stat_identity(before_write) != expected_identity
-        ):
-            raise ExecutionFailure("capability target changed before rooted materialization")
-        _validate_parent_binding(
-            root,
-            target,
-            root_fd=root_fd,
-            parent_fd=parent_fd,
-            expected_root_identity=expected_root_identity,
-        )
-
-        # Mutation stays confined to the authorized inode. If its rooted name changes
-'''
-          new = '''        if (
-            stat.S_ISLNK(before_write.st_mode)
-            or not stat.S_ISREG(before_write.st_mode)
-            or _stat_identity(before_write) != expected_identity
-            or before_write.st_nlink != 1
-        ):
-            raise ExecutionFailure("capability target changed before rooted materialization")
-        _validate_parent_binding(
-            root,
-            target,
-            root_fd=root_fd,
-            parent_fd=parent_fd,
-            expected_root_identity=expected_root_identity,
-        )
-        pre_mutation = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(pre_mutation.st_mode)
-            or _stat_identity(pre_mutation) != expected_identity
-            or pre_mutation.st_nlink != 1
-        ):
-            raise ExecutionFailure("capability target changed before rooted materialization")
-
-        # Mutation stays confined to a single-link authorized inode. If its rooted name changes
-'''
-          if old not in source:
-              raise SystemExit('pre-mutation anchor not found')
-          source = source.replace(old, new, 1)
-
-          old = '''            and stat.S_ISREG(verified.st_mode)
-            and stat.S_ISREG(committed.st_mode)
-            and materialized == content
-'''
-          new = '''            and stat.S_ISREG(verified.st_mode)
-            and stat.S_ISREG(committed.st_mode)
-            and verified.st_nlink == 1
-            and committed.st_nlink == 1
-            and materialized == content
-'''
-          if old not in source:
-              raise SystemExit('stable-commit anchor not found')
-          source = source.replace(old, new, 1)
+          old = (
+              '            and stat.S_ISREG(verified.st_mode)\n'
+              '            and stat.S_ISREG(committed.st_mode)\n'
+              '            and materialized == content\n'
+          )
+          new = (
+              '            and stat.S_ISREG(verified.st_mode)\n'
+              '            and stat.S_ISREG(committed.st_mode)\n'
+              '            and verified.st_nlink == 1\n'
+              '            and committed.st_nlink == 1\n'
+              '            and materialized == content\n'
+          )
+          source = replace_once(source, old, new, 'stable commit')
           source_path.write_text(source)
 
           test_path = Path('tests/test_h2_reliability_review.py')
           tests = test_path.read_text()
-          anchor = '''    def test_workspace_write_rejects_final_component_replacement_before_commit(self):
-'''
-          addition = '''    def test_workspace_write_rejects_hard_link_alias_outside_root(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            database, workspace, artifacts = self._fixture(root)
-            outside = root / "outside.txt"
-            outside.write_text("outside\\n")
-            target = workspace / "alias.txt"
-            os.link(outside, target)
-
-            with self._open(database, workspace, artifacts) as operator:
-                operator.grant(
-                    actor_id="a-1",
-                    capability_id="workspace.write",
-                    resource_scope=("alias.txt",),
-                )
-                result = operator.invoke(
-                    program_id="p-1",
-                    actor_id="a-1",
-                    capability_id="workspace.write",
-                    arguments={"path": "alias.txt", "content": "authorized\\n"},
-                )
-
-            self.assertEqual(result["operation"]["execution_outcome"], "failed")
-            self.assertEqual(result["operation"]["effect_status"], "indeterminate")
-            self.assertEqual(outside.read_text(), "outside\\n")
-            self.assertEqual(target.read_text(), "outside\\n")
-            self.assertTrue(os.path.samefile(outside, target))
-
-'''
-          if anchor not in tests:
-              raise SystemExit('test insertion anchor not found')
-          tests = tests.replace(anchor, addition + anchor, 1)
+          anchor = '    def test_workspace_write_rejects_final_component_replacement_before_commit(self):\n'
+          addition = '\n'.join([
+              '    def test_workspace_write_rejects_hard_link_alias_outside_root(self):',
+              '        with tempfile.TemporaryDirectory() as directory:',
+              '            root = Path(directory)',
+              '            database, workspace, artifacts = self._fixture(root)',
+              '            outside = root / "outside.txt"',
+              '            outside.write_text("outside\\n")',
+              '            target = workspace / "alias.txt"',
+              '            os.link(outside, target)',
+              '',
+              '            with self._open(database, workspace, artifacts) as operator:',
+              '                operator.grant(',
+              '                    actor_id="a-1",',
+              '                    capability_id="workspace.write",',
+              '                    resource_scope=("alias.txt",),',
+              '                )',
+              '                result = operator.invoke(',
+              '                    program_id="p-1",',
+              '                    actor_id="a-1",',
+              '                    capability_id="workspace.write",',
+              '                    arguments={"path": "alias.txt", "content": "authorized\\n"},',
+              '                )',
+              '',
+              '            self.assertEqual(result["operation"]["execution_outcome"], "failed")',
+              '            self.assertEqual(result["operation"]["effect_status"], "indeterminate")',
+              '            self.assertEqual(outside.read_text(), "outside\\n")',
+              '            self.assertEqual(target.read_text(), "outside\\n")',
+              '            self.assertTrue(os.path.samefile(outside, target))',
+              '',
+              '',
+          ])
+          tests = replace_once(tests, anchor, addition + anchor, 'test insertion')
           test_path.write_text(tests)
           PY
 
