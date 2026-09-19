@@ -38,6 +38,20 @@ def _unlink_if_identity(
     return True
 
 
+def _claim_existing_target(parent_fd: int, name: str, displaced: str) -> None:
+    try:
+        os.rename(
+            name,
+            displaced,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+    except TypeError as exc:
+        raise ExecutionFailure(
+            "race-resistant existing-target materialization is unavailable"
+        ) from exc
+
+
 def _restore_displaced_regular(
     parent_fd: int,
     displaced: str,
@@ -166,11 +180,6 @@ def atomic_write(
             cleanup_created_target = False
             return
 
-        if os.rename not in os.supports_dir_fd:
-            raise ExecutionFailure(
-                "race-resistant existing-target materialization is unavailable"
-            )
-
         expected_identity = _stat_identity(current)
         temporary = f".{name}.{secrets.token_hex(12)}.tmp"
         descriptor = os.open(
@@ -200,6 +209,8 @@ def atomic_write(
         ):
             raise ExecutionFailure("capability staged materialization is unstable")
 
+        # The original identity is captured before staging. Any replacement during
+        # staging is therefore rejected before namespace mutation.
         _validate_parent_binding(
             root,
             target,
@@ -217,18 +228,17 @@ def atomic_write(
 
         # Never mutate the existing inode. Move the final directory entry aside, then
         # install the fully materialized private inode with an atomic no-overwrite link.
-        # Any hard-link alias created at this boundary retains the old bytes.
+        # A hard-link alias created immediately before the claim retains the old bytes.
         displaced = _fresh_side_name(parent_fd, name, "previous")
         try:
-            os.rename(
-                name,
-                displaced,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-            )
+            _claim_existing_target(parent_fd, name, displaced)
         except FileNotFoundError as exc:
             raise ExecutionFailure(
                 "capability target changed before rooted materialization commit"
+            ) from exc
+        except OSError as exc:
+            raise ExecutionFailure(
+                "capability target could not be claimed for rooted materialization"
             ) from exc
         displaced_info = os.stat(displaced, dir_fd=parent_fd, follow_symlinks=False)
         displaced_identity = _stat_identity(displaced_info)
@@ -242,8 +252,8 @@ def atomic_write(
                 displaced = None
                 displaced_identity = None
             else:
-                # A newer replacement may already occupy the rooted name. Preserve the
-                # displaced concurrent object rather than overwrite or delete it.
+                # Preserve a raced object rather than overwrite/delete it when the
+                # rooted name has already been occupied by a newer writer.
                 preserve_displaced = True
             raise ExecutionFailure(
                 "capability target changed at rooted materialization commit"
@@ -273,9 +283,8 @@ def atomic_write(
             ) from exc
 
         created_target_identity = temporary_identity
-        # Once the new inode has been linked at the authorized name there is no rollback:
-        # failure to prove the final binding becomes indeterminate Operation truth rather
-        # than a second namespace mutation that could race another writer.
+        # Once the new inode is installed there is no namespace rollback: ambiguity
+        # becomes indeterminate Operation truth instead of risking a concurrent writer.
         cleanup_created_target = False
         os.unlink(temporary, dir_fd=parent_fd)
         temporary_owned = False
@@ -359,15 +368,15 @@ addition = '''    def test_workspace_write_detaches_alias_created_at_commit_boun
             target = workspace / "alias-race.txt"
             target.write_text("initial\\n")
             outside = root / "outside-race.txt"
-            real_rename = rooted_io.os.rename
+            real_claim = rooted_io._claim_existing_target
             injected = False
 
-            def link_then_claim(source, destination, *args, **kwargs):
+            def link_then_claim(parent_fd: int, name: str, displaced: str) -> None:
                 nonlocal injected
-                if not injected and source == "alias-race.txt":
+                if not injected:
                     os.link(target, outside)
                     injected = True
-                return real_rename(source, destination, *args, **kwargs)
+                real_claim(parent_fd, name, displaced)
 
             with self._open(database, workspace, artifacts) as operator:
                 operator.grant(
@@ -376,7 +385,7 @@ addition = '''    def test_workspace_write_detaches_alias_created_at_commit_boun
                     resource_scope=("alias-race.txt",),
                 )
                 with patch(
-                    "ai_capital.product.rooted_io.os.rename",
+                    "ai_capital.product.rooted_io._claim_existing_target",
                     side_effect=link_then_claim,
                 ):
                     result = operator.invoke(
