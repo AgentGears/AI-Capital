@@ -1,0 +1,64 @@
+name: H2.7 reliability remediation v14
+
+on:
+  push:
+    branches:
+      - h2-reliability-remediation-v14
+    paths:
+      - .github/workflows/h2-reliability-remediation-v14.yml
+
+permissions:
+  contents: write
+
+jobs:
+  remediate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reset to exact implementation candidate
+        run: git checkout -B h2-reliability-hardening 4b386d7175e22d94a0bd61c83dfd85559af599ab
+
+      - name: Apply copy-on-write rooted remediation
+        run: python <(git show origin/h2-reliability-remediation-v14:.github/h2-reliability-remediation-v14.py)
+        shell: bash
+
+      - name: Install test runner
+        run: python -m pip install pytest
+
+      - name: Diff check
+        run: git diff --check
+
+      - name: Focused H2.7 reliability gate
+        run: |
+          PYTHONPATH=src python -m pytest -q \
+            tests/test_h2_reliability_review.py \
+            tests/test_h2_reliability_hardening.py \
+            tests/test_h2_reliability_restart_matrix.py \
+            tests/test_h2_product_capabilities.py \
+            tests/test_h2_product_capability_review.py \
+            tests/test_h2_product_capability_security.py \
+            tests/test_h2_git_observation_guard.py \
+            tests/test_h2_capability_cli.py \
+            tests/test_h2_explicit_lifecycle_control.py \
+            tests/test_k1_recovery_edges.py \
+            tests/test_k1_process_death.py \
+            tests/test_k4_authority.py \
+            tests/test_k5_operation_journal.py \
+            tests/test_k5_operation_integrity.py \
+            tests/test_h2_approval_audit_surface.py \
+            tests/test_h2_program_bundles.py \
+            tests/test_h2_program_bundle_operation_auth.py
+
+      - name: Full suite
+        run: PYTHONPATH=src python -m pytest -q
+
+      - name: Commit and push green remediation
+        run: |
+          git config user.name "AI Capital Maintainer"
+          git config user.email "55954113+Alajmah@users.noreply.github.com"
+          git add src/ai_capital/product/rooted_io.py tests/test_h2_reliability_review.py
+          git commit -m "H2.7: commit existing writes by new inode"
+          git push origin HEAD:h2-reliability-hardening --force-with-lease=refs/heads/h2-reliability-hardening:4b386d7175e22d94a0bd61c83dfd85559af599ab
