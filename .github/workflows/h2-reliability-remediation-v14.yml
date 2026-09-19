@@ -62,3 +62,6 @@ jobs:
           git add src/ai_capital/product/rooted_io.py tests/test_h2_reliability_review.py
           git commit -m "H2.7: commit existing writes by new inode"
           git push origin HEAD:h2-reliability-hardening --force-with-lease=refs/heads/h2-reliability-hardening:4b386d7175e22d94a0bd61c83dfd85559af599ab
+
+      - name: Confirm implementation push
+        run: git ls-remote --exit-code origin refs/heads/h2-reliability-hardening
