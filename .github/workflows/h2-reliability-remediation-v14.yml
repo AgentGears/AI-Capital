@@ -22,7 +22,9 @@ jobs:
         run: git checkout -B h2-reliability-hardening 4b386d7175e22d94a0bd61c83dfd85559af599ab
 
       - name: Apply copy-on-write rooted remediation
-        run: python <(git show origin/h2-reliability-remediation-v14:.github/h2-reliability-remediation-v14.py)
+        run: |
+          python <(git show origin/h2-reliability-remediation-v14:.github/h2-reliability-remediation-v14.py)
+          python <(git show origin/h2-reliability-remediation-v14:.github/h2-reliability-remediation-v14-pin-original.py)
         shell: bash
 
       - name: Install test runner
